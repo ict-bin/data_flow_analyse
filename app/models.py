@@ -34,6 +34,7 @@ class RoleConfig(BaseModel):
 class ServiceConfig(BaseModel):
     """config.json — 服务提供者配置，不含任务信息"""
     max_rounds: int = Field(default=3, ge=1, le=10)
+    min_rounds: int = Field(default=2, ge=1, le=10, description="最少执行轮数（第1轮后强制自我反思）")
     pass_threshold: Optional[int] = Field(default=None)
     agent_max_retries: int = Field(default=100, description="API 错误时最大重试次数")
     agent_retry_delay: float = Field(default=30.0, description="首次重试等待秒数，指数退避")
@@ -61,6 +62,7 @@ class TaskConfig(BaseModel):
 
     # 服务配置部分（从 ServiceConfig 合并）
     max_rounds: int = Field(default=3)
+    min_rounds: int = Field(default=2)
     pass_threshold: Optional[int] = Field(default=None)
     agent_max_retries: int = Field(default=100)
     agent_retry_delay: float = Field(default=30.0)

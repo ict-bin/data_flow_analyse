@@ -385,11 +385,15 @@ class Orchestrator:
                            passed=is_passed, pass_count=pass_count,
                            total_judges=cfg.judge_count, best_worker=best_wid)
 
-                if is_passed:
+                if is_passed and rnd_num >= cfg.min_rounds:
                     result.status = TaskStatus.PASSED
                     best_w = next((w for w in round_workers if w.worker_id == best_wid), round_workers[0])
                     result.final_output = _get_best_output(best_w)
                     break
+
+                if is_passed and rnd_num < cfg.min_rounds:
+                    self._emit("round_reflection", task_id, round=rnd_num,
+                               message=f"Round {rnd_num} passed but min_rounds={cfg.min_rounds}, forcing reflection")
 
                 # 下一轮的反馈
                 feedback_for_workers = feedback_md
@@ -464,16 +468,14 @@ class Orchestrator:
         rnd_judges_dir: Path,
     ) -> JudgeRoundResult:
         """
-        一个 Judge 在一轮中的完整评审流程：
-          1. 逐个评判每个 Worker（使用临时 session 保持 Judge 内上下文）
-          2. ≥2 个 Worker 时，发送对比总结提示词
-          3. 归档所有评判文件 + session 文件
+        一个 Judge 在一轮中的完整评审流程（每步独立上下文）：
+          1. 对每个 Worker：新起上下文 → 评测 → 写 eval 文件
+          2. 新起上下文 → 读取所有 eval 文件 → 综合对比 → 写 summary
+
+        设计目的：防止 Worker 之间的评审互相影响。
         """
         cfg = self.cfg
         jid = f"judge-{judge_idx}"
-
-        # Judge 临时 session（每轮一个新文件，轮结束后归档保留）
-        judge_sess_file = str(sess_dir / f"{jid}-round-{rnd_num}.jsonl")
 
         j_dir = rnd_judges_dir / jid
         j_dir.mkdir(parents=True, exist_ok=True)
@@ -483,24 +485,50 @@ class Orchestrator:
             model=judge_cfg.model,
         )
 
-        common_kwargs = {
+        base_kwargs = {
             "model": judge_cfg.model,
             "tools": judge_cfg.tools or cfg.judges.default_tools,
             "system_prompt": judge_sys_prompt,
-            "cwd": cwd,
+            "cwd": str(j_dir),   # Judge 的 cwd 指向自己的输出目录
             "thinking_level": judge_cfg.thinking_level or cfg.judges.default_thinking_level,
-            "session_file": judge_sess_file,  # 轮内保持上下文
             "cancel_event": self._cancel_event,
             "max_retries": cfg.agent_max_retries,
             "retry_delay": cfg.agent_retry_delay,
         }
 
-        # ── 逐个评判 ─────────────────────────────────────────
+        # ═══ 步骤0：准备 Worker 输出文件（放入 Judge 工作目录）═══
 
         for w in round_workers:
-            eval_prompt = self._build_eval_prompt(cfg.task, cfg.criteria, w, rnd_num)
+            # 摘要输出
+            (j_dir / f"{w.worker_id}-output.md").write_text(
+                w.output, encoding="utf-8")
+            # dataflow 文件
+            df_dst = j_dir / f"{w.worker_id}-dataflow.md"
+            if w.dataflow_file:
+                try:
+                    df_content = Path(w.dataflow_file).read_text(encoding="utf-8")
+                    df_dst.write_text(df_content, encoding="utf-8")
+                except OSError:
+                    df_dst.write_text(
+                        f"# ⚠️ Dataflow file not found: {w.dataflow_file}",
+                        encoding="utf-8")
+            else:
+                df_dst.write_text(
+                    "# ⚠️ Worker did not produce a dataflow file",
+                    encoding="utf-8")
 
-            ar = await run_agent(prompt=eval_prompt, **common_kwargs)
+        # ═══ 步骤1：逐个评判（每个 Worker 独立上下文）═══════════
+
+        for w in round_workers:
+            eval_prompt = self._build_eval_prompt(
+                cfg.task, cfg.criteria, w, rnd_num,
+                output_path=f"{w.worker_id}-output.md",
+                dataflow_path=f"{w.worker_id}-dataflow.md",
+            )
+
+            # 独立上下文：session_file=None → --no-session
+            ar = await run_agent(
+                prompt=eval_prompt, **base_kwargs, session_file=None)
             j_result.token_usage += ar.token_usage
 
             parsed = _parse_eval_json(ar.output)
@@ -513,7 +541,7 @@ class Orchestrator:
             )
             j_result.evaluations.append(ev)
 
-            # 归档
+            # 归档 eval 结果
             (j_dir / f"eval-{w.worker_id}.md").write_text(
                 f"# {jid} → {w.worker_id} (Round {rnd_num})\n\n"
                 f"- **Model**: {judge_cfg.model}\n"
@@ -524,12 +552,16 @@ class Orchestrator:
                 encoding="utf-8",
             )
 
-        # ── 对比总结（≥2 worker）────────────────────────────
+        # ═══ 步骤2：综合对比（新上下文，读取 eval 文件）═══════════
 
         if len(round_workers) >= 2:
-            summary_prompt = self._build_summary_prompt(round_workers, j_result.evaluations)
+            eval_files = [f"eval-{w.worker_id}.md" for w in round_workers]
+            summary_prompt = self._build_summary_prompt(
+                round_workers, j_result.evaluations, eval_files)
 
-            ar = await run_agent(prompt=summary_prompt, **common_kwargs)
+            # 独立上下文
+            ar = await run_agent(
+                prompt=summary_prompt, **base_kwargs, session_file=None)
             j_result.token_usage += ar.token_usage
 
             parsed = _parse_summary_json(ar.output)
@@ -547,7 +579,6 @@ class Orchestrator:
                 encoding="utf-8",
             )
         else:
-            # 单 worker：直接用 eval 结果
             ev = j_result.evaluations[0]
             j_result.summary = JudgeSummary(
                 best_worker_id=ev.worker_id,
@@ -574,27 +605,40 @@ class Orchestrator:
         parts.append("Wrap your final deliverable in <result>...</result> tags.")
         return "\n\n".join(parts)
 
-    def _build_eval_prompt(self, task, criteria, worker: WorkerResult, rnd):
+    def _build_eval_prompt(self, task, criteria, worker: WorkerResult, rnd,
+                           output_path: str = "", dataflow_path: str = ""):
         parts = [
             f"# Evaluate {worker.worker_id} (Round {rnd})",
             f"## Task Requirements\n\n{task}",
         ]
         if criteria:
             parts.append(f"## Evaluation Criteria\n\n{criteria}")
+
+        # 指引 Judge 读取文件（而非嵌入内容）
         parts.append(
-            f"## {worker.worker_id}'s Output (model: {worker.model})\n\n"
-            f"{worker.output}")
+            f"## {worker.worker_id}'s Output Files\n\n"
+            f"Worker 的摘要输出文件: `{output_path}`\n"
+            f"Worker 的数据流分析文档: `{dataflow_path}`\n\n"
+            f"**请使用 read 工具读取以上两个文件，然后进行评测。**"
+        )
+
         parts.append(
             "Evaluate this worker's output. Respond with JSON only:\n"
             '{"pass": true/false, "score": 0-100, "feedback": "...", "refinement": "..."}')
         return "\n\n".join(parts)
 
-    def _build_summary_prompt(self, workers: list[WorkerResult], evals: list[WorkerEvaluation]):
+    def _build_summary_prompt(self, workers: list[WorkerResult],
+                               evals: list[WorkerEvaluation],
+                               eval_files: list[str]):
         parts = ["# Compare All Workers\n"]
-        parts.append("You have evaluated each worker individually. Now compare them.\n")
-        for ev in evals:
-            parts.append(f"- **{ev.worker_id}**: Score {ev.score}, {'PASS' if ev.passed else 'FAIL'}")
+        parts.append("You have evaluated each worker individually. "
+                     "Read the evaluation files below, then compare them.\n")
+        for ev, fpath in zip(evals, eval_files):
+            parts.append(
+                f"- **{ev.worker_id}**: Score {ev.score}, "
+                f"{'PASS' if ev.passed else 'FAIL'} — evaluation file: `{fpath}`")
         parts.append(
+            "\n**请使用 read 工具读取以上所有 eval 文件，然后给出综合对比。**\n"
             "\nRespond with JSON:\n"
             "```json\n"
             '{"best_worker": "worker-X", "reasoning": "Why this worker is best", '

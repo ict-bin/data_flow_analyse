@@ -1,5 +1,6 @@
 {
     "max_rounds": 3,
+    "min_rounds": 2,
     "pass_threshold": 2,
     "agent_max_retries": 100,
     "agent_retry_delay": 30,

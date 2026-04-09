@@ -1,205 +1,222 @@
 # data_flow_analyse
 
-多 Agent 协同数据流追踪分析工具 — 基于 [pi-coding-agent](https://github.com/badlogic/pi-mono)
+基于多 Agent 协作的外部输入数据流自动化分析系统。多个 Worker 并行分析同一函数，多个 Judge 独立评审，迭代优化直到通过。
 
-多个 Worker Agent 独立追踪同一函数的外部输入数据流 → Judge Agent 逐个评判并对比 → 未通过则迭代改进 → 直到质量达标 → 打包归档全部工作过程。
-
-```
-              config.json 驱动一切
-                     │
-                     ▼
-┌──────────────────────────────────────────────────────────┐
-│                  data_flow_analyse 容器                    │
-│                                                          │
-│   Round 1                                                │
-│   ┌────────────────────────────────────────────┐         │
-│   │  Worker 0 (Claude) ──session──► 保持上下文  │         │
-│   │  Worker 1 (GPT-4o) ──session──► 保持上下文  │         │
-│   │  各自独立追踪同一函数的数据流                 │         │
-│   └────────────────┬───────────────────────────┘         │
-│                    ▼                                      │
-│   ┌────────────────────────────────────────────┐         │
-│   │  Judge 0 ──no-session──► 每轮重置           │         │
-│   │    ├─ 评判 worker-0 → eval-worker-0.md     │         │
-│   │    ├─ 评判 worker-1 → eval-worker-1.md     │         │
-│   │    └─ 对比总结 → summary.md                 │         │
-│   │  Judge 1 ──no-session──► 每轮重置           │         │
-│   │    └─ 同上                                  │         │
-│   └────────────────┬───────────────────────────┘         │
-│                    ▼                                      │
-│              投票通过？                                    │
-│              No → feedback.md 注入 Worker → Round 2       │
-│              Yes → 打包 output/{task_id}/                 │
-└──────────────────────────────────────────────────────────┘
-```
-
-## 核心设计
-
-1. **JSON 配置驱动** — 每个 Worker/Judge 实例独立指定模型、工具、思考级别
-2. **Worker 保持上下文** — pi session 跨轮累积，改进时能看到完整历史
-3. **Judge 每轮重置** — 独立评审，逐个评判每个 Worker，最后对比总结
-4. **全过程 .md 归档** — Worker 输出、Judge 评判、反馈、session 全部归档
-
----
-
-## 快速开始
-
-```bash
-# 安装依赖
-pip install -r requirements.txt
-npm install -g @mariozechner/pi-coding-agent
-
-# 配置
-cp config.example.json config.json
-# 编辑 config.json（填入任务描述、目标函数、模型）
-export ANTHROPIC_API_KEY=sk-ant-...
-
-# 运行
-python cli.py config.json
-```
-
----
-
-## 配置文件
-
-```json
-{
-    "task": "分析文件 target/firmware.c 中函数 parse_network_packet 的外部输入数据流",
-
-    "max_rounds": 3,
-    "pass_threshold": 2,
-
-    "workers": {
-        "default_tools": ["read", "bash", "edit", "write", "grep", "find"],
-        "system_prompt_dir": "./prompts/workers",
-        "default_thinking_level": "high",
-        "agents": [
-            { "model": "anthropic/claude-sonnet-4-20250514", "thinking_level": "high" },
-            { "model": "openai/gpt-4o", "thinking_level": "medium" }
-        ]
-    },
-
-    "judges": {
-        "default_tools": ["read", "bash", "grep", "find", "ls"],
-        "system_prompt_dir": "./prompts/judges",
-        "default_thinking_level": "medium",
-        "agents": [
-            { "model": "anthropic/claude-sonnet-4-20250514" },
-            { "model": "openai/gpt-4o" }
-        ]
-    },
-
-    "cwd": "./workspace",
-    "output_dir": "./output",
-    "context": "Ghidra 反编译的嵌入式固件代码，C 风格，大量指针操作",
-    "criteria": "重点：外部输入识别完整性、追踪深度、处理函数覆盖"
-}
-```
-
-每个 `agents[]` 元素独立指定 model/tools/thinking_level，不填则用角色默认值。
-
----
-
-## System Prompt 文件夹
+## 架构
 
 ```
-prompts/
-├── workers/
-│   ├── default.md        ← 所有 Worker 共用
-│   ├── worker-0.md       ← 可选：Worker 0 专用（覆盖 default）
-│   └── worker-1.md       ← 可选：Worker 1 专用
-└── judges/
-    ├── default.md        ← 所有 Judge 共用
-    ├── judge-0.md        ← 可选：Judge 0 专用
-    └── judge-1.md        ← 可选：Judge 1 专用
+┌─────────────────────────────────────────────────────────┐
+│                    Orchestrator                          │
+│                                                         │
+│  Round 1 (min_rounds=2, 即使通过也强制反思)              │
+│  ┌───────────┐  ┌───────────┐                           │
+│  │ Worker-0  │  │ Worker-1  │  ← 并行，独立工作目录      │
+│  │ (session) │  │ (session) │  ← 保持上下文跨轮累积      │
+│  └─────┬─────┘  └─────┬─────┘                           │
+│        │ dataflow.md   │ dataflow.md                    │
+│        ▼               ▼                                │
+│  ┌─────────────────────────────────────────┐            │
+│  │           文件交换层                      │            │
+│  │  worker-0-output.md  worker-0-dataflow.md│            │
+│  │  worker-1-output.md  worker-1-dataflow.md│            │
+│  └─────────────────────────────────────────┘            │
+│        │                     │                          │
+│  ┌─────┴──────┐  ┌──────────┴─┐                         │
+│  │  Judge-0   │  │  Judge-1   │  ← 并行                 │
+│  │            │  │            │                          │
+│  │ [新上下文]  │  │ [新上下文]  │  ← 评 worker-0         │
+│  │  eval w-0  │  │  eval w-0  │                          │
+│  │ [新上下文]  │  │ [新上下文]  │  ← 评 worker-1         │
+│  │  eval w-1  │  │  eval w-1  │                          │
+│  │ [新上下文]  │  │ [新上下文]  │  ← 读所有 eval，对比   │
+│  │  summary   │  │  summary   │                          │
+│  └────────────┘  └────────────┘                         │
+│        │                                                │
+│        ▼                                                │
+│  投票: pass_count >= threshold → PASSED                 │
+│  Round < min_rounds → 强制下一轮（自我反思）              │
+│                                                         │
+│  Round 2+ (带反馈迭代)                                   │
+│  Workers 收到 feedback.md → 改进 → Judges 重新评审       │
+│                                                         │
+│  最终输出: dataflow 树状图 + 归档 zip                    │
+└─────────────────────────────────────────────────────────┘
 ```
 
----
+### 关键设计
 
-## 输出归档结构
+| 特性 | 说明 |
+|------|------|
+| **Worker 并行** | 多个 Worker 同时分析同一函数，各自独立工作目录 |
+| **Worker 保持上下文** | 使用 `--session` 跨轮累积上下文，第 2 轮能看到第 1 轮的全部对话 |
+| **Judge 独立上下文** | 每次评审新起上下文（`--no-session`），防止 Worker 间评审互相影响 |
+| **Judge 读文件评审** | Worker 输出以文件形式传递给 Judge，Judge 用 `read` 工具读取后评审 |
+| **最小轮数** | `min_rounds=2`：即使第 1 轮全票通过，也强制进行反思迭代轮 |
+| **错误重试** | API 调用失败自动重试（可配置次数和间隔） |
 
-```
-output/{task_id}/
-├── round-1/
-│   ├── workers/
-│   │   ├── worker-0-output.md          Worker 0 的数据流追踪结果
-│   │   └── worker-1-output.md          Worker 1 的数据流追踪结果
-│   ├── judges/
-│   │   ├── judge-0/
-│   │   │   ├── eval-worker-0.md        Judge 0 对 Worker 0 的评价
-│   │   │   ├── eval-worker-1.md        Judge 0 对 Worker 1 的评价
-│   │   │   └── summary.md             Judge 0 的对比总结
-│   │   └── judge-1/
-│   │       └── ...
-│   └── feedback.md                     汇总反馈（注入下一轮 Worker）
-├── round-2/
-│   └── ...
-├── sessions/
-│   ├── worker-0.jsonl                  Worker 0 完整会话历史
-│   ├── worker-1.jsonl                  Worker 1 完整会话历史
-│   ├── judge-0-round-1.jsonl           Judge 0 第 1 轮多轮对话
-│   └── ...
-├── output.md                           最终输出（最佳 Worker 的结果）
-├── report.md                           完整报告
-└── result.json                         机器可读数据
-```
-
----
-
-## 运行方式
-
-### CLI
-
-```bash
-python cli.py config.json
-python cli.py config.json --quiet
-```
-
-### REST API
-
-```bash
-python main.py
-
-curl -X POST http://localhost:3000/task \
-  -H "Content-Type: application/json" \
-  -d @config.json
-```
-
-### Docker
-
-```bash
-docker compose up --build
-
-docker run --rm -v ./config.json:/app/config.json \
-  -e ANTHROPIC_API_KEY=sk-ant-... \
-  data_flow_analyse python cli.py /app/config.json
-```
-
----
-
-## 项目结构
+## 目录结构
 
 ```
 data_flow_analyse/
 ├── app/
-│   ├── models.py           Pydantic 数据模型
-│   ├── config.py           JSON 配置 + system prompt 加载
-│   ├── runner.py           pi 子进程执行器（session/no-session）
-│   ├── orchestrator.py     编排引擎（Worker→Judge 循环）
-│   └── server.py           FastAPI REST API + SSE
+│   ├── models.py        # 数据模型（ServiceConfig, TaskConfig, ...）
+│   ├── config.py        # 配置加载 + prompt 解析
+│   ├── runner.py        # pi Agent 子进程执行器（重试机制）
+│   ├── orchestrator.py  # 多 Agent 编排核心
+│   └── server.py        # REST API 服务器
 ├── prompts/
-│   ├── workers/default.md  Worker 角色：数据流追踪 + 污点标记
-│   └── judges/default.md   Judge 角色：评审追踪完整性和深度
-├── config.example.json
-├── cli.py
-├── main.py
-├── requirements.txt
-├── Dockerfile
-└── docker-compose.yml
+│   ├── workers/default.md   # Worker system prompt（污点追踪规则）
+│   └── judges/default.md    # Judge system prompt（评审规则）
+├── cli.py               # CLI 入口
+├── main.py              # REST 服务入口
+├── config.example.json  # 服务配置示例
+├── Dockerfile           # 容器构建
+├── deploy.sh            # 一键部署脚本
+└── scripts/entrypoint.sh
 ```
 
----
+## 快速开始
 
-## License
+### 1. 准备配置文件
 
-MIT
+`config.json`（服务提供者配置一次，长期不变）：
+
+```json
+{
+    "max_rounds": 3,
+    "min_rounds": 2,
+    "pass_threshold": 2,
+    "agent_max_retries": 100,
+    "agent_retry_delay": 30,
+    "workers": {
+        "default_tools": ["read", "bash", "edit", "write", "grep", "find"],
+        "system_prompt_dir": "/opt/data_flow_analyse/prompts/workers",
+        "agents": [
+            { "model": "vllm/zai-org/GLM-5" },
+            { "model": "vllm/zai-org/GLM-5" }
+        ]
+    },
+    "judges": {
+        "default_tools": ["read", "bash", "grep", "find"],
+        "system_prompt_dir": "/opt/data_flow_analyse/prompts/judges",
+        "agents": [
+            { "model": "vllm/zai-org/GLM-5" },
+            { "model": "vllm/zai-org/GLM-5" }
+        ]
+    },
+    "output_dir": "/data/output",
+    "context": "Ghidra 反编译的嵌入式固件代码",
+    "criteria": "重点：外部输入识别完整性、污点追踪深度、数据处理函数覆盖"
+}
+```
+
+### 2. 准备模型配置
+
+`models.json`（放在配置目录下，容器启动时自动链接）：
+
+```json
+[
+    {
+        "id": "vllm/zai-org/GLM-5",
+        "provider": "openai",
+        "apiKey": "1234",
+        "baseUrl": "http://172.31.29.10:8000/v1"
+    }
+]
+```
+
+### 3. 运行分析
+
+**用户只需提供：待分析代码（挂载）+ 一句话 prompt**
+
+```bash
+docker run --rm --network host \
+  -v /path/to/source:/data/target:ro \
+  -v /path/to/config:/data/config:ro \
+  -v /path/to/output:/data/output \
+  data_flow_analyse \
+  python3 cli.py "对 firmware.c 的 parse_packet 函数完成数据流分析"
+```
+
+### 4. 查看结果
+
+分析完成后，输出目录包含：
+
+```
+output/
+├── firmware_parse_packet.md          # 最终数据流树状图文档
+└── firmware_parse_packet_log.zip     # 完整过程归档
+```
+
+## 配置说明
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `max_rounds` | 3 | 最大迭代轮数 |
+| `min_rounds` | 2 | 最少执行轮数（强制自我反思） |
+| `pass_threshold` | `ceil(judges/2)` | 通过所需的 Judge 投票数 |
+| `agent_max_retries` | 100 | API 错误时最大重试次数 |
+| `agent_retry_delay` | 30 | 首次重试等待秒数（指数退避） |
+| `workers.agents[]` | - | Worker 实例列表，每个可指定独立模型 |
+| `judges.agents[]` | - | Judge 实例列表，每个可指定独立模型 |
+| `context` | "" | 全局额外上下文（所有任务共用） |
+| `criteria` | "" | 全局评判标准 |
+
+## REST API 模式
+
+启动服务：
+
+```bash
+docker run -d --network host \
+  -v /path/to/config:/data/config:ro \
+  -v /path/to/output:/data/output \
+  data_flow_analyse \
+  python3 main.py
+```
+
+提交分析：
+
+```bash
+curl -X POST http://localhost:3000/analyse \
+  -H "Content-Type: application/json" \
+  -d '{"prompt": "对 firmware.c 的 parse_packet 函数完成数据流分析"}'
+```
+
+| 端点 | 方法 | 说明 |
+|------|------|------|
+| `/analyse` | POST | 提交分析任务 |
+| `/task/{id}` | GET | 查询任务状态 |
+| `/task/{id}/stream` | GET | SSE 实时事件流 |
+| `/task/{id}/abort` | POST | 中止任务 |
+| `/tasks` | GET | 列出所有任务 |
+| `/health` | GET | 健康检查 |
+
+## 输出格式
+
+最终输出为完整的数据流树状图文档（`.md`），包含：
+
+- **元信息头**：task_id、status、轮数、耗时
+- **外部输入清单**：所有入口点及类型
+- **数据流树状图**：每个输入的完整追踪路径
+  - 🔴 TAINTED — 未清洗的脏数据
+  - 🟢 CLEANED — 经过有效校验/清洗
+  - 🟡 EXPORT — 传入外部函数（跨模块边界）
+  - 📌 USED — 数据消费点（循环控制、条件判断等）
+  - [DEFERRED] — 需要跟入但本次分析未展开
+- **污点终点汇总表**
+- **数据处理函数清单**
+
+## 部署
+
+```bash
+# 一键部署（同步代码 → 构建镜像 → 清理残留）
+bash deploy.sh
+```
+
+## 挂载说明
+
+| 容器路径 | 说明 | 模式 |
+|----------|------|------|
+| `/data/target` | 待分析的源代码文件 | 只读 |
+| `/data/config` | 服务配置 (`config.json` + `models.json`) | 只读 |
+| `/data/output` | 分析结果输出 | 读写 |

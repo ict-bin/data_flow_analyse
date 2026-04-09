@@ -38,6 +38,7 @@ def build_task_config(svc: ServiceConfig, prompt: str, cwd: str = "/data/target"
         function_name=function_name,
         cwd=cwd,
         max_rounds=svc.max_rounds,
+        min_rounds=svc.min_rounds,
         pass_threshold=svc.pass_threshold,
         agent_max_retries=svc.agent_max_retries,
         agent_retry_delay=svc.agent_retry_delay,

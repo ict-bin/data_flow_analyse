@@ -57,6 +57,8 @@ def render_event(event: SwarmEvent, quiet: bool = False):
         print(f"\n  ➜ {s}  ({d.get('pass_count')}/{d.get('total_judges')} judges)")
         if d.get("best_worker"):
             print(f"     Best: {d.get('best_worker')}")
+    elif t == "round_reflection":
+        print(f"  🔄 {d.get('message', 'Forcing reflection round')}")
     elif t == "task_end":
         print(f"\n{'═' * 60}")
         print(f"📋 {event.task_id}: {d.get('status', '').upper()}")
@@ -132,7 +134,7 @@ async def main():
 ║  File:    {cfg.source_file or '(auto)' :<46} ║
 ║  Func:    {cfg.function_name or '(auto)' :<46} ║
 ║  Workers: {cfg.worker_count:<5}  Judges: {cfg.judge_count:<33} ║
-║  Rounds:  {cfg.max_rounds:<46} ║
+║  Rounds:  {cfg.min_rounds}~{cfg.max_rounds:<44} ║
 ╚═══════════════════════════════════════════════════════════╝""")
     for i, a in enumerate(cfg.workers.agents):
         print(f"  worker-{i}: {a.model}")
