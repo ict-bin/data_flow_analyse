@@ -128,41 +128,175 @@ def _get_best_output(worker: WorkerResult) -> str:
     return worker.output
 
 
-def _parse_eval_json(output: str) -> dict:
-    """从 Judge 输出中解析单个 Worker 的评价 JSON。"""
-    code_match = re.search(r"```(?:json)?\s*\n?(.*?)\n?```", output, re.DOTALL)
-    text = code_match.group(1) if code_match else output
-    json_match = re.search(r'\{[^{}]*"pass"[^{}]*\}', text, re.DOTALL)
-    if not json_match:
-        json_match = re.search(r"\{[\s\S]*?\}", text)
-    if not json_match:
-        return {"pass": False, "score": 0, "feedback": f"无效 JSON: {output[:500]}", "refinement": ""}
-    try:
-        p = json.loads(json_match.group(0))
-        return {"pass": bool(p.get("pass", False)), "score": int(p.get("score", 0)),
-                "feedback": str(p.get("feedback", "")), "refinement": str(p.get("refinement", ""))}
-    except (json.JSONDecodeError, ValueError, TypeError):
-        return {"pass": False, "score": 0, "feedback": f"JSON 解析失败: {json_match.group(0)[:300]}", "refinement": ""}
+def _extract_json_object(text: str, required_key: str) -> dict | None:
+    """从文本中提取包含指定 key 的 JSON 对象。支持多行、嵌套引号、转义字符。"""
+    # 先尝试从 code block 中提取
+    code_match = re.search(r"```(?:json)?\s*\n(.*?)\n\s*```", text, re.DOTALL)
+    if code_match:
+        try:
+            obj = json.loads(code_match.group(1))
+            if isinstance(obj, dict) and required_key in obj:
+                return obj
+        except json.JSONDecodeError:
+            pass
+
+    # 找所有 '{' 的位置，尝试从每个位置开始解析完整 JSON
+    for i, ch in enumerate(text):
+        if ch != '{':
+            continue
+        # 快速跳过明显不是目标 JSON 的（如 C 代码的 {）
+        ahead = text[i:i+100]
+        if required_key not in ahead and '"' not in ahead[:30]:
+            continue
+        # 尝试匹配平衡的 {}
+        depth = 0
+        in_str = False
+        escape = False
+        for j in range(i, len(text)):
+            c = text[j]
+            if escape:
+                escape = False
+                continue
+            if c == '\\':
+                if in_str:
+                    escape = True
+                continue
+            if c == '"' and not escape:
+                in_str = not in_str
+                continue
+            if in_str:
+                continue
+            if c == '{':
+                depth += 1
+            elif c == '}':
+                depth -= 1
+                if depth == 0:
+                    candidate = text[i:j+1]
+                    try:
+                        obj = json.loads(candidate)
+                        if isinstance(obj, dict) and required_key in obj:
+                            return obj
+                    except json.JSONDecodeError:
+                        pass
+                    break
+    return None
 
 
-def _parse_summary_json(output: str) -> dict:
-    """从 Judge 总结中解析对比结果。"""
-    code_match = re.search(r"```(?:json)?\s*\n?(.*?)\n?```", output, re.DOTALL)
-    text = code_match.group(1) if code_match else output
-    json_match = re.search(r'\{[^{}]*"best_worker"[^{}]*\}', text, re.DOTALL)
-    if not json_match:
-        json_match = re.search(r"\{[\s\S]*?\}", text)
-    if not json_match:
-        return {"best_worker": "", "reasoning": output[:500], "overall_passed": False}
-    try:
-        p = json.loads(json_match.group(0))
+def _parse_eval_md(output: str) -> dict:
+    """从 Judge 的输出中解析评审结果。优先解析 markdown，回退到 JSON。"""
+    score = 0
+    passed = False
+    feedback = ""
+    refinement = ""
+
+    # ═══ 尝试 markdown 解析 ═══
+
+    # 提取评分
+    m = re.search(r'##\s*评分[::=：]\s*(\d+)', output)
+    if not m:
+        m = re.search(r'##\s*[Ss]core[::=：]\s*(\d+)', output)
+    if m:
+        score = min(int(m.group(1)), 100)
+
+    # 提取通过/不通过
+    m = re.search(r'##\s*通过[::=：]\s*(是|否|true|false|yes|no|pass|fail)', output, re.IGNORECASE)
+    if not m:
+        m = re.search(r'##\s*[Pp]ass[::=：]\s*(是|否|true|false|yes|no)', output, re.IGNORECASE)
+    if m:
+        passed = m.group(1).lower() in ('是', 'true', 'yes', 'pass')
+    elif score >= 70:
+        passed = True
+
+    # 提取评审意见
+    m = re.search(r'##\s*评审意见\s*\n(.*?)(?=\n##|$)', output, re.DOTALL)
+    if not m:
+        m = re.search(r'##\s*[Ff]eedback\s*\n(.*?)(?=\n##|$)', output, re.DOTALL)
+    if m:
+        feedback = m.group(1).strip()
+
+    # 提取改进指令
+    m = re.search(r'##\s*改进指令\s*\n(.*?)(?=\n##|$)', output, re.DOTALL)
+    if not m:
+        m = re.search(r'##\s*[Rr]efinement\s*\n(.*?)(?=\n##|$)', output, re.DOTALL)
+    if m:
+        refinement = m.group(1).strip()
+
+    # markdown 解析成功（至少拿到了分数）
+    if score > 0:
+        if not feedback:
+            feedback = output[:500]
+        return {"pass": passed, "score": score, "feedback": feedback, "refinement": refinement}
+
+    # ═══ 回退 JSON 解析 ═══
+
+    obj = _extract_json_object(output, "pass")
+    if obj:
         return {
-            "best_worker": str(p.get("best_worker", p.get("best_worker_id", ""))),
-            "reasoning": str(p.get("reasoning", "")),
-            "overall_passed": bool(p.get("overall_passed", p.get("pass", False))),
+            "pass": bool(obj.get("pass", False)),
+            "score": int(obj.get("score", 0)),
+            "feedback": str(obj.get("feedback", "")),
+            "refinement": str(obj.get("refinement", "")),
         }
-    except (json.JSONDecodeError, ValueError, TypeError):
-        return {"best_worker": "", "reasoning": "解析失败", "overall_passed": False}
+
+    # ═══ 最后尝试从任意文本中抽取分数 ═══
+
+    sm = re.search(r'(\d{1,3})\s*/\s*100|\b(\d{2,3})分', output)
+    if sm:
+        score = int(sm.group(1) or sm.group(2))
+        passed = score >= 70
+        return {"pass": passed, "score": score, "feedback": output[:500], "refinement": ""}
+
+    return {"pass": False, "score": 0, "feedback": output[:500], "refinement": ""}
+
+
+def _parse_summary_md(output: str) -> dict:
+    """从 Judge 的输出中解析综合对比结果。优先 markdown，回退 JSON。"""
+    best_worker = ""
+    overall_passed = False
+    reasoning = ""
+
+    # ═══ 尝试 markdown 解析 ═══
+
+    m = re.search(r'##\s*最佳\s*[Ww]orker[::=：]\s*(worker-\d+)', output, re.IGNORECASE)
+    if not m:
+        m = re.search(r'##\s*[Bb]est\s*[Ww]orker[::=：]\s*(worker-\d+)', output, re.IGNORECASE)
+    if m:
+        best_worker = m.group(1)
+
+    m = re.search(r'##\s*整体通过[::=：]\s*(是|否|true|false|yes|no)', output, re.IGNORECASE)
+    if not m:
+        m = re.search(r'##\s*[Oo]verall.*?[Pp]ass[::=：]\s*(是|否|true|false|yes|no)', output, re.IGNORECASE)
+    if m:
+        overall_passed = m.group(1).lower() in ('是', 'true', 'yes')
+
+    m = re.search(r'##\s*(?:对比理由|理由|[Rr]easoning)\s*\n(.*?)(?=\n##|$)', output, re.DOTALL)
+    if m:
+        reasoning = m.group(1).strip()
+
+    if best_worker:
+        if not reasoning:
+            reasoning = output[:500]
+        return {"best_worker": best_worker, "reasoning": reasoning, "overall_passed": overall_passed}
+
+    # ═══ 回退 JSON 解析 ═══
+
+    obj = _extract_json_object(output, "best_worker")
+    if obj:
+        return {
+            "best_worker": str(obj.get("best_worker", obj.get("best_worker_id", ""))),
+            "reasoning": str(obj.get("reasoning", "")),
+            "overall_passed": bool(obj.get("overall_passed", obj.get("pass", False))),
+        }
+
+    # ═══ 最后尝试从任意文本中找 worker-X ═══
+
+    m = re.search(r'(worker-\d+)\s*(?:最优|最好|胜出|best|winner)', output, re.IGNORECASE)
+    if not m:
+        m = re.search(r'(?:最优|最好|胜出|best|winner).*?(worker-\d+)', output, re.IGNORECASE)
+    if m:
+        best_worker = m.group(1)
+
+    return {"best_worker": best_worker, "reasoning": output[:500], "overall_passed": overall_passed}
 
 
 # ─── 编排器 ───────────────────────────────────────────────────────────────────
@@ -531,7 +665,7 @@ class Orchestrator:
                 prompt=eval_prompt, **base_kwargs, session_file=None)
             j_result.token_usage += ar.token_usage
 
-            parsed = _parse_eval_json(ar.output)
+            parsed = _parse_eval_md(ar.output)
             ev = WorkerEvaluation(
                 worker_id=w.worker_id,
                 passed=parsed["pass"],
@@ -564,7 +698,7 @@ class Orchestrator:
                 prompt=summary_prompt, **base_kwargs, session_file=None)
             j_result.token_usage += ar.token_usage
 
-            parsed = _parse_summary_json(ar.output)
+            parsed = _parse_summary_md(ar.output)
             j_result.summary = JudgeSummary(
                 best_worker_id=parsed["best_worker"],
                 reasoning=parsed["reasoning"],
@@ -614,7 +748,6 @@ class Orchestrator:
         if criteria:
             parts.append(f"## Evaluation Criteria\n\n{criteria}")
 
-        # 指引 Judge 读取文件（而非嵌入内容）
         parts.append(
             f"## {worker.worker_id}'s Output Files\n\n"
             f"Worker 的摘要输出文件: `{output_path}`\n"
@@ -623,8 +756,15 @@ class Orchestrator:
         )
 
         parts.append(
-            "Evaluate this worker's output. Respond with JSON only:\n"
-            '{"pass": true/false, "score": 0-100, "feedback": "...", "refinement": "..."}')
+            "评测完成后，请严格按以下 markdown 格式输出结果：\n\n"
+            "```\n"
+            "## 评分: <0-100的整数>\n"
+            "## 通过: <是/否>\n"
+            "## 评审意见\n"
+            "<详细评审，引用具体行号、变量名、函数名>\n"
+            "## 改进指令\n"
+            "<按优先级列出可操作的改进项，如果通过则写“无”>\n"
+            "```")
         return "\n\n".join(parts)
 
     def _build_summary_prompt(self, workers: list[WorkerResult],
@@ -639,12 +779,14 @@ class Orchestrator:
                 f"{'PASS' if ev.passed else 'FAIL'} — evaluation file: `{fpath}`")
         parts.append(
             "\n**请使用 read 工具读取以上所有 eval 文件，然后给出综合对比。**\n"
-            "\nRespond with JSON:\n"
-            "```json\n"
-            '{"best_worker": "worker-X", "reasoning": "Why this worker is best", '
-            '"overall_passed": true/false}\n'
+            "\n对比完成后，请严格按以下 markdown 格式输出：\n\n"
             "```\n"
-            "`overall_passed` = true only if the best worker's output meets all requirements.")
+            "## 最佳Worker: <worker-X>\n"
+            "## 整体通过: <是/否>\n"
+            "## 对比理由\n"
+            "<解释为什么这个 worker 最好，以及整体是否达标>\n"
+            "```\n"
+            "注意: `整体通过` 写 `是` 仅当最佳 worker 的输出满足所有要求。")
         return "\n".join(parts)
 
     # ═══════════════════════════════════════════════════════════════════════
