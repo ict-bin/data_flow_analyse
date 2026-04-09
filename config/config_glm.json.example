@@ -1,0 +1,35 @@
+{
+    "task": "分析文件 firmware.c 中函数 parse_network_packet 的外部输入数据流",
+
+    "source_file": "firmware.c",
+    "function_name": "parse_network_packet",
+
+    "max_rounds": 3,
+    "pass_threshold": 1,
+
+    "workers": {
+        "default_tools": ["read", "bash", "edit", "write", "grep", "find"],
+        "system_prompt_dir": "/opt/data_flow_analyse/prompts/workers",
+        "default_thinking_level": "off",
+        "agents": [
+            { "model": "glm/zai-org/GLM-5" },
+            { "model": "glm/zai-org/GLM-5" }
+        ]
+    },
+
+    "judges": {
+        "default_tools": ["read", "bash", "grep", "find", "ls"],
+        "system_prompt_dir": "/opt/data_flow_analyse/prompts/judges",
+        "default_thinking_level": "off",
+        "agents": [
+            { "model": "glm/zai-org/GLM-5" }
+        ]
+    },
+
+    "cwd": "/data/target",
+    "output_dir": "/data/output",
+    "archive_dir": "/data/output",
+    "result_dir": "/data/output",
+    "context": "Ghidra 反编译的嵌入式固件代码",
+    "criteria": ""
+}

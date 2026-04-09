@@ -1,0 +1,173 @@
+"""
+data_flow_analyse — 数据模型
+"""
+
+from __future__ import annotations
+
+import time
+import uuid
+from enum import Enum
+from typing import Optional
+
+from pydantic import BaseModel, Field
+
+
+# ─── Agent 实例配置 ───────────────────────────────────────────────────────────
+
+class AgentInstanceConfig(BaseModel):
+    model: str = Field(..., description="该实例使用的 LLM 模型")
+    tools: Optional[list[str]] = Field(default=None)
+    system_prompt: Optional[str] = Field(default=None)
+    thinking_level: Optional[str] = Field(default=None)
+
+
+class RoleConfig(BaseModel):
+    default_model: str = Field(default="")
+    default_tools: list[str] = Field(default_factory=lambda: ["read", "bash", "edit", "write"])
+    system_prompt_dir: str = Field(default="./prompts/workers")
+    default_thinking_level: str = Field(default="off")
+    agents: list[AgentInstanceConfig] = Field(default_factory=list)
+
+
+# ─── 服务配置（由管理员一次性配置，长期不变）─────────────────────────────────
+
+class ServiceConfig(BaseModel):
+    """config.json — 服务提供者配置，不含任务信息"""
+    max_rounds: int = Field(default=3, ge=1, le=10)
+    pass_threshold: Optional[int] = Field(default=None)
+    agent_max_retries: int = Field(default=100, description="API 错误时最大重试次数")
+    agent_retry_delay: float = Field(default=30.0, description="首次重试等待秒数，指数退避")
+
+    workers: RoleConfig = Field(default_factory=RoleConfig)
+    judges: RoleConfig = Field(default_factory=RoleConfig)
+
+    output_dir: str = Field(default="/data/output")
+    archive_dir: str = Field(default="/data/output")
+    result_dir: str = Field(default="/data/output")
+
+    context: str = Field(default="", description="全局额外上下文（所有任务共用）")
+    criteria: str = Field(default="", description="全局评判标准（所有任务共用）")
+
+
+# ─── 运行时任务（由 ServiceConfig + 用户输入合成）─────────────────────────────
+
+class TaskConfig(BaseModel):
+    """运行时完整配置 = 服务配置 + 用户输入"""
+    # 用户输入部分
+    task: str = Field(..., description="用户的一句话 prompt")
+    source_file: str = Field(default="", description="从 prompt 解析出的文件名")
+    function_name: str = Field(default="", description="从 prompt 解析出的函数名")
+    cwd: str = Field(default="/data/target", description="待分析文件所在目录")
+
+    # 服务配置部分（从 ServiceConfig 合并）
+    max_rounds: int = Field(default=3)
+    pass_threshold: Optional[int] = Field(default=None)
+    agent_max_retries: int = Field(default=100)
+    agent_retry_delay: float = Field(default=30.0)
+    workers: RoleConfig = Field(default_factory=RoleConfig)
+    judges: RoleConfig = Field(default_factory=RoleConfig)
+    output_dir: str = Field(default="/data/output")
+    archive_dir: str = Field(default="/data/output")
+    result_dir: str = Field(default="/data/output")
+    context: str = Field(default="")
+    criteria: str = Field(default="")
+
+    @property
+    def worker_count(self) -> int:
+        return len(self.workers.agents)
+
+    @property
+    def judge_count(self) -> int:
+        return len(self.judges.agents)
+
+
+# ─── Token 统计 ───────────────────────────────────────────────────────────────
+
+class TokenUsage(BaseModel):
+    input: int = 0
+    output: int = 0
+    cache_read: int = 0
+    cache_write: int = 0
+    cost: float = 0.0
+
+    def __iadd__(self, other: TokenUsage) -> TokenUsage:
+        self.input += other.input
+        self.output += other.output
+        self.cache_read += other.cache_read
+        self.cache_write += other.cache_write
+        self.cost += other.cost
+        return self
+
+
+# ─── 执行结果 ─────────────────────────────────────────────────────────────────
+
+class TaskStatus(str, Enum):
+    PENDING = "pending"
+    RUNNING = "running"
+    PASSED = "passed"
+    FAILED = "failed"
+    ERROR = "error"
+
+
+class WorkerResult(BaseModel):
+    worker_id: str
+    model: str = ""
+    output: str = ""
+    dataflow_file: str = ""  # Worker 写入的 dataflow-*.md 路径
+    token_usage: TokenUsage = Field(default_factory=TokenUsage)
+    error: Optional[str] = None
+
+
+class WorkerEvaluation(BaseModel):
+    worker_id: str
+    passed: bool = False
+    score: int = 0
+    feedback: str = ""
+    refinement: str = ""
+
+
+class JudgeSummary(BaseModel):
+    best_worker_id: str = ""
+    reasoning: str = ""
+    overall_passed: bool = False
+
+
+class JudgeRoundResult(BaseModel):
+    judge_id: str
+    model: str = ""
+    evaluations: list[WorkerEvaluation] = Field(default_factory=list)
+    summary: Optional[JudgeSummary] = None
+    token_usage: TokenUsage = Field(default_factory=TokenUsage)
+
+
+class RoundResult(BaseModel):
+    round: int
+    worker_results: list[WorkerResult] = Field(default_factory=list)
+    judge_results: list[JudgeRoundResult] = Field(default_factory=list)
+    pass_count: int = 0
+    total_judges: int = 0
+    passed: bool = False
+    best_worker_id: str = ""
+    feedback_to_workers: str = ""
+
+
+class TaskResult(BaseModel):
+    task_id: str
+    status: TaskStatus = TaskStatus.RUNNING
+    task: str
+    config_snapshot: Optional[dict] = None
+    rounds: list[RoundResult] = Field(default_factory=list)
+    final_output: str = ""
+    total_duration_ms: float = 0
+    total_tokens: TokenUsage = Field(default_factory=TokenUsage)
+    error: Optional[str] = None
+
+
+class SwarmEvent(BaseModel):
+    type: str
+    task_id: str
+    data: dict = Field(default_factory=dict)
+
+
+def make_id() -> str:
+    return f"task-{int(time.time())}-{uuid.uuid4().hex[:8]}"

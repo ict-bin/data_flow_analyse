@@ -1,0 +1,33 @@
+{
+    "max_rounds": 3,
+    "pass_threshold": 2,
+    "agent_max_retries": 100,
+    "agent_retry_delay": 30,
+
+    "workers": {
+        "default_tools": ["read", "bash", "edit", "write", "grep", "find"],
+        "system_prompt_dir": "/opt/data_flow_analyse/prompts/workers",
+        "default_thinking_level": "off",
+        "agents": [
+            { "model": "vllm/zai-org/GLM-5" },
+            { "model": "vllm/zai-org/GLM-5" }
+        ]
+    },
+
+    "judges": {
+        "default_tools": ["read", "bash", "grep", "find", "ls"],
+        "system_prompt_dir": "/opt/data_flow_analyse/prompts/judges",
+        "default_thinking_level": "off",
+        "agents": [
+            { "model": "vllm/zai-org/GLM-5" },
+            { "model": "vllm/zai-org/GLM-5" }
+        ]
+    },
+
+    "output_dir": "/data/output",
+    "archive_dir": "/data/output",
+    "result_dir": "/data/output",
+
+    "context": "",
+    "criteria": "重点：外部输入识别完整性、污点追踪深度（子函数必须跟入）、数据处理函数覆盖"
+}

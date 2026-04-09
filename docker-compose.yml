@@ -1,0 +1,30 @@
+version: "3.8"
+
+services:
+  data_flow_analyse:
+    build: .
+    ports:
+      - "${PORT:-3000}:3000"
+    environment:
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - PORT=3000
+      - OUTPUT_DIR=/data/output
+      - SESSION_DIR=/data/sessions
+    volumes:
+      # 二进制/待分析文件（只读）
+      - ./target:/data/target:ro
+      # 配置文件 + 自定义 prompts（只读）
+      - ./config:/data/config:ro
+      # 输出持久化
+      - ./output:/data/output
+      # 工作空间（Agent 读写）
+      - ./target:/data/workspace:ro
+      # Session 归档
+      - ./sessions:/data/sessions
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
