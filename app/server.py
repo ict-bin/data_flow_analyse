@@ -113,7 +113,7 @@ async def submit_analyse(body: AnalyseRequest):
 
     async def _run():
         try:
-            entry.result = await orch.execute(task_id)
+            entry.result = await orch.execute_recursive(task_id)
         except Exception as e:
             entry.result = TaskResult(
                 task_id=task_id, status=TaskStatus.ERROR,

@@ -42,6 +42,7 @@ def build_task_config(svc: ServiceConfig, prompt: str, cwd: str = "/data/target"
         pass_threshold=svc.pass_threshold,
         agent_max_retries=svc.agent_max_retries,
         agent_retry_delay=svc.agent_retry_delay,
+        max_trace_depth=svc.max_trace_depth,
         workers=svc.workers.model_copy(deep=True),
         judges=svc.judges.model_copy(deep=True),
         output_dir=svc.output_dir,

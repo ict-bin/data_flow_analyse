@@ -38,6 +38,7 @@ class ServiceConfig(BaseModel):
     pass_threshold: Optional[int] = Field(default=None)
     agent_max_retries: int = Field(default=100, description="API 错误时最大重试次数")
     agent_retry_delay: float = Field(default=30.0, description="首次重试等待秒数，指数退避")
+    max_trace_depth: int = Field(default=3, ge=1, le=10, description="函数调用递归追踪最大深度")
 
     workers: RoleConfig = Field(default_factory=RoleConfig)
     judges: RoleConfig = Field(default_factory=RoleConfig)
@@ -66,6 +67,7 @@ class TaskConfig(BaseModel):
     pass_threshold: Optional[int] = Field(default=None)
     agent_max_retries: int = Field(default=100)
     agent_retry_delay: float = Field(default=30.0)
+    max_trace_depth: int = Field(default=3)
     workers: RoleConfig = Field(default_factory=RoleConfig)
     judges: RoleConfig = Field(default_factory=RoleConfig)
     output_dir: str = Field(default="/data/output")
@@ -118,6 +120,15 @@ class WorkerResult(BaseModel):
     dataflow_file: str = ""  # Worker 写入的 dataflow-*.md 路径
     token_usage: TokenUsage = Field(default_factory=TokenUsage)
     error: Optional[str] = None
+
+
+class CalleeRef(BaseModel):
+    """子函数引用（从 Worker 输出中解析）"""
+    function_name: str
+    file: str = ""
+    line: str = ""
+    tainted_params: str = ""
+    description: str = ""
 
 
 class WorkerEvaluation(BaseModel):

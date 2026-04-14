@@ -1,6 +1,6 @@
 # data_flow_analyse
 
-基于多 Agent 协作的外部输入数据流自动化分析系统。多个 Worker 并行分析同一函数，多个 Judge 独立评审，迭代优化直到通过。
+基于多 Agent 协作的外部输入数据流自动化分析系统。多个 Worker 并行分析同一函数，多个 Judge 独立评审，迭代优化直到通过。子函数调用自动递归分析。
 
 ## 架构
 
@@ -47,6 +47,9 @@
 
 | 特性 | 说明 |
 |------|------|
+| **递归追踪** | 子函数调用自动触发新的 Worker+Judge 流水线，防止上下文过长和跟踪深度不足 |
+| **深度可控** | `max_trace_depth` 配置递归深度（默认 3），自动去重防止循环 |
+| **全量跟入** | 所有函数调用都尝试跟入，只有确认找不到定义的才标记 EXPORT |
 | **Worker 并行** | 多个 Worker 同时分析同一函数，各自独立工作目录 |
 | **Worker 保持上下文** | 使用 `--session` 跨轮累积上下文，第 2 轮能看到第 1 轮的全部对话 |
 | **Judge 独立上下文** | 每次评审新起上下文（`--no-session`），防止 Worker 间评审互相影响 |
@@ -157,6 +160,7 @@ output/
 | `pass_threshold` | `ceil(judges/2)` | 通过所需的 Judge 投票数 |
 | `agent_max_retries` | 100 | API 错误时最大重试次数 |
 | `agent_retry_delay` | 30 | 首次重试等待秒数（指数退避） |
+| `max_trace_depth` | 3 | 函数调用递归追踪最大深度 |
 | `workers.agents[]` | - | Worker 实例列表，每个可指定独立模型 |
 | `judges.agents[]` | - | Judge 实例列表，每个可指定独立模型 |
 | `context` | "" | 全局额外上下文（所有任务共用） |

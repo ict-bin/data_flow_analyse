@@ -59,6 +59,17 @@ def render_event(event: SwarmEvent, quiet: bool = False):
             print(f"     Best: {d.get('best_worker')}")
     elif t == "round_reflection":
         print(f"  🔄 {d.get('message', 'Forcing reflection round')}")
+    elif t == "trace_start":
+        indent = "  " * d.get("depth", 0)
+        print(f"\n{indent}🔍 Trace: {d.get('function', '?')} (depth={d.get('depth')}/{d.get('max_depth')})")
+    elif t == "trace_callees":
+        indent = "  " * d.get("depth", 0)
+        funcs = d.get("callees", [])
+        print(f"{indent}  └─ {len(funcs)} sub-functions: {', '.join(funcs[:5])}{'...' if len(funcs)>5 else ''}")
+    elif t == "trace_depth_limit":
+        print(f"  ⚠️  Depth limit: {d.get('function', '?')}")
+    elif t == "trace_skip":
+        print(f"  ⏭️  Skip: {d.get('function', '?')} ({d.get('reason', '')})")
     elif t == "task_end":
         print(f"\n{'═' * 60}")
         print(f"📋 {event.task_id}: {d.get('status', '').upper()}")
@@ -142,7 +153,7 @@ async def main():
         print(f"  judge-{i}:  {a.model}")
 
     orch = Orchestrator(config=cfg, on_event=lambda e: render_event(e, quiet=quiet))
-    result = await orch.execute()
+    result = await orch.execute_recursive()
 
     print(f"\n📊 Summary:")
     print(f"   Status:   {result.status.value}")

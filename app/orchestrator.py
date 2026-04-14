@@ -67,6 +67,7 @@ from typing import Callable
 from .config import load_system_prompts, resolve_system_prompt
 from .models import (
     AgentInstanceConfig,
+    CalleeRef,
     JudgeRoundResult,
     JudgeSummary,
     RoundResult,
@@ -126,6 +127,38 @@ def _get_best_output(worker: WorkerResult) -> str:
         except OSError:
             pass
     return worker.output
+
+
+def _parse_callees(dataflow_content: str) -> list[CalleeRef]:
+    """从 Worker 的 dataflow 文件中解析'需要跟入的函数调用'表格。"""
+    callees: list[CalleeRef] = []
+    in_table = False
+    for line in dataflow_content.split("\n"):
+        stripped = line.strip()
+        if "需要跟入的函数调用" in stripped:
+            in_table = True
+            continue
+        if in_table and stripped.startswith("|"):
+            cells = [c.strip() for c in stripped.split("|")]
+            cells = [c for c in cells if c]
+            if len(cells) < 2:
+                continue
+            if cells[0] in ("函数名", "Function") or cells[0].startswith("---"):
+                continue
+            desc = cells[4] if len(cells) > 4 else ""
+            if "未找到定义" in desc or "EXPORT" in desc.upper():
+                continue
+            callees.append(CalleeRef(
+                function_name=cells[0],
+                file=cells[1] if len(cells) > 1 else "",
+                line=cells[2] if len(cells) > 2 else "",
+                tainted_params=cells[3] if len(cells) > 3 else "",
+                description=desc,
+            ))
+        elif in_table and stripped and not stripped.startswith("|"):
+            if not stripped.startswith("---") and not stripped.startswith("*"):
+                in_table = False
+    return callees
 
 
 def _extract_json_object(text: str, required_key: str) -> dict | None:
@@ -584,6 +617,109 @@ class Orchestrator:
     def abort(self):
         if self._cancel_event:
             self._cancel_event.set()
+
+
+
+
+    # ═══════════════════════════════════════════════════════════════════════
+    # 递归分析入口
+    # ═══════════════════════════════════════════════════════════════════════
+
+    async def execute_recursive(
+        self,
+        task_id: str | None = None,
+        depth: int = 0,
+        tainted_context: str = "",
+        _analyzed: set[str] | None = None,
+    ) -> TaskResult:
+        """递归分析：当前函数 Worker+Judge → 解析子函数 → 递归。"""
+        cfg = self.cfg
+        max_depth = cfg.max_trace_depth
+        analyzed = _analyzed if _analyzed is not None else set()
+
+        func_key = cfg.source_file + "::" + cfg.function_name
+        if func_key in analyzed:
+            self._emit("trace_skip", task_id or "",
+                       function=cfg.function_name, reason="already analyzed")
+            skip_out = "# " + cfg.function_name + "\n\n(已在其他分支中分析，跳过)"
+            return TaskResult(
+                task_id=task_id or make_id(), status=TaskStatus.PASSED,
+                task=cfg.task, final_output=skip_out)
+        analyzed.add(func_key)
+
+        if depth > 0:
+            depth_note = "\n\n# 追踪深度: " + str(depth) + "/" + str(max_depth)
+        else:
+            depth_note = ""
+        if tainted_context:
+            cfg.context = (cfg.context or "") + "\n\n# 调用者传入的脏数据\n" + tainted_context + depth_note
+        elif depth_note:
+            cfg.context = (cfg.context or "") + depth_note
+
+        self._emit("trace_start", task_id or "",
+                   function=cfg.function_name, depth=depth, max_depth=max_depth)
+
+        result = await self.execute(task_id)
+
+        if depth >= max_depth:
+            self._emit("trace_depth_limit", result.task_id,
+                       function=cfg.function_name, depth=depth)
+            return result
+
+        callees = _parse_callees(result.final_output)
+        if not callees:
+            return result
+
+        self._emit("trace_callees", result.task_id,
+                   function=cfg.function_name,
+                   callees=[c.function_name for c in callees], depth=depth)
+
+        sub_outputs: list[str] = []
+
+        for callee in callees:
+            callee_key = (callee.file or cfg.source_file) + "::" + callee.function_name
+            if callee_key in analyzed:
+                hdr = ("\n---\n\n# 子追踪: " + callee.function_name
+                       + " (depth=" + str(depth + 1) + ")\n\n(跳过，已分析)\n")
+                sub_outputs.append(hdr)
+                continue
+
+            sub_file = callee.file or cfg.source_file
+            sub_prompt = "分析文件 " + sub_file + " 中函数 " + callee.function_name + " 的数据流"
+
+            sub_cfg = cfg.model_copy(deep=True)
+            sub_cfg.task = sub_prompt
+            sub_cfg.function_name = callee.function_name
+            sub_cfg.source_file = sub_file
+            ctx_base = cfg.context or ""
+            if "# 调用者传入的脏数据" in ctx_base:
+                ctx_base = ctx_base.split("# 调用者传入的脏数据")[0].strip()
+            sub_cfg.context = ctx_base
+
+            tainted_ctx = ("函数 " + callee.function_name + " 被 " + cfg.function_name
+                           + " 在 " + callee.line + " 调用。\n"
+                           + "污染参数: " + callee.tainted_params + "\n"
+                           + "说明: " + callee.description)
+
+            sub_orch = Orchestrator(config=sub_cfg, on_event=self._on_event)
+            sub_id = result.task_id + "-d" + str(depth + 1) + "-" + callee.function_name[:30]
+
+            sub_result = await sub_orch.execute_recursive(
+                task_id=sub_id, depth=depth + 1,
+                tainted_context=tainted_ctx, _analyzed=analyzed)
+
+            result.total_tokens += sub_result.total_tokens
+            result.total_duration_ms += sub_result.total_duration_ms
+
+            if sub_result.final_output:
+                hdr = ("\n---\n\n# 子追踪: " + callee.function_name
+                       + " (depth=" + str(depth + 1) + ")\n\n")
+                sub_outputs.append(hdr + sub_result.final_output + "\n")
+
+        if sub_outputs:
+            result.final_output = result.final_output + "\n" + "\n".join(sub_outputs)
+
+        return result
 
     # ═══════════════════════════════════════════════════════════════════════
     # Judge 多轮评判逻辑
