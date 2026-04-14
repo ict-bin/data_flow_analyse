@@ -670,6 +670,18 @@ class Orchestrator:
         if not callees:
             return result
 
+        # 防护：过滤自递归 + 已分析函数 + 单层上限
+        MAX_CALLEES_PER_LEVEL = 10
+        filtered: list[CalleeRef] = []
+        for c in callees:
+            c_key = (c.file or cfg.source_file) + "::" + c.function_name
+            if c.function_name == cfg.function_name:
+                continue  # 自递归
+            if c_key in analyzed:
+                continue  # 已分析
+            filtered.append(c)
+        callees = filtered[:MAX_CALLEES_PER_LEVEL]
+
         self._emit("trace_callees", result.task_id,
                    function=cfg.function_name,
                    callees=[c.function_name for c in callees], depth=depth)
@@ -677,15 +689,12 @@ class Orchestrator:
         sub_outputs: list[str] = []
 
         for callee in callees:
-            callee_key = (callee.file or cfg.source_file) + "::" + callee.function_name
-            if callee_key in analyzed:
-                hdr = ("\n---\n\n# 子追踪: " + callee.function_name
-                       + " (depth=" + str(depth + 1) + ")\n\n(跳过，已分析)\n")
-                sub_outputs.append(hdr)
-                continue
 
             sub_file = callee.file or cfg.source_file
-            sub_prompt = "分析文件 " + sub_file + " 中函数 " + callee.function_name + " 的数据流"
+            sub_prompt = (
+                "分析文件 " + sub_file + " 中函数 " + callee.function_name + " 的数据流。"
+                + " 只追踪以下被污染的参数: " + (callee.tainted_params or "所有参数")
+            )
 
             sub_cfg = cfg.model_copy(deep=True)
             sub_cfg.task = sub_prompt
@@ -701,7 +710,7 @@ class Orchestrator:
                            + "污染参数: " + callee.tainted_params + "\n"
                            + "说明: " + callee.description)
 
-            sub_orch = Orchestrator(config=sub_cfg, on_event=self._on_event)
+            sub_orch = Orchestrator(config=sub_cfg, on_event=self.on_event)
             sub_id = result.task_id + "-d" + str(depth + 1) + "-" + callee.function_name[:30]
 
             sub_result = await sub_orch.execute_recursive(
