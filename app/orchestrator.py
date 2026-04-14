@@ -146,7 +146,13 @@ def _parse_callees(dataflow_content: str) -> list[CalleeRef]:
             if cells[0] in ("函数名", "Function") or cells[0].startswith("---"):
                 continue
             desc = cells[4] if len(cells) > 4 else ""
-            if "未找到定义" in desc or "EXPORT" in desc.upper():
+            # 检查所有列是否含有“未找到定义”/“EXPORT”/“extern”
+            all_cols = " ".join(cells)
+            if "未找到定义" in all_cols or "EXPORT" in all_cols.upper() or "extern" in all_cols.lower():
+                continue
+            # 函数名有效性检查：必须是合法标识符
+            fname = cells[0]
+            if not re.match(r'^[A-Za-z_]\w*$', fname) or fname in ('N/A', 'NA', 'None', 'null', 'void'):
                 continue
             callees.append(CalleeRef(
                 function_name=cells[0],
@@ -749,7 +755,8 @@ class Orchestrator:
             if sub_result.final_output:
                 # 将子函数输出写入根工作目录
                 if root_out_dir:
-                    sub_df_path = root_out_dir / ("dataflow-" + callee.function_name + ".md")
+                    safe_name = re.sub(r'[^A-Za-z0-9_-]', '_', callee.function_name)
+                    sub_df_path = root_out_dir / ("dataflow-" + safe_name + ".md")
                     sub_df_path.write_text(sub_result.final_output, encoding="utf-8")
                     sub_dataflow_files.append((callee.function_name, str(sub_df_path)))
 
