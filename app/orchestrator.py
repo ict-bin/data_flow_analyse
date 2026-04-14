@@ -353,7 +353,7 @@ class Orchestrator:
         except Exception:
             pass
 
-    async def execute(self, task_id: str | None = None) -> TaskResult:
+    async def execute(self, task_id: str | None = None, *, archive: bool = True) -> TaskResult:
         cfg = self.cfg
         task_id = task_id or make_id()
         start = time.time()
@@ -584,6 +584,13 @@ class Orchestrator:
         (out_dir / "report.md").write_text(self._report(result), encoding="utf-8")
         (out_dir / "result.json").write_text(result.model_dump_json(indent=2), encoding="utf-8")
 
+        if not archive:
+            # 子任务模式：不压缩/不清理/不写 result_dir，留给根任务统一处理
+            self._emit("task_end", task_id,
+                       status=result.status.value, function=cfg.function_name)
+            self._cancel_event = None
+            return result
+
         # 2) 格式化最终输出 → 写到 result_dir（挂载的输出目录）
         result_dir = Path(os.path.abspath(cfg.result_dir))
         result_dir.mkdir(parents=True, exist_ok=True)
@@ -621,6 +628,7 @@ class Orchestrator:
 
 
 
+
     # ═══════════════════════════════════════════════════════════════════════
     # 递归分析入口
     # ═══════════════════════════════════════════════════════════════════════
@@ -631,12 +639,15 @@ class Orchestrator:
         depth: int = 0,
         tainted_context: str = "",
         _analyzed: set[str] | None = None,
+        _root_out_dir: Path | None = None,
     ) -> TaskResult:
-        """递归分析：当前函数 Worker+Judge → 解析子函数 → 递归。"""
+        """递归分析：当前函数 Worker+Judge → 解析子函数 → 递归 → merge。"""
         cfg = self.cfg
         max_depth = cfg.max_trace_depth
+        is_root = (depth == 0)
         analyzed = _analyzed if _analyzed is not None else set()
 
+        # 防止重复分析
         func_key = cfg.source_file + "::" + cfg.function_name
         if func_key in analyzed:
             self._emit("trace_skip", task_id or "",
@@ -647,6 +658,7 @@ class Orchestrator:
                 task=cfg.task, final_output=skip_out)
         analyzed.add(func_key)
 
+        # 注入深度和污染上下文
         if depth > 0:
             depth_note = "\n\n# 追踪深度: " + str(depth) + "/" + str(max_depth)
         else:
@@ -656,40 +668,52 @@ class Orchestrator:
         elif depth_note:
             cfg.context = (cfg.context or "") + depth_note
 
+        # 子任务的 output_dir 放在根任务目录下
+        if _root_out_dir and not is_root:
+            sub_dir_name = "depth" + str(depth) + "-" + cfg.function_name[:40]
+            cfg.output_dir = str(_root_out_dir / sub_dir_name)
+
         self._emit("trace_start", task_id or "",
                    function=cfg.function_name, depth=depth, max_depth=max_depth)
 
-        result = await self.execute(task_id)
+        # ─── 步骤1：当前函数的 Worker+Judge 分析（子任务不归档）───
+        result = await self.execute(task_id, archive=is_root and max_depth == 0)
 
+        # 确定根任务工作目录
+        root_out_dir = _root_out_dir
+        if is_root and root_out_dir is None:
+            root_out_dir = Path(os.path.abspath(cfg.output_dir)) / result.task_id
+
+        # ─── 步骤2：解析子函数列表 ───
         if depth >= max_depth:
             self._emit("trace_depth_limit", result.task_id,
                        function=cfg.function_name, depth=depth)
+            if is_root:
+                self._do_final_archive(result, root_out_dir)
             return result
 
         callees = _parse_callees(result.final_output)
-        if not callees:
-            return result
-
-        # 防护：过滤自递归 + 已分析函数 + 单层上限
+        # 防护：过滤自递归 + 已分析 + 单层上限
         MAX_CALLEES_PER_LEVEL = 10
         filtered: list[CalleeRef] = []
         for c in callees:
             c_key = (c.file or cfg.source_file) + "::" + c.function_name
             if c.function_name == cfg.function_name:
-                continue  # 自递归
+                continue
             if c_key in analyzed:
-                continue  # 已分析
+                continue
             filtered.append(c)
         callees = filtered[:MAX_CALLEES_PER_LEVEL]
 
-        self._emit("trace_callees", result.task_id,
-                   function=cfg.function_name,
-                   callees=[c.function_name for c in callees], depth=depth)
+        if callees:
+            self._emit("trace_callees", result.task_id,
+                       function=cfg.function_name,
+                       callees=[c.function_name for c in callees], depth=depth)
 
-        sub_outputs: list[str] = []
+        # ─── 步骤3：递归分析每个子函数 ───
+        sub_dataflow_files: list[tuple[str, str]] = []  # (func_name, dataflow_path)
 
         for callee in callees:
-
             sub_file = callee.file or cfg.source_file
             sub_prompt = (
                 "分析文件 " + sub_file + " 中函数 " + callee.function_name + " 的数据流。"
@@ -715,20 +739,143 @@ class Orchestrator:
 
             sub_result = await sub_orch.execute_recursive(
                 task_id=sub_id, depth=depth + 1,
-                tainted_context=tainted_ctx, _analyzed=analyzed)
+                tainted_context=tainted_ctx, _analyzed=analyzed,
+                _root_out_dir=root_out_dir)
 
             result.total_tokens += sub_result.total_tokens
             result.total_duration_ms += sub_result.total_duration_ms
 
+            # 收集子函数 dataflow 路径
             if sub_result.final_output:
-                hdr = ("\n---\n\n# 子追踪: " + callee.function_name
-                       + " (depth=" + str(depth + 1) + ")\n\n")
-                sub_outputs.append(hdr + sub_result.final_output + "\n")
+                # 将子函数输出写入根工作目录
+                if root_out_dir:
+                    sub_df_path = root_out_dir / ("dataflow-" + callee.function_name + ".md")
+                    sub_df_path.write_text(sub_result.final_output, encoding="utf-8")
+                    sub_dataflow_files.append((callee.function_name, str(sub_df_path)))
 
-        if sub_outputs:
-            result.final_output = result.final_output + "\n" + "\n".join(sub_outputs)
+        # ─── 步骤4：根层合并 + 归档 ───
+        if is_root:
+            # 将根函数的 dataflow 也保存
+            if root_out_dir and result.final_output:
+                root_df_path = root_out_dir / ("dataflow-" + cfg.function_name + ".md")
+                root_df_path.write_text(result.final_output, encoding="utf-8")
+                sub_dataflow_files.insert(0, (cfg.function_name, str(root_df_path)))
+
+            # 运行 merge agent 合并所有 dataflow
+            if sub_dataflow_files and root_out_dir:
+                merged = await self._run_merge_agent(
+                    root_function=cfg.function_name,
+                    dataflow_files=sub_dataflow_files,
+                    cwd=str(root_out_dir),
+                    result=result)
+                if merged:
+                    result.final_output = merged
+
+            self._do_final_archive(result, root_out_dir)
 
         return result
+
+    def _do_final_archive(self, result: TaskResult, root_out_dir: Path | None):
+        """统一归档：写报告 + 压缩 + 输出结果文件 + 清理。"""
+        cfg = self.cfg
+        if not root_out_dir or not root_out_dir.exists():
+            return
+
+        # 写报告
+        (root_out_dir / "report.md").write_text(self._report(result), encoding="utf-8")
+        (root_out_dir / "result.json").write_text(result.model_dump_json(indent=2), encoding="utf-8")
+
+        # 格式化最终输出
+        result_dir = Path(os.path.abspath(cfg.result_dir))
+        result_dir.mkdir(parents=True, exist_ok=True)
+        cleaned_output = self._format_final_output(result)
+        result_filename = self._make_result_filename(cfg, "md")
+        (result_dir / result_filename).write_text(cleaned_output, encoding="utf-8")
+        result.final_output = cleaned_output
+
+        # 压缩全部（包含所有子任务工作目录）
+        archive_dir = Path(os.path.abspath(cfg.archive_dir))
+        archive_dir.mkdir(parents=True, exist_ok=True)
+        zip_name = self._make_result_filename(cfg, "zip", suffix="_log")
+        zip_path = archive_dir / zip_name
+        shutil.make_archive(
+            str(zip_path).removesuffix(".zip"),
+            "zip",
+            root_dir=str(root_out_dir.parent),
+            base_dir=root_out_dir.name,
+        )
+
+        # 清理
+        shutil.rmtree(root_out_dir, ignore_errors=True)
+
+        self._emit("task_end", result.task_id,
+                    status=result.status.value,
+                    archive=str(zip_path),
+                    result_file=str(result_dir / result_filename))
+
+    async def _run_merge_agent(
+        self,
+        root_function: str,
+        dataflow_files: list[tuple[str, str]],
+        cwd: str,
+        result: TaskResult,
+    ) -> str | None:
+        """合并所有子函数 dataflow 为统一的完整数据流文档。"""
+        cfg = self.cfg
+        if not dataflow_files:
+            return None
+
+        file_list = "\n".join(
+            "- `" + name + "`: `" + path + "`"
+            for name, path in dataflow_files
+        )
+        merge_prompt = (
+            "# 合并数据流文档\n\n"
+            "你是数据流分析专家。以下是对函数 " + root_function + " 及其调用链中各子函数的独立数据流分析文档。\n\n"
+            "请使用 `read` 工具逐一读取以下文件，然后合并为一个完整的数据流树状图文档：\n\n"
+            + file_list + "\n\n"
+            "## 合并要求\n\n"
+            "1. 以根函数 " + root_function + " 为起点，构建完整的调用链数据流\n"
+            "2. 子函数的分析结果嵌入到父函数调用点下方，形成层级结构\n"
+            "3. 保留所有污点标记（🔴/🟢/🟡/📌）和行号\n"
+            "4. 生成统一的污点终点汇总表和数据处理函数清单（合并所有层级）\n"
+            "5. 在文档开头添加完整的调用链概览图\n\n"
+            "使用 `write` 工具将合并后的文档写入 `merged-dataflow-" + root_function + ".md`"
+        )
+
+        self._emit("merge_start", result.task_id, function=root_function,
+                    file_count=len(dataflow_files))
+
+        # 用第一个 worker 的配置跑 merge
+        w_cfg = cfg.workers.agents[0] if cfg.workers.agents else AgentInstanceConfig(model="")
+        ar = await run_agent(
+            prompt=merge_prompt,
+            model=w_cfg.model,
+            tools=["read", "write", "bash"],
+            system_prompt="你是数据流分析专家，擅长合并多层级的数据流追踪文档。",
+            cwd=cwd,
+            thinking_level=w_cfg.thinking_level or "off",
+            session_file=None,
+            max_retries=cfg.agent_max_retries,
+            retry_delay=cfg.agent_retry_delay,
+        )
+
+        result.total_tokens += ar.token_usage
+
+        # 搜索合并后的文件
+        merged_path = Path(cwd) / ("merged-dataflow-" + root_function + ".md")
+        if merged_path.exists():
+            content = merged_path.read_text(encoding="utf-8")
+            self._emit("merge_done", result.task_id, size=len(content))
+            return content
+
+        # 回退：尝试从输出中提取
+        if ar.output and len(ar.output) > 200:
+            self._emit("merge_done", result.task_id, size=len(ar.output))
+            return ar.output
+
+        self._emit("merge_failed", result.task_id, error=ar.error or "no output")
+        return None
 
     # ═══════════════════════════════════════════════════════════════════════
     # Judge 多轮评判逻辑

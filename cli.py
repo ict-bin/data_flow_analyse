@@ -70,6 +70,12 @@ def render_event(event: SwarmEvent, quiet: bool = False):
         print(f"  ⚠️  Depth limit: {d.get('function', '?')}")
     elif t == "trace_skip":
         print(f"  ⏭️  Skip: {d.get('function', '?')} ({d.get('reason', '')})")
+    elif t == "merge_start":
+        print(f"\n🔀 Merging {d.get('file_count', 0)} dataflow documents...")
+    elif t == "merge_done":
+        print(f"  ✅ Merged ({d.get('size', 0)} chars)")
+    elif t == "merge_failed":
+        print(f"  ❌ Merge failed: {d.get('error', '')}")
     elif t == "task_end":
         print(f"\n{'═' * 60}")
         print(f"📋 {event.task_id}: {d.get('status', '').upper()}")
