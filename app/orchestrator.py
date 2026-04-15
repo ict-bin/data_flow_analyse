@@ -763,17 +763,23 @@ class Orchestrator:
 
         # ─── 步骤4：根层合并 + 归档 ───
         if is_root:
-            # 将根函数的 dataflow 也保存
+            # 保存根函数 dataflow
             if root_out_dir and result.final_output:
                 root_df_path = root_out_dir / ("dataflow-" + cfg.function_name + ".md")
                 root_df_path.write_text(result.final_output, encoding="utf-8")
-                sub_dataflow_files.insert(0, (cfg.function_name, str(root_df_path)))
 
-            # 运行 merge agent 合并所有 dataflow
-            if sub_dataflow_files and root_out_dir:
+            # 扫描 root_out_dir 下所有 dataflow-*.md（包含所有深度的子函数）
+            all_dataflow_files: list[tuple[str, str]] = []
+            if root_out_dir:
+                for df_path in sorted(root_out_dir.glob("dataflow-*.md")):
+                    fname = df_path.stem.replace("dataflow-", "")
+                    all_dataflow_files.append((fname, str(df_path)))
+
+            # 运行 merge agent
+            if all_dataflow_files and root_out_dir:
                 merged = await self._run_merge_agent(
                     root_function=cfg.function_name,
-                    dataflow_files=sub_dataflow_files,
+                    dataflow_files=all_dataflow_files,
                     cwd=str(root_out_dir),
                     result=result)
                 if merged:
