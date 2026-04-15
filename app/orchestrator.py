@@ -131,40 +131,78 @@ def _get_best_output(worker: WorkerResult) -> str:
 
 
 def _parse_callees(dataflow_content: str) -> list[CalleeRef]:
-    """从 Worker 的 dataflow 文件中解析'需要跟入的函数调用'表格。"""
+    """从 Worker 的 dataflow 文件中解析'需要跟入的函数调用'表格。
+    兼容多种列格式（自动检测函数名列位置）。"""
     callees: list[CalleeRef] = []
     in_table = False
+    func_col = -1
+    file_col = -1
+    line_col = -1
+    param_col = -1
+    desc_col = -1
+
     for line in dataflow_content.split("\n"):
         stripped = line.strip()
         if "需要跟入的函数调用" in stripped:
             in_table = True
+            func_col = -1
             continue
-        if in_table and stripped.startswith("|"):
-            cells = [c.strip() for c in stripped.split("|")]
-            cells = [c for c in cells if c]
-            if len(cells) < 2:
-                continue
-            if cells[0] in ("函数名", "Function") or cells[0].startswith("---"):
-                continue
-            desc = cells[4] if len(cells) > 4 else ""
-            # 检查所有列是否含有“未找到定义”/“EXPORT”/“extern”
-            all_cols = " ".join(cells)
-            if "未找到定义" in all_cols or "EXPORT" in all_cols.upper() or "extern" in all_cols.lower():
-                continue
-            # 函数名有效性检查：必须是合法标识符
-            fname = cells[0]
-            if not re.match(r'^[A-Za-z_]\w*$', fname) or fname in ('N/A', 'NA', 'None', 'null', 'void'):
-                continue
-            callees.append(CalleeRef(
-                function_name=cells[0],
-                file=cells[1] if len(cells) > 1 else "",
-                line=cells[2] if len(cells) > 2 else "",
-                tainted_params=cells[3] if len(cells) > 3 else "",
-                description=desc,
-            ))
-        elif in_table and stripped and not stripped.startswith("|"):
-            if not stripped.startswith("---") and not stripped.startswith("*"):
+        if not in_table:
+            continue
+        if not stripped.startswith("|"):
+            if stripped and not stripped.startswith("*") and not stripped.startswith("---"):
                 in_table = False
+            continue
+
+        cells = [c.strip() for c in stripped.split("|")]
+        cells = [c for c in cells if c]
+        if len(cells) < 2:
+            continue
+        if all(c.startswith("---") or c.startswith(":--") for c in cells):
+            continue
+
+        # 检测表头行 → 确定各列位置
+        lower_cells = [c.lower() for c in cells]
+        is_header = False
+        for i, lc in enumerate(lower_cells):
+            if lc in ("函数名", "function", "func", "func_name"):
+                func_col = i
+                is_header = True
+            elif lc in ("文件", "file"):
+                file_col = i
+            elif "调用位置" in lc or "行号" in lc or "line" in lc or "call" in lc:
+                line_col = i
+            elif "污染" in lc or "taint" in lc or "参数" in lc:
+                param_col = i
+            elif "说明" in lc or "desc" in lc:
+                desc_col = i
+        if is_header:
+            continue
+
+        # 未检测到表头时默认第一列
+        if func_col == -1:
+            func_col = 0
+
+        # 提取各字段
+        fname = cells[func_col] if func_col < len(cells) else ""
+        ffile = cells[file_col] if 0 <= file_col < len(cells) else ""
+        fline = cells[line_col] if 0 <= line_col < len(cells) else ""
+        fparam = cells[param_col] if 0 <= param_col < len(cells) else ""
+        fdesc = cells[desc_col] if 0 <= desc_col < len(cells) else ""
+
+        # 过滤外部函数
+        all_cols = " ".join(cells)
+        if "未找到定义" in all_cols or "EXPORT" in all_cols.upper() or "extern" in all_cols.lower():
+            continue
+        # 函数名有效性：至少3字符的合法标识符
+        if not re.match(r'^[A-Za-z_]\w{2,}$', fname):
+            continue
+        if fname in ('None', 'null', 'void', 'return', 'break', 'continue'):
+            continue
+
+        callees.append(CalleeRef(
+            function_name=fname, file=ffile, line=fline,
+            tainted_params=fparam, description=fdesc))
     return callees
 
 
