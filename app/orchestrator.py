@@ -76,6 +76,7 @@ from .models import (
     TaskResult,
     TaskStatus,
     TokenUsage,
+    TraceNode,
     WorkerEvaluation,
     WorkerResult,
     make_id,
@@ -832,34 +833,47 @@ class Orchestrator:
         if not dataflow_files:
             return None
 
+        # 生成 trace-tree.md 供 merge agent 读取
+        tree_lines = ["# 调用树结构\n"]
+        for name, path in dataflow_files:
+            tree_lines.append("- `" + name + "` → `" + os.path.basename(path) + "`")
+        tree_path = Path(cwd) / "trace-tree.md"
+        tree_path.write_text("\n".join(tree_lines), encoding="utf-8")
+
+        # 文件列表
         file_list = "\n".join(
-            "- `" + name + "`: `" + path + "`"
+            "- `" + os.path.basename(path) + "` — " + name
             for name, path in dataflow_files
         )
         merge_prompt = (
-            "# 合并数据流文档\n\n"
-            "你是数据流分析专家。以下是对函数 " + root_function + " 及其调用链中各子函数的独立数据流分析文档。\n\n"
-            "请使用 `read` 工具逐一读取以下文件，然后合并为一个完整的数据流树状图文档：\n\n"
+            "# 合并任务\n\n"
+            "根函数: " + root_function + "\n"
+            "共 " + str(len(dataflow_files)) + " 个数据流文档需要合并。\n\n"
+            "请使用 `read` 工具读取以下文件，然后按照 system prompt 中的格式规范合并：\n\n"
             + file_list + "\n\n"
-            "## 合并要求\n\n"
-            "1. 以根函数 " + root_function + " 为起点，构建完整的调用链数据流\n"
-            "2. 子函数的分析结果嵌入到父函数调用点下方，形成层级结构\n"
-            "3. 保留所有污点标记（🔴/🟢/🟡/📌）和行号\n"
-            "4. 生成统一的污点终点汇总表和数据处理函数清单（合并所有层级）\n"
-            "5. 在文档开头添加完整的调用链概览图\n\n"
-            "使用 `write` 工具将合并后的文档写入 `merged-dataflow-" + root_function + ".md`"
+            "调用树结构文件: `trace-tree.md`\n\n"
+            "合并结果写入: `merged-dataflow.md`"
         )
+
+        # 加载 merge 专用 system prompt
+        merge_prompt_dir = os.path.join(
+            os.path.dirname(cfg.workers.system_prompt_dir), "merge")
+        sys_prompt = ""
+        for p in [os.path.join(merge_prompt_dir, "default.md"),
+                  "/opt/data_flow_analyse/prompts/merge/default.md"]:
+            if os.path.isfile(p):
+                sys_prompt = Path(p).read_text(encoding="utf-8")
+                break
 
         self._emit("merge_start", result.task_id, function=root_function,
                     file_count=len(dataflow_files))
 
-        # 用第一个 worker 的配置跑 merge
         w_cfg = cfg.workers.agents[0] if cfg.workers.agents else AgentInstanceConfig(model="")
         ar = await run_agent(
             prompt=merge_prompt,
             model=w_cfg.model,
             tools=["read", "write", "bash"],
-            system_prompt="你是数据流分析专家，擅长合并多层级的数据流追踪文档。",
+            system_prompt=sys_prompt,
             cwd=cwd,
             thinking_level=w_cfg.thinking_level or "off",
             session_file=None,
@@ -870,13 +884,14 @@ class Orchestrator:
         result.total_tokens += ar.token_usage
 
         # 搜索合并后的文件
-        merged_path = Path(cwd) / ("merged-dataflow-" + root_function + ".md")
+        merged_path = Path(cwd) / "merged-dataflow.md"
+        if not merged_path.exists():
+            merged_path = Path(cwd) / ("merged-dataflow-" + root_function + ".md")
         if merged_path.exists():
             content = merged_path.read_text(encoding="utf-8")
             self._emit("merge_done", result.task_id, size=len(content))
             return content
 
-        # 回退：尝试从输出中提取
         if ar.output and len(ar.output) > 200:
             self._emit("merge_done", result.task_id, size=len(ar.output))
             return ar.output

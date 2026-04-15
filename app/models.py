@@ -131,6 +131,15 @@ class CalleeRef(BaseModel):
     description: str = ""
 
 
+class TraceNode(BaseModel):
+    """调用树节点（用于确定性合并）"""
+    function_name: str
+    depth: int = 0
+    dataflow_content: str = ""  # 该函数的 dataflow 文档内容
+    status: str = ""  # passed/failed/skipped/depth_limit
+    children: list["TraceNode"] = Field(default_factory=list)
+
+
 class WorkerEvaluation(BaseModel):
     worker_id: str
     passed: bool = False
