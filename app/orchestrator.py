@@ -969,7 +969,7 @@ class Orchestrator:
 
         for w in round_workers:
             eval_prompt = self._build_eval_prompt(
-                cfg.task, cfg.criteria, w, rnd_num,
+                cfg.task, w, rnd_num,
                 output_path=f"{w.worker_id}-output.md",
                 dataflow_path=f"{w.worker_id}-dataflow.md",
             )
@@ -1053,14 +1053,17 @@ class Orchestrator:
         parts.append("Wrap your final deliverable in <result>...</result> tags.")
         return "\n\n".join(parts)
 
-    def _build_eval_prompt(self, task, criteria, worker: WorkerResult, rnd,
+    def _build_eval_prompt(self, task, worker: WorkerResult, rnd,
                            output_path: str = "", dataflow_path: str = ""):
+        CRITERIA = (
+            "重点评判维度：外部输入识别完整性、污点追踪深度（子函数必须跟入）、"
+            "数据处理函数覆盖、文档规范性、需要跟入的函数列表完整性"
+        )
         parts = [
             f"# Evaluate {worker.worker_id} (Round {rnd})",
             f"## Task Requirements\n\n{task}",
+            f"## Evaluation Criteria\n\n{CRITERIA}",
         ]
-        if criteria:
-            parts.append(f"## Evaluation Criteria\n\n{criteria}")
 
         parts.append(
             f"## {worker.worker_id}'s Output Files\n\n"

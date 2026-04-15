@@ -141,9 +141,7 @@ data_flow_analyse/
         "system_prompt_dir": "/opt/data_flow_analyse/prompts/judges",
         "agents": [{ "model": "vllm/zai-org/GLM-5" }]
     },
-    "output_dir": "/data/output",
-    "context": "Ghidra 反编译的嵌入式固件代码",
-    "criteria": "重点：外部输入识别完整性、污点追踪深度、数据处理函数覆盖"
+    "output_dir": "/data/output"
 }
 ```
 
@@ -189,8 +187,6 @@ output/
 | `agent_retry_delay` | 30 | 首次重试等待秒数（指数退避） |
 | `workers.agents[]` | - | Worker 实例列表，每个可指定独立模型 |
 | `judges.agents[]` | - | Judge 实例列表 |
-| `context` | "" | 全局上下文（如：反编译代码风格说明） |
-| `criteria` | "" | 全局评判标准 |
 
 ## 输出格式
 

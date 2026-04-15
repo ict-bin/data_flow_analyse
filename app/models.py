@@ -47,9 +47,6 @@ class ServiceConfig(BaseModel):
     archive_dir: str = Field(default="/data/output")
     result_dir: str = Field(default="/data/output")
 
-    context: str = Field(default="", description="全局额外上下文（所有任务共用）")
-    criteria: str = Field(default="", description="全局评判标准（所有任务共用）")
-
 
 # ─── 运行时任务（由 ServiceConfig + 用户输入合成）─────────────────────────────
 
@@ -73,8 +70,8 @@ class TaskConfig(BaseModel):
     output_dir: str = Field(default="/data/output")
     archive_dir: str = Field(default="/data/output")
     result_dir: str = Field(default="/data/output")
-    context: str = Field(default="")
-    criteria: str = Field(default="")
+    # context 用于内部递归时注入脏数据上下文，不需用户配置
+    context: str = Field(default="", exclude=True)
 
     @property
     def worker_count(self) -> int:

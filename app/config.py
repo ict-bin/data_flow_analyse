@@ -48,8 +48,6 @@ def build_task_config(svc: ServiceConfig, prompt: str, cwd: str = "/data/target"
         output_dir=svc.output_dir,
         archive_dir=svc.archive_dir,
         result_dir=svc.result_dir,
-        context=svc.context,
-        criteria=svc.criteria,
     )
 
     _backfill_role(cfg.workers)
