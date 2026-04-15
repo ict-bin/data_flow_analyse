@@ -168,6 +168,27 @@ def _parse_callees(dataflow_content: str) -> list[CalleeRef]:
     return callees
 
 
+def _function_has_definition(target_dir: str, function_name: str) -> bool:
+    """快速 grep 检查函数定义是否存在于目标目录的源文件中。"""
+    import subprocess
+    try:
+        # 搜索 C 风格函数定义: "函数名(" 出现在行首附近
+        result = subprocess.run(
+            ["grep", "-rl", "--include=*.c", "--include=*.h",
+             function_name + "(", target_dir],
+            capture_output=True, text=True, timeout=5)
+        if result.returncode != 0:
+            return False
+        # 进一步确认是定义而非仅调用: 搜索 "type func_name(" 模式
+        result2 = subprocess.run(
+            ["grep", "-rn", "--include=*.c",
+             "^[A-Za-z_].*" + function_name + "(", target_dir],
+            capture_output=True, text=True, timeout=5)
+        return result2.returncode == 0 and len(result2.stdout.strip()) > 0
+    except (subprocess.TimeoutExpired, OSError):
+        return True  # 超时/出错时保守返回 True，不跳过
+
+
 def _extract_json_object(text: str, required_key: str) -> dict | None:
     """从文本中提取包含指定 key 的 JSON 对象。支持多行、嵌套引号、转义字符。"""
     # 先尝试从 code block 中提取
@@ -721,6 +742,14 @@ class Orchestrator:
         sub_dataflow_files: list[tuple[str, str]] = []  # (func_name, dataflow_path)
 
         for callee in callees:
+            # 预检：grep 确认函数定义存在，不存在则跳过（避免浪费完整 Worker+Judge 流水线）
+            target_dir = os.path.abspath(cfg.cwd)
+            if not _function_has_definition(target_dir, callee.function_name):
+                self._emit("trace_skip", result.task_id,
+                           function=callee.function_name,
+                           reason="no definition found in source (grep pre-check)")
+                continue
+
             sub_file = callee.file or cfg.source_file
             sub_prompt = (
                 "分析文件 " + sub_file + " 中函数 " + callee.function_name + " 的数据流。"
