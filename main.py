@@ -26,7 +26,7 @@ if __name__ == "__main__":
 ║            data_flow_analyse API Server                 ║
 ╠═══════════════════════════════════════════════════════╣
 ║  URL:    http://localhost:{port:<38}║
-║  POST /task  — 提交任务（body = config.json 格式）     ║
+║  POST /analyse  — 提交分析任务                         ║
 ║  GET  /task/{{id}}/stream  — SSE 实时事件流            ║
 ╚═══════════════════════════════════════════════════════╝
 """)

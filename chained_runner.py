@@ -60,7 +60,7 @@ def has_any_file(root: Path) -> bool:
 
 
 def downstream_source_root() -> Path:
-    recovered = RUN_ROOT / "01-re" / "output" / "recovered"
+    recovered = RUN_ROOT / "02-re" / "output" / "recovered"
     if has_any_file(recovered):
         return recovered
     unpacked = RUN_ROOT / "00-unpack" / "output" / "unpacked"
