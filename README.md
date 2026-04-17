@@ -5,7 +5,7 @@
 ## 核心架构
 
 ```
-用户: "对 libipsec.so.c 的 IPSEC_SOCKI_PipeMsg 函数完成数据流分析"
+用户: "对 libipsec.c 的 IPSEC_SOCKI_PipeMsg 函数完成数据流分析"
                             │
                             ▼
                 ┌───────────────────────┐
@@ -27,22 +27,15 @@
     ├─ depth=1: IPSEC_SOCKI_HandlePipeData
     │   └─ Worker+Judge 流水线（只追踪脏参数）
     │       └─ depth=2: IPSEC_SOCK_ProcPipeData
-    │           └─ Worker+Judge 流水线
-    │               ├─ depth=3: IPSEC_LIBI_HandleInputPktV4
-    │               │   └─ depth=4: IPSEC_AH_HandleInputPktV4
-    │               │       └─ depth=5: ...
-    │               └─ depth=3: IPSEC_SOCK_SendToSocket
-    │                   └─ ...
-    ├─ depth=1: IPSEC_SOCK_ProcPipeData ⏭️ (已分析，跳过)
-    └─ depth=1: IPSEC_MakeDbgCompStrSetter
-        └─ ...
+    │           └─ ...
+    ├─ depth=1: IPSEC_Print_File ⏭️ (extern, 跳过)
+    └─ depth=1: SSP_Debug ⏭️ (extern, 跳过)
                             │
                             ▼
                 ┌───────────────────────┐
                 │  Merge Agent          │
                 │  读取所有 dataflow    │
                 │  合并为统一文档       │
-                │  (专用 system prompt) │
                 └───────────┬───────────┘
                             │
                             ▼
@@ -50,6 +43,7 @@
             │  最终输出                    │
             │  • merged-dataflow.md       │
             │  • 统一归档 _log.zip        │
+            │  • flag (1=成功 / 0=失败)   │
             └─────────────────────────────┘
 ```
 
@@ -83,17 +77,17 @@
 |------|------|
 | **递归追踪** | 子函数调用自动触发新的 Worker+Judge 流水线 |
 | **深度可控** | `max_trace_depth` 配置递归深度（默认 3） |
-| **全量跟入** | 所有函数调用都 grep 搜索定义，找不到才标 EXPORT |
+| **外部函数过滤** | 双层过滤：grep 排除 extern 声明 + 解析时排除 "外部函数" 标记，避免浪费 |
 | **只追踪脏参数** | 子函数分析时只追踪调用者标记的被污染参数 |
 | **自动去重** | 同一函数不会被重复分析（跨分支共享 analyzed 集合） |
 | **单层上限** | 每个函数最多递归 10 个子函数，防止爆炸 |
-| **Worker 并行** | 多个 Worker 同时分析同一函数，各自独立工作目录 |
 | **Worker 保持上下文** | `--session` 跨轮累积，第 2 轮看到第 1 轮全部对话 |
 | **Judge 独立上下文** | 每次评审 `--no-session`，防止 Worker 间评审互相影响 |
 | **最小轮数** | `min_rounds=2`：即使第 1 轮全票通过，也强制反思 |
 | **Merge Agent** | 专用 system prompt + 精确输出模板，合并所有层级 |
-| **统一归档** | 所有子任务工作目录保留在根任务下，最终统一压缩 |
-| **错误重试** | API 失败自动重试（可配置次数和间隔） |
+| **双层重试** | pi 进程级（崩溃/拉起失败）+ API 级（连接/限流），独立计数，-1=无限 |
+| **致命错误识别** | model not found / invalid API key 等配置错误立即终止，不重试 |
+| **flag 文件** | 任务开始写 `0`，仅成功覆盖为 `1`，崩溃/中断也保证有 flag |
 
 ## 目录结构
 
@@ -102,19 +96,18 @@ data_flow_analyse/
 ├── app/
 │   ├── models.py        # 数据模型
 │   ├── config.py        # 配置加载 + prompt 解析
-│   ├── runner.py        # pi Agent 子进程执行器（重试机制）
-│   ├── orchestrator.py  # 多 Agent 编排核心（递归 + merge）
+│   ├── runner.py        # pi Agent 子进程执行器（双层重试 + 致命错误检测）
+│   ├── orchestrator.py  # 多 Agent 编排核心（递归 + merge + 外部函数过滤）
 │   └── server.py        # REST API 服务器
 ├── prompts/
 │   ├── workers/default.md   # Worker system prompt（污点追踪 + 子函数列表）
 │   ├── judges/default.md    # Judge system prompt（评审规则 + markdown 输出）
 │   └── merge/default.md     # Merge system prompt（合并格式模板）
-├── cli.py               # CLI 入口
+├── cli.py               # CLI 入口（美化输出 + 树状层级显示）
 ├── main.py              # REST 服务入口
 ├── config.example.json  # 服务配置示例
 ├── Dockerfile
-├── deploy.sh            # 一键部署脚本
-└── examples/            # 测试结果示例
+└── Dockerfile.full      # 全量构建（首次）
 ```
 
 ## 快速开始
@@ -130,6 +123,8 @@ data_flow_analyse/
     "pass_threshold": 1,
     "agent_max_retries": 100,
     "agent_retry_delay": 30,
+    "pi_max_retries": -1,
+    "pi_retry_delay": 10,
     "max_trace_depth": 5,
     "workers": {
         "default_tools": ["read", "bash", "edit", "write", "grep", "find"],
@@ -145,15 +140,19 @@ data_flow_analyse/
 }
 ```
 
-`models.json`（同目录下）：
+`models.json`（同目录下，pi 模型配置）：
 
 ```json
-[{
-    "id": "vllm/zai-org/GLM-5",
-    "provider": "openai",
-    "apiKey": "1234",
-    "baseUrl": "http://172.31.29.10:8000/v1"
-}]
+{
+    "providers": {
+        "vllm": {
+            "baseUrl": "http://172.31.29.10:8000/v1",
+            "api": "openai-completions",
+            "apiKey": "1234",
+            "models": [{ "id": "zai-org/GLM-5", "name": "GLM-5", "contextWindow": 128000, "maxTokens": 8192 }]
+        }
+    }
+}
 ```
 
 ### 2. 运行分析
@@ -164,15 +163,54 @@ docker run --rm --network host \
   -v /path/to/config:/data/config:ro \
   -v /path/to/output:/data/output \
   data_flow_analyse \
-  python3 cli.py "对 libipsec.so.c 的 IPSEC_SOCKI_PipeMsg 函数完成数据流分析"
+  python3 cli.py "对 libipsec.c 的 IPSEC_SOCKI_PipeMsg 函数完成数据流分析"
 ```
 
 ### 3. 查看结果
 
 ```
 output/
-├── libipsec.so_IPSEC_SOCKI_PipeMsg.md        # 最终合并的数据流文档
-└── libipsec.so_IPSEC_SOCKI_PipeMsg_log.zip   # 完整归档
+├── flag                                      # 1=成功, 0=失败（脚本对接用）
+├── libipsec_IPSEC_SOCKI_PipeMsg.md           # 最终合并的数据流文档
+└── libipsec_IPSEC_SOCKI_PipeMsg_log.zip      # 完整归档
+```
+
+**flag 文件行为**：任务开始即写入 `0`，仅在最终状态为 PASSED 时覆盖为 `1`。中途崩溃、被 kill、异常退出时 flag 始终为 `0`。
+
+### CLI 输出示例
+
+```
+┌─────────────────────────────────────────────────┐
+│  data_flow_analyse                              │
+├─────────────────────────────────────────────────┤
+│  IPSEC_SOCKI_PipeMsg                             │
+│  libipsec.c                                      │
+│  W=1 J=1  rounds=2~3  depth≤6                   │
+│  vllm/zai-org/GLM-5                              │
+└─────────────────────────────────────────────────┘
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  ▶ IPSEC_SOCKI_PipeMsg
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  R1: W[✓] → J[82] ✅ 1/1 (552s)
+  R2: W[✓] → J[90] ✅ 1/1 (380s)
+  → 1 callees: IPSEC_SOCKI_HandlePipeData
+
+  ├─ [d1] IPSEC_SOCKI_HandlePipeData
+  │  R1: W[✓] → J[88] ✅ 1/1 (395s)
+  │  → 1 callees: IPSEC_SOCKI_PipeData
+
+  │  ├─ [d2] IPSEC_SOCKI_PipeData
+  │  │  R1: W[✓] → J[92] ✅ 1/1 (202s)
+
+  🔀 Merging 3 documents... ✅ (11.7KB)
+
+════════════════════════════════════════════════════════════
+  ✅ PASSED  │  3 functions  │  1395s
+  📄 /data/output/libipsec_IPSEC_SOCKI_PipeMsg.md
+  📦 /data/output/libipsec_IPSEC_SOCKI_PipeMsg_log.zip
+  ⏭  Skipped: IPSEC_Print_File(extern), SSP_Debug(extern)
+════════════════════════════════════════════════════════════
 ```
 
 ## 配置参数
@@ -183,10 +221,24 @@ output/
 | `min_rounds` | 2 | 每个函数最少轮数（强制自我反思） |
 | `pass_threshold` | `ceil(judges/2)` | 通过所需的 Judge 投票数 |
 | `max_trace_depth` | 3 | 函数调用递归追踪最大深度 |
-| `agent_max_retries` | 100 | API 错误最大重试次数 |
-| `agent_retry_delay` | 30 | 首次重试等待秒数（指数退避） |
+| `agent_max_retries` | 100 | API 错误（连接/限流/500）最大重试次数，-1=无限 |
+| `agent_retry_delay` | 30 | API 重试首次等待秒数（指数退避，上限 300s） |
+| `pi_max_retries` | 3 | pi 进程拉起失败/崩溃重试次数，-1=无限 |
+| `pi_retry_delay` | 10 | pi 进程重试首次等待秒数（指数退避，上限 300s） |
 | `workers.agents[]` | - | Worker 实例列表，每个可指定独立模型 |
 | `judges.agents[]` | - | Judge 实例列表 |
+
+## 重试机制
+
+双层重试，独立计数，独立退避：
+
+| 层级 | 触发条件 | 配置项 | 退避策略 |
+|------|---------|--------|---------|
+| **pi 进程级** | 拉起失败 / 崩溃 / 信号杀死 / OOM | `pi_max_retries` | `pi_retry_delay × 2^n`，上限 300s |
+| **API 级** | 连接超时 / 429 限流 / 500/502/503 | `agent_max_retries` | `agent_retry_delay × 2^n`，上限 300s |
+| **致命错误** | model not found / invalid API key / 401 | 不重试 | 立即终止并报告 |
+
+错误分类优先级：致命错误 > pi 进程失败 > API 错误 > 成功
 
 ## 输出格式
 
@@ -272,10 +324,14 @@ task-xxx/
 |----------|------|------|
 | `/data/target` | 待分析的源代码文件 | 只读 |
 | `/data/config` | `config.json` + `models.json` | 只读 |
-| `/data/output` | 分析结果输出 | 读写 |
+| `/data/output` | 分析结果输出（含 flag 文件） | 读写 |
 
 ## 部署
 
 ```bash
-bash deploy.sh   # 同步代码 → 构建镜像 → 清理残留
+# 全量构建（首次）
+docker build --network host -f Dockerfile.full -t data_flow_analyse .
+
+# 增量构建（代码更新后，基于 dfa-base:layer5）
+docker build --network host -t data_flow_analyse .
 ```

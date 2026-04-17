@@ -194,6 +194,9 @@ def _parse_callees(dataflow_content: str) -> list[CalleeRef]:
         all_cols = " ".join(cells)
         if "未找到定义" in all_cols or "EXPORT" in all_cols.upper() or "extern" in all_cols.lower():
             continue
+        # 文件列标记为外部的函数（Worker 常输出 "外部函数"、"external" 等）
+        if ffile and ("外部" in ffile or "external" in ffile.lower() or "未找到" in ffile):
+            continue
         # 函数名有效性：至少3字符的合法标识符
         if not re.match(r'^[A-Za-z_]\w{2,}$', fname):
             continue
@@ -207,7 +210,7 @@ def _parse_callees(dataflow_content: str) -> list[CalleeRef]:
 
 
 def _function_has_definition(target_dir: str, function_name: str) -> bool:
-    """快速 grep 检查函数定义是否存在于目标目录的源文件中。"""
+    """快速 grep 检查函数定义（非 extern 声明）是否存在于目标目录的源文件中。"""
     import subprocess
     try:
         # 搜索 C 风格函数定义: "函数名(" 出现在行首附近
@@ -217,12 +220,21 @@ def _function_has_definition(target_dir: str, function_name: str) -> bool:
             capture_output=True, text=True, timeout=5)
         if result.returncode != 0:
             return False
-        # 进一步确认是定义而非仅调用: 搜索 "type func_name(" 模式
+        # 搜索 "type func_name(" 模式
         result2 = subprocess.run(
             ["grep", "-rn", "--include=*.c",
              "^[A-Za-z_].*" + function_name + "(", target_dir],
             capture_output=True, text=True, timeout=5)
-        return result2.returncode == 0 and len(result2.stdout.strip()) > 0
+        if result2.returncode != 0 or not result2.stdout.strip():
+            return False
+        # 排除 extern 声明（extern int func(...); 不是定义）
+        lines = result2.stdout.strip().split("\n")
+        for line in lines:
+            # 提取 grep 输出中冒号后的代码部分
+            code_part = line.split(":", 2)[-1] if ":" in line else line
+            if not re.search(r'\bextern\b', code_part, re.IGNORECASE):
+                return True  # 至少有一行是非 extern 的定义
+        return False  # 所有匹配行都是 extern 声明
     except (subprocess.TimeoutExpired, OSError):
         return True  # 超时/出错时保守返回 True，不跳过
 
@@ -427,6 +439,12 @@ class Orchestrator:
         threshold = cfg.pass_threshold or math.ceil(cfg.judge_count / 2)
         self._cancel_event = asyncio.Event()
 
+        # 归档模式且非子任务：立即写 flag=0
+        if archive:
+            flag_dir = Path(os.path.abspath(cfg.result_dir))
+            flag_dir.mkdir(parents=True, exist_ok=True)
+            (flag_dir / "flag").write_text("0", encoding="utf-8")
+
         out_dir = Path(os.path.abspath(cfg.output_dir)) / task_id
         out_dir.mkdir(parents=True, exist_ok=True)
         sess_dir = out_dir / "sessions"
@@ -499,6 +517,8 @@ class Orchestrator:
                         "cancel_event": self._cancel_event,
                         "max_retries": cfg.agent_max_retries,
                         "retry_delay": cfg.agent_retry_delay,
+                        "pi_max_retries": cfg.pi_max_retries,
+                        "pi_retry_delay": cfg.pi_retry_delay,
                         "on_stream": lambda d, wid=wid: self._emit(
                             "worker_stream", task_id, worker_id=wid, delta=d),
                     })
@@ -680,6 +700,10 @@ class Orchestrator:
         # 4) 清理工作目录（压缩包已归档）
         shutil.rmtree(out_dir, ignore_errors=True)
 
+        # 5) 写 flag 文件（仅 PASSED 覆盖为 1，其他保持入口处写的 0）
+        if result.status == TaskStatus.PASSED:
+            (result_dir / "flag").write_text("1", encoding="utf-8")
+
         self._emit("task_end", task_id,
                     status=result.status.value,
                     archive=str(zip_path),
@@ -712,6 +736,12 @@ class Orchestrator:
         max_depth = cfg.max_trace_depth
         is_root = (depth == 0)
         analyzed = _analyzed if _analyzed is not None else set()
+
+        # 根任务入口：立即写 flag=0（任何崩溃/中断都保证有 flag 文件）
+        if is_root:
+            flag_dir = Path(os.path.abspath(cfg.result_dir))
+            flag_dir.mkdir(parents=True, exist_ok=True)
+            (flag_dir / "flag").write_text("0", encoding="utf-8")
 
         # 防止重复分析
         func_key = cfg.source_file + "::" + cfg.function_name
@@ -889,6 +919,10 @@ class Orchestrator:
         # 清理
         shutil.rmtree(root_out_dir, ignore_errors=True)
 
+        # 写 flag 文件（仅 PASSED 覆盖为 1，其他保持入口处写的 0）
+        if result.status == TaskStatus.PASSED:
+            (result_dir / "flag").write_text("1", encoding="utf-8")
+
         self._emit("task_end", result.task_id,
                     status=result.status.value,
                     archive=str(zip_path),
@@ -952,6 +986,8 @@ class Orchestrator:
             session_file=None,
             max_retries=cfg.agent_max_retries,
             retry_delay=cfg.agent_retry_delay,
+            pi_max_retries=cfg.pi_max_retries,
+            pi_retry_delay=cfg.pi_retry_delay,
         )
 
         result.total_tokens += ar.token_usage
@@ -1015,6 +1051,8 @@ class Orchestrator:
             "cancel_event": self._cancel_event,
             "max_retries": cfg.agent_max_retries,
             "retry_delay": cfg.agent_retry_delay,
+            "pi_max_retries": cfg.pi_max_retries,
+            "pi_retry_delay": cfg.pi_retry_delay,
         }
 
         # ═══ 步骤0：准备 Worker 输出文件（放入 Judge 工作目录）═══

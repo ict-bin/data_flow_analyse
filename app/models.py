@@ -38,6 +38,8 @@ class ServiceConfig(BaseModel):
     pass_threshold: Optional[int] = Field(default=None)
     agent_max_retries: int = Field(default=100, description="API 错误时最大重试次数")
     agent_retry_delay: float = Field(default=30.0, description="首次重试等待秒数，指数退避")
+    pi_max_retries: int = Field(default=3, ge=-1, description="pi 进程拉起失败时最大重试次数，-1 为无限重试")
+    pi_retry_delay: float = Field(default=10.0, description="pi 进程重试首次等待秒数，指数退避")
     max_trace_depth: int = Field(default=3, ge=1, le=10, description="函数调用递归追踪最大深度")
 
     workers: RoleConfig = Field(default_factory=RoleConfig)
@@ -64,6 +66,8 @@ class TaskConfig(BaseModel):
     pass_threshold: Optional[int] = Field(default=None)
     agent_max_retries: int = Field(default=100)
     agent_retry_delay: float = Field(default=30.0)
+    pi_max_retries: int = Field(default=3)
+    pi_retry_delay: float = Field(default=10.0)
     max_trace_depth: int = Field(default=3)
     workers: RoleConfig = Field(default_factory=RoleConfig)
     judges: RoleConfig = Field(default_factory=RoleConfig)
