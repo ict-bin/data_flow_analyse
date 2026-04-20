@@ -48,15 +48,16 @@ COPY config.example.json .env.example ./
 RUN chmod +x scripts/*.sh 2>/dev/null || true
 
 # ═══ pi 配置目录 ══════════════════════════════════════════════════════════════
-# pi 的全局配置目录，models.json 放这里才能被 pi 识别
-# 容器启动脚本会将 /data/config/models.json 链接到此处
+# pi 的全局配置目录，镜像内置固定 models.json / settings.json
 ENV PI_CODING_AGENT_DIR=/root/.pi/agent
 RUN mkdir -p /root/.pi/agent
+COPY config/models.json.example /root/.pi/agent/models.json
+COPY config/settings.json /root/.pi/agent/settings.json
 
 # ═══ 挂载点 ═══════════════════════════════════════════════════════════════════
 #
 # /data/target  — 待分析文件（只读）
-# /data/config  — config.json + models.json + prompts/（只读）
+# /data/config  — config.json + prompts/（只读）
 # /data/output  — 输出目录
 #
 RUN mkdir -p /data/target /data/config /data/output /data/workspace /data/sessions
@@ -74,7 +75,6 @@ HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
     CMD curl -f http://localhost:${PORT}/health || exit 1
 
 # ═══ 入口脚本 ═════════════════════════════════════════════════════════════════
-# 启动前自动链接 models.json（如果挂载了的话）
 COPY scripts/entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 ENTRYPOINT ["/entrypoint.sh"]

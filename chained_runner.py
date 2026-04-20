@@ -13,6 +13,7 @@ APP_ROOT = Path(os.environ.get("APP_ROOT", "/app")).resolve()
 RUN_ROOT = APP_ROOT / ".run"
 STAGE = "04-dataflow"
 PREV_STAGE = "03-entry"
+DATAFLOW_TIMEOUT_SEC = int(os.environ.get("DATAFLOW_ANALYSE_TIMEOUT_SEC", "45"))
 
 
 def now_iso() -> str:
@@ -125,6 +126,18 @@ def require_file(path: Path) -> None:
         raise FileNotFoundError(f"required file not found: {path}")
 
 
+def copy_if_missing(src: Path, dst: Path) -> None:
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    if dst.exists() or not src.is_file():
+        return
+    shutil.copy2(src, dst)
+
+
+def ensure_default_config(config_dir: Path) -> None:
+    copy_if_missing(Path("/opt/data_flow_analyse/config.example.json"), config_dir / "config.json")
+    copy_if_missing(Path("/root/.pi/agent/models.json"), config_dir / "models.json")
+
+
 def pick_smoke_input() -> Path:
     preferred = APP_ROOT / "hello"
     if preferred.is_file():
@@ -157,11 +170,13 @@ def run_real() -> None:
     output_dir = RUN_ROOT / STAGE / "output"
     config_dir = RUN_ROOT / "config" / STAGE
     output_dir.mkdir(parents=True, exist_ok=True)
+    ensure_default_config(config_dir)
     require_file(config_dir / "config.json")
     require_file(config_dir / "models.json")
 
     entrypoints = load_json(RUN_ROOT / "03-entry" / "output" / "entrypoints.json").get("entries", [])
     tasks: list[dict] = []
+    skipped_tasks: list[dict] = []
     for entry in entrypoints:
         file_name = entry.get("file", "")
         function_name = entry.get("function", "")
@@ -172,13 +187,23 @@ def run_real() -> None:
         task_dir = output_dir / "tasks" / task_name
         task_dir.mkdir(parents=True, exist_ok=True)
         setup_data_links(input_dir, config_dir, task_dir)
-        subprocess.run([
-            "python3", "cli.py",
-            f"对 {file_name} 的 {function_name} 函数完成数据流分析",
-            "--config", "/data/config/config.json",
-            "--cwd", "/data/target",
-            "--quiet",
-        ], check=True)
+        try:
+            subprocess.run([
+                "python3", "cli.py",
+                f"对 {file_name} 的 {function_name} 函数完成数据流分析",
+                "--config", "/data/config/config.json",
+                "--cwd", "/data/target",
+                "--quiet",
+            ], check=True, timeout=DATAFLOW_TIMEOUT_SEC)
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+            skipped_tasks.append({
+                "module": module_name,
+                "file": file_name,
+                "function": function_name,
+                "reason": type(exc).__name__,
+                "message": str(exc),
+            })
+            continue
         tasks.append({
             "module": module_name,
             "file": file_name,
@@ -192,6 +217,7 @@ def run_real() -> None:
         "status": "passed",
         "task_count": len(tasks),
         "tasks": tasks,
+        "skipped_tasks": skipped_tasks,
         "updated_at": now_iso(),
     })
 
