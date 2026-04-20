@@ -821,8 +821,7 @@ class Orchestrator:
             sub_file = callee.file or cfg.source_file
             sub_prompt = (
                 "分析文件 " + sub_file + " 中函数 " + callee.function_name + " 的数据流。"
-                + " 重点追踪以下被污染的参数: " + (callee.tainted_params or "所有参数")
-                + "。同时识别函数内部的主动拉取型外部输入（如 recv/read/ioctl 等系统调用的返回值）作为额外污点源。"
+                + " 只追踪以下被污染的参数: " + (callee.tainted_params or "所有参数")
             )
 
             sub_cfg = cfg.model_copy(deep=True)
