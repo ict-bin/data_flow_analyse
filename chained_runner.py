@@ -13,6 +13,7 @@ APP_ROOT = Path(os.environ.get("APP_ROOT", "/app")).resolve()
 RUN_ROOT = APP_ROOT / ".run"
 STAGE = "04-dataflow"
 PREV_STAGE = "03-entry"
+NEXT_STAGE = "05-vuln"
 DATAFLOW_TIMEOUT_SEC = int(os.environ.get("DATAFLOW_ANALYSE_TIMEOUT_SEC", "45"))
 
 
@@ -54,6 +55,10 @@ def require_previous_passed() -> None:
     status = load_json(RUN_ROOT / PREV_STAGE / "status.json").get("status")
     if status != "passed":
         raise RuntimeError(f"upstream stage not passed: {PREV_STAGE}={status!r}")
+
+
+def create_request_for_next(payload: dict) -> None:
+    save_json(RUN_ROOT / NEXT_STAGE / "request.json", payload)
 
 
 def has_any_file(root: Path) -> bool:
@@ -163,6 +168,7 @@ def run_smoke() -> None:
         "final_output": str(stage_file),
         "updated_at": now_iso(),
     })
+    create_request_for_next({"from_stage": STAGE, "input_file": str(stage_file), "mode": "smoke"})
 
 
 def run_real() -> None:
@@ -220,6 +226,12 @@ def run_real() -> None:
         "skipped_tasks": skipped_tasks,
         "updated_at": now_iso(),
     })
+    create_request_for_next({
+        "from_stage": STAGE,
+        "tasks": tasks,
+        "skipped_tasks": skipped_tasks,
+        "mode": "real",
+    })
 
 
 def main() -> int:
@@ -237,7 +249,7 @@ def main() -> int:
         update_pipeline(STAGE, "failed", str(exc), mode=mode)
         raise
     update_status("passed")
-    update_pipeline(STAGE, "passed", mode=mode)
+    update_pipeline(NEXT_STAGE, "running", mode=mode)
     return 0
 
 
