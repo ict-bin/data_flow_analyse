@@ -12,6 +12,12 @@ from pathlib import Path
 
 from .models import AgentInstanceConfig, RoleConfig, ServiceConfig, TaskConfig
 
+# 容器内固定挂载路径（可通过环境变量覆盖）
+# ENV: TARGET_DIR, CONFIG_DIR, OUTPUT_DIR
+TARGET_DIR = os.environ.get("TARGET_DIR", "/data/target")
+CONFIG_DIR = os.environ.get("CONFIG_DIR", "/data/config")
+OUTPUT_DIR = os.environ.get("OUTPUT_DIR", "/data/output")
+
 
 def load_service_config(config_path: str) -> ServiceConfig:
     """加载服务配置（管理员配置的长期文件）。"""
@@ -22,14 +28,15 @@ def load_service_config(config_path: str) -> ServiceConfig:
     return ServiceConfig(**raw)
 
 
-def build_task_config(svc: ServiceConfig, prompt: str, cwd: str = "/data/target") -> TaskConfig:
-    """
-    从服务配置 + 用户一句话 prompt 构造运行时 TaskConfig。
+def build_task_config(svc: ServiceConfig, prompt: str, cwd: str = None) -> TaskConfig:
+    """从服务配置 + 用户一句话 prompt 构造运行时 TaskConfig。
 
     prompt 示例：
       "对 vfpfwd_board.c 的 VFP_ReceivePktFromNpByPcie 函数完成数据流分析"
       "分析 firmware.c 中 parse_packet 的外部输入数据流"
     """
+    if cwd is None:
+        cwd = TARGET_DIR
     source_file, function_name = parse_prompt(prompt)
 
     cfg = TaskConfig(

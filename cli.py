@@ -181,8 +181,10 @@ class CliRenderer:
 
 # ─── 查找服务配置文件 ─────────────────────────────────────────────────────────
 
-CONFIG_SEARCH_PATHS = [
-    "/data/config/config.json",
+# 从环境变量读取路径配置
+_CONFIG_DIR = os.environ.get("CONFIG_DIR", "/data/config")
+_CONFIG_SEARCH_PATHS = [
+    f"{_CONFIG_DIR}/config.json",
     "/opt/data_flow_analyse/config.example.json",
     "./config.json",
     "./config.example.json",
@@ -190,12 +192,12 @@ CONFIG_SEARCH_PATHS = [
 
 
 def find_service_config() -> str:
-    for p in CONFIG_SEARCH_PATHS:
+    for p in _CONFIG_SEARCH_PATHS:
         if os.path.isfile(p):
             return p
     raise FileNotFoundError(
         "找不到服务配置文件。请在以下位置之一放置 config.json：\n"
-        + "\n".join(f"  - {p}" for p in CONFIG_SEARCH_PATHS)
+        + "\n".join(f"  - {p}" for p in _CONFIG_SEARCH_PATHS)
     )
 
 
@@ -236,7 +238,7 @@ async def main():
         sys.exit(1)
 
     config_path = None
-    cwd = "/data/target"
+    cwd = os.environ.get("TARGET_DIR", "/data/target")
     for i, a in enumerate(sys.argv):
         if a == "--config" and i + 1 < len(sys.argv):
             config_path = sys.argv[i + 1]
