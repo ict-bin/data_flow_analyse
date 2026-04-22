@@ -21,6 +21,10 @@ def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
+def log(message: str) -> None:
+    print(f"[{now_iso()}] [{STAGE}] {message}", flush=True)
+
+
 def load_json(path: Path) -> dict:
     if not path.exists():
         return {}
@@ -166,6 +170,10 @@ def ensure_default_config(config_dir: Path) -> None:
     copy_if_missing(Path("/root/.pi/agent/models.json"), config_dir / "models.json")
 
 
+def cli_quiet_enabled() -> bool:
+    return os.environ.get("GAIASEC_CLI_QUIET", "").lower() in {"1", "true", "yes"}
+
+
 def pick_smoke_input() -> Path:
     preferred = APP_ROOT / "hello"
     if preferred.is_file():
@@ -202,8 +210,14 @@ def run_real() -> None:
     ensure_default_config(config_dir)
     require_file(config_dir / "config.json")
     require_file(config_dir / "models.json")
+    log(
+        f"real mode start: input_dir={input_dir} config={config_dir / 'config.json'} "
+        f"models={config_dir / 'models.json'}"
+    )
 
     entrypoints = load_json(RUN_ROOT / "03-entry" / "output" / "entrypoints.json").get("entries", [])
+    quiet = cli_quiet_enabled()
+    log(f"loaded entrypoints: entry_count={len(entrypoints)} quiet={quiet} timeout_sec={DATAFLOW_TIMEOUT_SEC}")
     tasks: list[dict] = []
     skipped_tasks: list[dict] = []
     for entry in entrypoints:
@@ -216,15 +230,19 @@ def run_real() -> None:
         task_dir = output_dir / "tasks" / task_name
         task_dir.mkdir(parents=True, exist_ok=True)
         setup_data_links(input_dir, config_dir, task_dir)
+        cmd = [
+            "python3", "cli.py",
+            f"对 {file_name} 的 {function_name} 函数完成数据流分析",
+            "--config", "/data/config/config.json",
+            "--cwd", "/data/target",
+        ]
+        if quiet:
+            cmd.append("--quiet")
+        log(f"launching cli for task={task_name}: task_dir={task_dir}")
         try:
-            subprocess.run([
-                "python3", "cli.py",
-                f"对 {file_name} 的 {function_name} 函数完成数据流分析",
-                "--config", "/data/config/config.json",
-                "--cwd", "/data/target",
-                "--quiet",
-            ], check=True, timeout=DATAFLOW_TIMEOUT_SEC)
+            subprocess.run(cmd, check=True, timeout=DATAFLOW_TIMEOUT_SEC)
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+            log(f"task failed: task={task_name} reason={type(exc).__name__} message={exc}")
             skipped_tasks.append({
                 "module": module_name,
                 "file": file_name,
@@ -233,6 +251,7 @@ def run_real() -> None:
                 "message": str(exc),
             })
             continue
+        log(f"task finished: task={task_name}")
         tasks.append({
             "module": module_name,
             "file": file_name,
@@ -240,6 +259,9 @@ def run_real() -> None:
             "task_dir": str(task_dir),
         })
 
+    log(
+        f"real mode complete: task_count={len(tasks)} skipped_tasks={len(skipped_tasks)}"
+    )
     save_json(output_dir / "summary.json", {
         "stage": STAGE,
         "mode": "real",
@@ -260,9 +282,11 @@ def run_real() -> None:
 def main() -> int:
     mode = os.environ.get("CHAINED_MODE") or load_json(RUN_ROOT / STAGE / "request.json").get("mode") or "real"
     if stage_already_completed(mode):
+        log(f"stage already completed historically; skipping rerun for mode={mode}")
         resume_from_history(mode)
         return 0
     require_previous_passed()
+    log(f"stage start: mode={mode} app_root={APP_ROOT}")
     update_pipeline(STAGE, "running", mode=mode)
     update_status("running")
     try:
@@ -271,11 +295,13 @@ def main() -> int:
         else:
             run_real()
     except Exception as exc:
+        log(f"stage failed: {exc}")
         update_status("failed", str(exc))
         update_pipeline(STAGE, "failed", str(exc), mode=mode)
         raise
     update_status("passed")
     update_pipeline(NEXT_STAGE, "running", mode=mode)
+    log(f"stage passed; next_stage={NEXT_STAGE}")
     return 0
 
 
