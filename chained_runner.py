@@ -61,6 +61,29 @@ def create_request_for_next(payload: dict) -> None:
     save_json(RUN_ROOT / NEXT_STAGE / "request.json", payload)
 
 
+def stage_already_completed(mode: str) -> bool:
+    status = load_json(RUN_ROOT / STAGE / "status.json").get("status")
+    summary = load_json(RUN_ROOT / STAGE / "output" / "summary.json")
+    return status == "passed" and summary.get("mode") == mode
+
+
+def resume_from_history(mode: str) -> None:
+    summary = load_json(RUN_ROOT / STAGE / "output" / "summary.json")
+    if mode == "smoke":
+        final_output = summary.get("final_output")
+        if final_output:
+            create_request_for_next({"from_stage": STAGE, "input_file": final_output, "mode": "smoke"})
+    else:
+        create_request_for_next({
+            "from_stage": STAGE,
+            "tasks": summary.get("tasks", []),
+            "skipped_tasks": summary.get("skipped_tasks", []),
+            "mode": "real",
+        })
+    update_status("passed", "already completed historically; skipped rerun")
+    update_pipeline(NEXT_STAGE, "running", "current stage already completed historically", mode=mode)
+
+
 def has_any_file(root: Path) -> bool:
     return root.is_dir() and any(p.is_file() for p in root.rglob("*"))
 
@@ -235,8 +258,11 @@ def run_real() -> None:
 
 
 def main() -> int:
-    require_previous_passed()
     mode = os.environ.get("CHAINED_MODE") or load_json(RUN_ROOT / STAGE / "request.json").get("mode") or "real"
+    if stage_already_completed(mode):
+        resume_from_history(mode)
+        return 0
+    require_previous_passed()
     update_pipeline(STAGE, "running", mode=mode)
     update_status("running")
     try:
