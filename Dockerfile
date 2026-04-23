@@ -15,7 +15,16 @@ RUN chmod +x scripts/*.sh 2>/dev/null || true
 # pi 的全局配置目录，models.json 放这里才能被 pi 识别
 # 容器启动脚本会将 /data/config/models.json 链接到此处
 ENV PI_CODING_AGENT_DIR=/root/.pi/agent
-RUN mkdir -p /root/.pi/agent
+RUN mkdir -p /root/.pi/agent/bin
+
+# ═══ 预装 ripgrep（pi grep 工具依赖）═══════════════════════════════════════════
+# pi 首次使用 grep 工具时会尝试从外网下载 ripgrep，服务器无外网时会卡死。
+# 1) apt 安装系统级 ripgrep（提供 rg 命令）
+# 2) 同时在 pi 期望路径创建快捷方式，確保 pi 不再尝试下载
+RUN apt-get update && apt-get install -y --no-install-recommends ripgrep \
+    && rm -rf /var/lib/apt/lists/* \
+    && ln -sf "$(which rg)" /root/.pi/agent/bin/rg \
+    && echo "ripgrep ready: $(rg --version | head -1)"
 
 # ═══ 挂载点 ═══════════════════════════════════════════════════════════════════
 #

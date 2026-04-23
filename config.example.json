@@ -9,7 +9,7 @@
     "max_trace_depth": 5,
 
     "workers": {
-        "default_tools": ["read", "bash", "edit", "write", "grep", "find"],
+        "default_tools": ["read", "bash", "edit", "write", "find"],
         "system_prompt_dir": "/opt/data_flow_analyse/prompts/workers",
         "default_thinking_level": "off",
         "agents": [
@@ -18,7 +18,7 @@
     },
 
     "judges": {
-        "default_tools": ["read", "bash", "grep", "find"],
+        "default_tools": ["read", "bash", "find"],
         "system_prompt_dir": "/opt/data_flow_analyse/prompts/judges",
         "default_thinking_level": "off",
         "agents": [
