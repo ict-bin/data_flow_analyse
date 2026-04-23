@@ -102,6 +102,20 @@ def _cmd_preview(args: list[str]) -> str:
     return " ".join(parts)
 
 
+def _write_temp_markdown(
+    tmp_dir: str | None,
+    prefix: str,
+    filename: str,
+    content: str,
+) -> tuple[str, str]:
+    """将 prompt 写入临时 markdown 文件，返回 (tmp_dir, file_path)。"""
+    if tmp_dir is None:
+        tmp_dir = tempfile.mkdtemp(prefix=prefix)
+    file_path = os.path.join(tmp_dir, filename)
+    Path(file_path).write_text(content, encoding="utf-8")
+    return tmp_dir, file_path
+
+
 # ─── pi 可执行文件定位 ────────────────────────────────────────────────────────
 
 def _find_pi_command() -> list[str]:
@@ -317,17 +331,19 @@ async def run_agent(
     if thinking_level and thinking_level != "off":
         args.extend(["--thinking", thinking_level])
 
-    # ── System Prompt → 临时文件 ──────────────────────────────
+    # ── System/User Prompt → 临时文件，避免超长 argv ───────────
     tmp_dir: str | None = None
-    tmp_file: str | None = None
+    sys_tmp_file: str | None = None
+    prompt_tmp_file: str | None = None
 
     if system_prompt.strip():
-        tmp_dir = tempfile.mkdtemp(prefix="dfa-")
-        tmp_file = os.path.join(tmp_dir, "system.md")
-        Path(tmp_file).write_text(system_prompt, encoding="utf-8")
-        args.extend(["--append-system-prompt", tmp_file])
+        tmp_dir, sys_tmp_file = _write_temp_markdown(
+            tmp_dir, "dfa-", "system.md", system_prompt)
+        args.extend(["--append-system-prompt", sys_tmp_file])
 
-    args.append(prompt)
+    tmp_dir, prompt_tmp_file = _write_temp_markdown(
+        tmp_dir, "dfa-", "prompt.md", prompt)
+    args.append(f"@{prompt_tmp_file}")
 
     try:
         pi_failures = 0
@@ -520,9 +536,14 @@ async def run_agent(
         return result
 
     finally:
-        if tmp_file and os.path.exists(tmp_file):
+        if sys_tmp_file and os.path.exists(sys_tmp_file):
             try:
-                os.unlink(tmp_file)
+                os.unlink(sys_tmp_file)
+            except OSError:
+                pass
+        if prompt_tmp_file and os.path.exists(prompt_tmp_file):
+            try:
+                os.unlink(prompt_tmp_file)
             except OSError:
                 pass
         if tmp_dir and os.path.exists(tmp_dir):
