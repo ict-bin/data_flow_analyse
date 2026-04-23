@@ -258,13 +258,14 @@ async def main():
     models = set(a.model for a in cfg.workers.agents) | set(a.model for a in cfg.judges.agents)
     model_str = ", ".join(models)
 
+    max_r = '∞' if cfg.max_rounds < 0 else str(cfg.max_rounds)
     print(f"""
 ┌─────────────────────────────────────────────────┐
 │  data_flow_analyse                              │
 ├─────────────────────────────────────────────────┤
 │  {func:<48}│
 │  {src:<48}│
-│  W={cfg.worker_count} J={cfg.judge_count}  rounds={cfg.min_rounds}~{cfg.max_rounds}  depth≤{cfg.max_trace_depth:<12}│
+│  W={cfg.worker_count} J={cfg.judge_count}  rounds={cfg.min_rounds}~{max_r}  depth≤{cfg.max_trace_depth:<12}│
 │  {model_str:<48}│
 └─────────────────────────────────────────────────┘""")
 
