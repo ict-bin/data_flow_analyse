@@ -483,7 +483,7 @@ class Orchestrator:
         try:
             feedback_for_workers = ""
 
-            for rnd_num in range(1, cfg.max_rounds + 1):
+            for rnd_num in (range(1, cfg.max_rounds + 1) if cfg.max_rounds >= 0 else __import__('itertools').count(1)):
                 if self._cancel_event.is_set():
                     break
 
@@ -650,7 +650,7 @@ class Orchestrator:
 
                 # 下一轮的反馈
                 feedback_for_workers = feedback_md
-                if rnd_num == cfg.max_rounds:
+                if cfg.max_rounds >= 0 and rnd_num == cfg.max_rounds:
                     result.status = TaskStatus.FAILED
                     best_w = next((w for w in round_workers if w.worker_id == best_wid), round_workers[0])
                     result.final_output = _get_best_output(best_w)

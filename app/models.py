@@ -33,7 +33,7 @@ class RoleConfig(BaseModel):
 
 class ServiceConfig(BaseModel):
     """config.json — 服务提供者配置，不含任务信息"""
-    max_rounds: int = Field(default=3, ge=1, le=10)
+    max_rounds: int = Field(default=3, ge=-1, description="每个函数最大 Worker+Judge 迭ge轮数，-1=无限")
     min_rounds: int = Field(default=2, ge=1, le=10, description="最少执行轮数（第1轮后强制自我反思）")
     pass_threshold: Optional[int] = Field(default=None)
     agent_max_retries: int = Field(default=100, description="API 错误时最大重试次数")

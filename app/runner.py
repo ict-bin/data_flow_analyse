@@ -102,20 +102,6 @@ def _cmd_preview(args: list[str]) -> str:
     return " ".join(parts)
 
 
-def _write_temp_markdown(
-    tmp_dir: str | None,
-    prefix: str,
-    filename: str,
-    content: str,
-) -> tuple[str, str]:
-    """将 prompt 写入临时 markdown 文件，返回 (tmp_dir, file_path)。"""
-    if tmp_dir is None:
-        tmp_dir = tempfile.mkdtemp(prefix=prefix)
-    file_path = os.path.join(tmp_dir, filename)
-    Path(file_path).write_text(content, encoding="utf-8")
-    return tmp_dir, file_path
-
-
 # ─── pi 可执行文件定位 ────────────────────────────────────────────────────────
 
 def _find_pi_command() -> list[str]:
@@ -331,19 +317,20 @@ async def run_agent(
     if thinking_level and thinking_level != "off":
         args.extend(["--thinking", thinking_level])
 
-    # ── System/User Prompt → 临时文件，避免超长 argv ───────────
+    # ── System Prompt → 临时文件 ──────────────────────────────
     tmp_dir: str | None = None
-    sys_tmp_file: str | None = None
-    prompt_tmp_file: str | None = None
+    tmp_file: str | None = None
 
     if system_prompt.strip():
-        tmp_dir, sys_tmp_file = _write_temp_markdown(
-            tmp_dir, "dfa-", "system.md", system_prompt)
-        args.extend(["--append-system-prompt", sys_tmp_file])
+        tmp_dir = tempfile.mkdtemp(prefix="dfa-")
+        tmp_file = os.path.join(tmp_dir, "system.md")
+        Path(tmp_file).write_text(system_prompt, encoding="utf-8")
+        args.extend(["--append-system-prompt", tmp_file])
 
-    tmp_dir, prompt_tmp_file = _write_temp_markdown(
-        tmp_dir, "dfa-", "prompt.md", prompt)
-    args.append(f"@{prompt_tmp_file}")
+    # 注意：prompt 不再作为命令行参数传递，而是通过 stdin pipe 写入。
+    # 这样可以避免文件内容嵌入 prompt 时超出 Linux ARG_MAX 限制。
+    # pi 在 print 模式下会读取 piped stdin 并合并进初始 prompt。
+    prompt_bytes = prompt.encode("utf-8")
 
     try:
         pi_failures = 0
@@ -363,7 +350,9 @@ async def run_agent(
                     cwd=os.path.abspath(cwd),
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
-                    stdin=asyncio.subprocess.DEVNULL,
+                    # 使用 PIPE 而非 DEVNULL：prompt 通过 stdin 写入，
+                    # 避免将大文件内容拼入命令行参数导致超出 ARG_MAX 限制。
+                    stdin=asyncio.subprocess.PIPE,
                 )
             except (OSError, FileNotFoundError, PermissionError) as e:
                 # pi 进程拉起失败（二进制不存在、权限不足、资源不足等）
@@ -385,6 +374,18 @@ async def run_agent(
                 else:
                     _log_error(f"pi 拉起重试已耗尽 ({pi_failures} 次失败)")
                     break
+
+            # ── 将 prompt 写入 stdin 后立即关闭 ────────────
+            # pi -p 模式会读取 piped stdin 并合并进初始 prompt，
+            # 写完即关闭表示 EOF，pi 才会开始处理请求。
+            try:
+                assert proc.stdin is not None
+                proc.stdin.write(prompt_bytes)
+                await proc.stdin.drain()
+                proc.stdin.close()
+            except (BrokenPipeError, ConnectionResetError):
+                # 进程在我们写完前就退出了（罕见），继续读取输出
+                pass
 
             # ── 取消监控 ──────────────────────────────────────
             async def _cancel_monitor():
@@ -536,14 +537,9 @@ async def run_agent(
         return result
 
     finally:
-        if sys_tmp_file and os.path.exists(sys_tmp_file):
+        if tmp_file and os.path.exists(tmp_file):
             try:
-                os.unlink(sys_tmp_file)
-            except OSError:
-                pass
-        if prompt_tmp_file and os.path.exists(prompt_tmp_file):
-            try:
-                os.unlink(prompt_tmp_file)
+                os.unlink(tmp_file)
             except OSError:
                 pass
         if tmp_dir and os.path.exists(tmp_dir):
