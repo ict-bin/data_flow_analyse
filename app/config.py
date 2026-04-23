@@ -94,8 +94,11 @@ def parse_prompt(prompt: str) -> tuple[str, str]:
 
     # 尝试匹配函数名
     func_patterns = [
+        r'(?:函数|function|的)\s+([A-Za-z_]\w*(?:::[A-Za-z_]\w*)+)',  # C++ 方法名 "Class::Method"
         r'(?:函数|function|的)\s+(\w+)',        # "函数 xxx" / "的 xxx"
+        r'(?:中|的)\s+([A-Za-z_]\w*(?:::[A-Za-z_]\w*)+)\s*(?:函数|的|$)',  # C++ 方法名
         r'(?:中|的)\s+(\w+)\s*(?:函数|的|$)',    # "中 xxx 函数"
+        r'([A-Za-z_]\w*(?:::[A-Za-z_]\w*)+)\s+(?:函数|function)',  # C++ 方法名
         r'(\w+)\s+(?:函数|function)',            # "xxx 函数"
     ]
     for pat in func_patterns:
