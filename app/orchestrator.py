@@ -668,11 +668,15 @@ class Orchestrator:
                         except OSError:
                             pass
 
-                    # 自动同步：Worker 输出文本明显大于 dataflow 文件时，直接同步
-                    if df_file and df_content and output and len(output.strip()) > len(df_content.strip()) * 1.5:
+
+                    # 自动同步：使用全量 pi 输出（wr.output）而非提取的 <result> 摘要
+                    # Worker 常常只写短摘要没写文件，但 wr.output 有完整分析文本
+                    _raw_out = wr.output
+                    _sync_content = _raw_out if len(_raw_out.strip()) > len(output.strip()) else output
+                    if df_file and df_content and len(_sync_content.strip()) > 500:
                         try:
-                            Path(df_file).write_text(output, encoding="utf-8")
-                            df_content = output
+                            Path(df_file).write_text(_sync_content[:80000], encoding="utf-8")
+                            df_content = _sync_content[:80000]
                         except OSError:
                             pass
 
