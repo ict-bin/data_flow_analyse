@@ -610,6 +610,30 @@ class Orchestrator:
                                 f"[F3] dataflow 文件缺少 '## 需要跟入的函数调用' 表格\n"
                                 f"     此表格是系统递归分析子函数的关键依据，即使为空也必须保留表头"
                             )
+                        # 检查污点标记（F5）
+                        has_taint = any(m in df_content for m in
+                                        ['🔴', 'TAINTED', '🟢 CLEANED', '🟡 EXPORT', '📌 USED', '[☢]'])
+                        if not has_taint:
+                            df_issues.append(
+                                "[F5] dataflow 文件中没有污点标记（🔴/TAINTED/🟢/🟡）\n"
+                                "     Worker 未进行污点追踪，请按 '### INPUT-N: var 🔴 TAINTED / ├── [Lxx] code → result 🔴 TAINTED' 格式重写"
+                            )
+                        # 检查树状图（F6）
+                        has_tree = '├──' in df_content or '└──' in df_content
+                        if not has_tree:
+                            df_issues.append(
+                                "[F6] dataflow 文件中没有树状图结构（├── / └──）\n"
+                                "     请按 '├── [Lxx] `代码行` → result 🔴 TAINTED (原因)' 格式重写"
+                            )
+                        # 检查是否包含安全漏洞分析（F7）
+                        vuln_keywords = ['漏洞', 'CVE', '测试用例', 'PoC', 'exploit',
+                                         '薄弱性', '运漏', '追加', 'CRITICAL', 'RCE', 'bypass']
+                        found_vulns = [k for k in vuln_keywords if k in df_content]
+                        if found_vulns:
+                            df_issues.append(
+                                f"[F7] dataflow 文件包含安全漏洞分析内容（{', '.join(found_vulns[:3])}），辙超越了职责\n"
+                                "     请删除所有漏洞分析/测试用例/CVE 内容，只进行污点追踪"
+                            )
 
                     self._emit("worker_done", task_id, worker_id=wid,
                                output=output[:500],
