@@ -589,14 +589,38 @@ class Orchestrator:
                         except OSError:
                             pass
 
+                    # 后置校验：检查 dataflow 文件结构完整性
+                    df_issues: list[str] = []
+                    if not df_file or len(df_content.strip()) < 100:
+                        df_issues.append(
+                            f"[F1] {wid} 未将分析结果写入 dataflow-*.md 文件（或文件为空）\n"
+                            f"     请使用 write 工具将完整分析写入 dataflow-{cfg.function_name}.md"
+                        )
+                    else:
+                        # 检查是否包含目标函数名
+                        func_short = cfg.function_name.split("::")[-1]
+                        if func_short not in df_content and cfg.function_name not in df_content:
+                            df_issues.append(
+                                f"[F2] dataflow 文件内容不包含目标函数名 '{cfg.function_name}'，"
+                                f"可能分析了错误的函数\n     请确认分析的是 {cfg.source_file} 中的 {cfg.function_name}"
+                            )
+                        # 检查是否包含 callee 表格
+                        if "需要跟入的函数调用" not in df_content:
+                            df_issues.append(
+                                f"[F3] dataflow 文件缺少 '## 需要跟入的函数调用' 表格\n"
+                                f"     此表格是系统递归分析子函数的关键依据，即使为空也必须保留表头"
+                            )
+
                     self._emit("worker_done", task_id, worker_id=wid,
                                output=output[:500],
-                               dataflow_found=bool(df_file),
+                               dataflow_found=bool(df_file) and not df_issues,
+                               df_issues=df_issues,
                                function=cfg.function_name)
                     round_workers.append(WorkerResult(
                         worker_id=wid, model=cfg.workers.agents[i].model,
                         output=output, dataflow_file=df_file or "",
-                        token_usage=wr.token_usage, error=wr.error))
+                        token_usage=wr.token_usage, error=wr.error,
+                        df_issues=df_issues))
 
                     # 归档 worker 摘要输出
                     (rnd_workers_dir / f"{wid}-output.md").write_text(output, encoding="utf-8")
@@ -1137,6 +1161,13 @@ class Orchestrator:
                 w.output, encoding="utf-8")
             # dataflow 文件
             df_dst = j_dir / f"{w.worker_id}-dataflow.md"
+
+            # 如果有结构性问题，写入问题描述作为代替文件
+            if w.df_issues:
+                df_dst.write_text(
+                    "# ⚠️ 结构性检查失败 — Worker 未正确交付\n\n"
+                    + "\n".join(w.df_issues),
+                    encoding="utf-8")
             if w.dataflow_file:
                 try:
                     df_content = Path(w.dataflow_file).read_text(encoding="utf-8")
@@ -1153,6 +1184,23 @@ class Orchestrator:
         # ═══ 步骤1：并行评判所有 Worker（每个 Worker 独立上下文）═════════
 
         async def _eval_one_worker(w: WorkerResult) -> tuple[WorkerEvaluation, object]:
+            # 结构性问题：直接生成 fail，不调用 LLM
+            if w.df_issues:
+                issues_text = "\n".join(w.df_issues)
+                ev = WorkerEvaluation(
+                    worker_id=w.worker_id,
+                    passed=False,
+                    score=0,
+                    feedback=f"结构性检查失败，自动不通过：\n{issues_text}",
+                    refinement=issues_text,
+                )
+                (j_dir / f"eval-{w.worker_id}.md").write_text(
+                    f"# {jid} → {w.worker_id} (Round {rnd_num}) — 自动不通过\n\n"
+                    f"- **原因**: 结构性检查失败\n\n"
+                    f"## 问题列表\n\n{issues_text}\n",
+                    encoding="utf-8",
+                )
+                return ev, TokenUsage()  # 不消耗 token
             eval_prompt = self._build_eval_prompt(
                 cfg.task, w, rnd_num,
                 output_path=f"{w.worker_id}-output.md",

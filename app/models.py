@@ -123,6 +123,7 @@ class WorkerResult(BaseModel):
     dataflow_file: str = ""  # Worker 写入的 dataflow-*.md 路径
     token_usage: TokenUsage = Field(default_factory=TokenUsage)
     error: Optional[str] = None
+    df_issues: list[str] = Field(default_factory=list)  # 结构校验问题列表
 
 
 class CalleeRef(BaseModel):
