@@ -568,29 +568,6 @@ class Orchestrator:
                             pass
             worker_cwds.append(str(wdir))
 
-        # 每轮开始前预创建 dataflow 骨架文件，确保格式正确
-        # Worker 只需用 edit 工具填充内容，不再需要记得调用 gen_dataflow
-        if cfg.function_name:
-            import subprocess as _sp
-            # 解析污染参数
-            _inputs = []
-            if cfg.context:
-                _m = re.search(r'污染参数[::：]\s*([^\n]+)', cfg.context)
-                if _m:
-                    _inputs = [x.strip() for x in _m.group(1).split(',') if x.strip()]
-            if not _inputs:
-                _inputs = ['input']
-            _line_range = 'L?-L?'
-            for wdir_path in worker_cwds:
-                try:
-                    _r = _sp.run(
-                        ['gen_dataflow', cfg.function_name,
-                         cfg.source_file or '', _line_range,
-                         ','.join(_inputs)],
-                        cwd=wdir_path, capture_output=True, timeout=10)
-                except Exception:
-                    pass  # gen_dataflow 失败不影响主流程
-
 
         worker_dir_prompts = load_system_prompts(cfg.workers.system_prompt_dir, cfg.worker_count)
         judge_dir_prompts = load_system_prompts(cfg.judges.system_prompt_dir, cfg.judge_count)
