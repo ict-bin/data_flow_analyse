@@ -39,12 +39,10 @@ class CliRenderer:
         self._t0 = time.time()
         self._in_round = False
         # 流式输出状态
-        self._stream_chars = 0
-        self._stream_dots = 0
-        self._worker_active = False
-        # 并行任务跟踪： task_id → (depth, func_name)
-        self._task_depth: dict[str, int] = {}
-        self._task_func: dict[str, str] = {}
+        self._in_think = False          # 是否在 <think> 块内
+        self._think_chars = 0           # think 块内繌穏字符数
+        self._stream_col = 0            # 当前行已写字符数（控制换行）
+        self._worker_active = False     # Worker 是否正在运行
 
     def __call__(self, event: SwarmEvent):
         if self.quiet:
@@ -77,8 +75,6 @@ class CliRenderer:
             depth = d.get("depth", 0)
             func = d.get("function", "?")
             self._depth = depth
-            self._task_depth[event.task_id] = depth
-            self._task_func[event.task_id] = func
             self._func_count += 1
             if depth == 0:
                 self._root_id = event.task_id
@@ -97,53 +93,39 @@ class CliRenderer:
             self._round_t0 = time.time()
             self._round_evals = []
             self._in_round = True
-            self._stream_chars = 0
-            self._stream_dots = 0
-            _depth = self._task_depth.get(event.task_id, self._depth)
-            _func  = d.get("function", self._task_func.get(event.task_id, "?"))
-            prefix = self._cont(_depth)
+            self._in_think = False
+            self._think_chars = 0
+            self._stream_col = 0
+            prefix = self._cont()
+            print(f"{prefix}R{rnd}:", flush=True)
 
         elif t == "worker_start":
             self._worker_active = True
-            self._stream_chars = 0
-            self._stream_dots = 0
-            _depth = self._task_depth.get(event.task_id, self._depth)
-            _func  = d.get("function", self._task_func.get(event.task_id, "?"))
-            prefix = self._cont(_depth)
-            elapsed = f"{time.time() - self._round_t0:.0f}s"
-            print(f"{prefix}  [{_func}] W ", end="", flush=True)
+            prefix = self._cont()
+            wid = d.get('worker_id', 'worker-0')
+            model = d.get('model', '').split('/')[-1]
+            print(f"{prefix}  [W:{model}] ", end="", flush=True)
+            self._stream_col = len(f"  [W:{model}] ")
 
         elif t == "worker_stream":
-            # 每 300 字符打一个点，表示进度
-            delta = d.get("delta", "")
-            if delta:
-                self._stream_chars += len(delta)
-                dots = self._stream_chars // 300
-                if dots > self._stream_dots:
-                    print("." * (dots - self._stream_dots), end="", flush=True)
-                    self._stream_dots = dots
+            self._handle_stream(d.get("delta", ""))
 
         elif t == "worker_done":
             self._worker_active = False
-            elapsed = f"{time.time() - self._round_t0:.0f}s"
-            df_issues = d.get("df_issues", [])
+            # 确保流式输出已换行
+            if self._stream_col > 0:
+                print(flush=True)
+                self._stream_col = 0
             df = "✓" if d.get("dataflow_found") else "∅"
-            print(f" W[{df}] ({elapsed})", flush=True)
-            # 显示具体的结构性问题
-            if df_issues:
-                prefix = self._cont(self._task_depth.get(event.task_id, self._depth))
-                for issue in df_issues:
-                    first_line = issue.split('\n')[0]
-                    print(f"{prefix}  ⚠️  {first_line}", flush=True)
+            prefix = self._cont()
+            print(f"{prefix}  W[{df}] ", end="", flush=True)
 
         elif t == "judge_start":
-            _depth = self._task_depth.get(event.task_id, self._depth)
-            _func  = d.get("function", self._task_func.get(event.task_id, "?"))
-            prefix = self._cont(_depth)
-            elapsed = f"{time.time() - self._round_t0:.0f}s"
-            print(f"{prefix}  [{_func}] J ", end="", flush=True)
-            self._stream_chars = 0
-            self._stream_dots = 0
+            prefix = self._cont()
+            jid = d.get('judge_id', 'judge-0')
+            model = d.get('model', '').split('/')[-1]
+            print(f"{prefix}  [J:{model}] ", end="", flush=True)
+            self._stream_col = len(f"  [J:{model}] ")
 
         elif t == "judge_eval":
             score = d.get("score", 0)
@@ -151,16 +133,18 @@ class CliRenderer:
             self._round_evals.append({"score": score, "passed": passed})
 
         elif t == "round_end":
+            # 确保尚未换行的内容就位
+            if self._stream_col > 0:
+                print(flush=True)
+                self._stream_col = 0
             elapsed = time.time() - self._round_t0
             passed = d.get("passed", False)
             pc = d.get("pass_count", 0)
             tc = d.get("total_judges", 1)
             scores = "/".join(str(e["score"]) for e in self._round_evals)
             icon = "✅" if passed else "❌"
-            _depth = self._task_depth.get(event.task_id, self._depth)
-            _func  = d.get("function", self._task_func.get(event.task_id, "?"))
-            prefix = self._cont(_depth)
-            print(f"{prefix}  → {icon} {pc}/{tc} ({elapsed:.0f}s)")
+            prefix = self._cont()
+            print(f"{prefix}  → J[{scores}] {icon} {pc}/{tc} ({elapsed:.0f}s)")
             self._in_round = False
 
         elif t == "round_reflection":
@@ -213,6 +197,73 @@ class CliRenderer:
             print(f"\n{prefix}❗ {d.get('error', '')[:200]}", file=sys.stderr)
 
     # ── 最终汇总 ──────────────────────────────────────────────
+
+    def _handle_stream(self, delta: str):
+        """处理流式文本 delta：过滤 <think> 块，实时打印实际内容。"""
+        if not delta:
+            return
+        MAX_COL = 120  # 超过此宽度自动换行
+        prefix = self._cont() + "  "
+
+        i = 0
+        while i < len(delta):
+            if self._in_think:
+                # 在 think 块内：搜索结束标签
+                end = delta.find("</think>", i)
+                if end == -1:
+                    self._think_chars += len(delta) - i
+                    # 每 200 字符打一个点表示思考进度
+                    dots = self._think_chars // 200
+                    displayed = getattr(self, '_think_dots_shown', 0)
+                    if dots > displayed:
+                        new_dots = '.' * (dots - displayed)
+                        print(new_dots, end='', flush=True)
+                        self._stream_col += len(new_dots)
+                        self._think_dots_shown = dots
+                    break
+                else:
+                    self._in_think = False
+                    self._think_chars = 0
+                    self._think_dots_shown = 0
+                    # 结束 think 块后换行
+                    if self._stream_col > 0:
+                        print(flush=True)
+                        self._stream_col = 0
+                    i = end + len("</think>")
+            else:
+                # 在正常文本中：搜索 think 开始标签
+                start = delta.find("<think>", i)
+                chunk = delta[i:start] if start != -1 else delta[i:]
+
+                # 逐行输出 chunk
+                for line in chunk.split('\n'):
+                    if line:
+                        # 需要换行时先打前缀
+                        if self._stream_col == 0:
+                            print(prefix, end='', flush=True)
+                            self._stream_col = len(prefix)
+                        print(line, end='', flush=True)
+                        self._stream_col += len(line)
+                        if self._stream_col >= MAX_COL:
+                            print(flush=True)
+                            self._stream_col = 0
+                    else:
+                        # 空行 = 换行
+                        if self._stream_col > 0:
+                            print(flush=True)
+                            self._stream_col = 0
+
+                if start == -1:
+                    break
+                self._in_think = True
+                self._think_chars = 0
+                self._think_dots_shown = 0
+                # think 开始时打标记
+                if self._stream_col == 0:
+                    print(prefix, end='', flush=True)
+                print('💭[', end='', flush=True)
+                self._stream_col += 3
+                i = start + len("<think>")
 
     def _print_summary(self, d: dict):
         status = d.get("status", "?").upper()

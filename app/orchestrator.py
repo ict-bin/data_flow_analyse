@@ -94,82 +94,28 @@ def _extract_result(output: str) -> str:
 
 
 def _find_dataflow_file(worker_cwd: str, function_name: str = "") -> str:
-    """从 Worker 工作目录搜索数据流分析文件。
-    兼容多种命名惯例：dataflow-*.md / *.dataflow.md / *dataflow*.md / <funcname>*.md
-    """
+    """从 Worker 工作目录搜索 dataflow-*.md 文件。"""
     cwd = Path(worker_cwd)
     candidates: list[Path] = []
 
+    # 搜索当前目录和常见位置
     for search_dir in [cwd, Path("/tmp")]:
-        if not search_dir.is_dir():
-            continue
-        # 常见命名惯例（当前目录）
-        for pat in ["dataflow-*.md", "dataflow_*.md", "*.dataflow.md",
-                    "*dataflow*.md", "*_analysis.md"]:
-            candidates.extend(search_dir.glob(pat))
-        # 递归搜索子目录（Worker 可能将文件写到源码子目录下）
-        if function_name:
-            short = function_name.split("::")[-1]
-            candidates.extend(search_dir.rglob(f"*{short}*.md"))
-            candidates.extend(search_dir.rglob("*.dataflow.md"))
-            candidates.extend(search_dir.glob(f"{short}*.md"))
-            candidates.extend(search_dir.glob(f"*{short}*.md"))
-
-    # 去重
-    seen: set[str] = set()
-    uniq: list[Path] = []
-    for c in candidates:
-        k = str(c)
-        if k not in seen:
-            seen.add(k)
-            uniq.append(c)
-    candidates = uniq
+        if search_dir.is_dir():
+            candidates.extend(search_dir.glob("dataflow-*.md"))
+            candidates.extend(search_dir.glob("dataflow_*.md"))
 
     if not candidates:
         return ""
 
-    # 优先匹配函数名，且内容 > 100 bytes
+    # 优先匹配函数名
     if function_name:
-        short = function_name.split("::")[-1].lower()
-        func_lower = function_name.lower()
-        # 首先尝试内容匹配（文件名可能不包含函数名）
-        for c in sorted(candidates, key=lambda p: p.stat().st_mtime, reverse=True):
-            try:
-                sz = c.stat().st_size
-                if sz > 200:  # 排除空骨架
-                    head = c.read_text(encoding='utf-8', errors='replace')[:500]
-                    if short in head.lower() or func_lower in head.lower():
-                        # 如果文件不在 cwd 根目录，将内容拷贝到正确路径
-                        correct = cwd / f"dataflow-{function_name}.md"
-                        if c.resolve() != correct.resolve() and not correct.exists():
-                            try:
-                                correct.write_text(
-                                    c.read_text(encoding='utf-8', errors='replace'),
-                                    encoding='utf-8')
-                                return str(correct)
-                            except OSError:
-                                pass
-                        return str(c)
-            except OSError:
-                pass
-        # 备选：文件名包含函数名
         for c in candidates:
-            if short in c.name.lower() or func_lower in c.name.lower():
-                try:
-                    if c.stat().st_size > 200:
-                        return str(c)
-                except OSError:
-                    pass
-
-    # 取最新且 > 200 bytes 的文件
-    candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
-    for c in candidates:
-        try:
-            if c.stat().st_size > 200:
+            if function_name.lower() in c.name.lower():
                 return str(c)
-        except OSError:
-            pass
-    return str(candidates[0]) if candidates else ""
+
+    # 取最新修改的
+    candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    return str(candidates[0])
 
 
 def _get_best_output(worker: WorkerResult) -> str:
@@ -197,7 +143,7 @@ def _parse_callees(dataflow_content: str) -> list[CalleeRef]:
 
     for line in dataflow_content.split("\n"):
         stripped = line.strip()
-        if "函数调用" in stripped:  # 兼容跟入/跟进/callee 等写法
+        if "需要跟入的函数调用" in stripped:
             in_table = True
             func_col = -1
             continue
@@ -256,9 +202,6 @@ def _parse_callees(dataflow_content: str) -> list[CalleeRef]:
             continue
         if fname in ('None', 'null', 'void', 'return', 'break', 'continue'):
             continue
-        # 标准库函数直接过滤
-        if fname in _STDLIB_SKIP:
-            continue
 
         callees.append(CalleeRef(
             function_name=fname, file=ffile, line=fline,
@@ -266,69 +209,25 @@ def _parse_callees(dataflow_content: str) -> list[CalleeRef]:
     return callees
 
 
-# 标准库 / 编译器内置函数黑名单，这些函数不在项目源码中有定义，无需追踪
-_STDLIB_SKIP: frozenset[str] = frozenset({
-    # 内存
-    'memcpy', 'memset', 'memmove', 'memcmp', 'memchr', 'memrchr',
-    # 字符串
-    'strlen', 'strcpy', 'strncpy', 'strcat', 'strncat', 'strcmp', 'strncmp',
-    'strchr', 'strrchr', 'strstr', 'strtok', 'strtok_r',
-    'strtol', 'strtoul', 'strtoll', 'strtoull', 'strtod', 'strtof',
-    'sprintf', 'snprintf', 'printf', 'fprintf', 'vprintf', 'vsprintf', 'vsnprintf',
-    'scanf', 'sscanf', 'fscanf',
-    # 内存管理
-    'malloc', 'calloc', 'realloc', 'free', 'alloca', 'valloc',
-    'new', 'delete',
-    # 文件 IO
-    'fopen', 'fclose', 'fread', 'fwrite', 'fgets', 'fputs', 'fflush',
-    'fseek', 'ftell', 'rewind', 'feof', 'ferror', 'clearerr', 'fileno',
-    'open', 'close', 'read', 'write', 'lseek',
-    # 数学
-    'abs', 'labs', 'llabs', 'fabs', 'fabsf', 'sqrt', 'sqrtf',
-    'sin', 'cos', 'tan', 'pow', 'log', 'log2', 'log10',
-    # 类型转换
-    'atoi', 'atol', 'atof', 'atoll',
-    # 控制
-    'assert', 'abort', 'exit', '_exit', 'atexit', 'rand', 'srand',
-    # POSIX
-    'pthread_create', 'pthread_join', 'pthread_mutex_lock', 'pthread_mutex_unlock',
-    'pthread_mutex_init', 'pthread_mutex_destroy',
-    'sleep', 'usleep', 'nanosleep', 'getpid', 'getppid',
-    # 网络
-    'socket', 'bind', 'connect', 'listen', 'accept', 'send', 'recv',
-    'sendto', 'recvfrom', 'setsockopt', 'getsockopt', 'htons', 'ntohs', 'htonl', 'ntohl',
-    # 其他 C++ 内置
-    'operator', 'swap',
-})
-
-
 def _function_has_definition(target_dir: str, function_name: str) -> bool:
     """快速 grep 检查函数定义（非 extern 声明）是否存在于目标目录的源文件中。"""
     import subprocess
-    # 标准库函数直接返回 False（不在项目源码中定义）
-    if function_name in _STDLIB_SKIP:
-        return False
     try:
-        # 第一步：全词匹配函数名（-w），避免 ltc_memcpy 误匹配 memcpy
+        # 搜索 C 风格函数定义: "函数名(" 出现在行首附近
         result = subprocess.run(
-            ["grep", "-rl", "-w",
-             "--include=*.c", "--include=*.h",
-             "--include=*.cpp", "--include=*.cc", "--include=*.cxx",
-             function_name, target_dir],
+            ["grep", "-rl", "--include=*.c", "--include=*.h",
+             function_name + "(", target_dir],
             capture_output=True, text=True, timeout=5)
         if result.returncode != 0:
             return False
-        # 第二步：搜索函数定义行（返回类型 + 空白 + 函数名(）
-        #   使用 -P 珀尔正则，要求函数名前有空格/指针符，排除纯调用行
+        # 搜索 "type func_name(" 模式
         result2 = subprocess.run(
-            ["grep", "-rn", "-P",
-             "--include=*.c", "--include=*.cpp", "--include=*.cc", "--include=*.cxx",
-             r"^[A-Za-z_][A-Za-z0-9_ *&:<>\[\]]*[\s*:]" + re.escape(function_name) + r"\s*\(",
-             target_dir],
+            ["grep", "-rn", "--include=*.c",
+             "^[A-Za-z_].*" + function_name + "(", target_dir],
             capture_output=True, text=True, timeout=5)
         if result2.returncode != 0 or not result2.stdout.strip():
             return False
-        # 第三步：排除 extern 声明
+        # 排除 extern 声明（extern int func(...); 不是定义）
         lines = result2.stdout.strip().split("\n")
         for line in lines:
             # 提取 grep 输出中冒号后的代码部分
@@ -416,7 +315,7 @@ def _parse_eval_md(output: str) -> dict:
         m = re.search(r'##\s*[Pp]ass[::=：]\s*(是|否|true|false|yes|no)', output, re.IGNORECASE)
     if m:
         passed = m.group(1).lower() in ('是', 'true', 'yes', 'pass')
-    elif score >= 60:
+    elif score >= 70:
         passed = True
 
     # 提取评审意见
@@ -568,30 +467,6 @@ class Orchestrator:
                             pass
             worker_cwds.append(str(wdir))
 
-        # 每轮开始前预创建 dataflow 骨架文件，确保格式正确
-        # Worker 只需用 edit 工具填充内容，不再需要记得调用 gen_dataflow
-        if cfg.function_name:
-            import subprocess as _sp
-            # 解析污染参数
-            _inputs = []
-            if cfg.context:
-                _m = re.search(r'污染参数[::：]\s*([^\n]+)', cfg.context)
-                if _m:
-                    _inputs = [x.strip() for x in _m.group(1).split(',') if x.strip()]
-            if not _inputs:
-                _inputs = ['input']
-            _line_range = 'L?-L?'
-            for wdir_path in worker_cwds:
-                try:
-                    _r = _sp.run(
-                        ['gen_dataflow', cfg.function_name,
-                         cfg.source_file or '', _line_range,
-                         ','.join(_inputs)],
-                        cwd=wdir_path, capture_output=True, timeout=10)
-                except Exception:
-                    pass  # gen_dataflow 失败不影响主流程
-
-
         worker_dir_prompts = load_system_prompts(cfg.workers.system_prompt_dir, cfg.worker_count)
         judge_dir_prompts = load_system_prompts(cfg.judges.system_prompt_dir, cfg.judge_count)
 
@@ -612,8 +487,7 @@ class Orchestrator:
                 if self._cancel_event.is_set():
                     break
 
-                self._emit("round_start", task_id, round=rnd_num,
-                           function=cfg.function_name)
+                self._emit("round_start", task_id, round=rnd_num)
                 rnd_dir = out_dir / f"round-{rnd_num}"
                 rnd_workers_dir = rnd_dir / "workers"
                 rnd_judges_dir = rnd_dir / "judges"
@@ -625,15 +499,13 @@ class Orchestrator:
                 # ═══════════════════════════════════════════════════════
 
                 worker_prompt = self._build_worker_prompt(
-                    cfg.task, cfg.context, rnd_num, feedback_for_workers,
-                    function_name=cfg.function_name, source_file=cfg.source_file)
+                    cfg.task, cfg.context, rnd_num, feedback_for_workers)
 
                 w_tasks = []
                 for i, acfg in enumerate(cfg.workers.agents):
                     wid = f"worker-{i}"
                     self._emit("worker_start", task_id, worker_id=wid,
-                               model=acfg.model, round=rnd_num,
-                               function=cfg.function_name)
+                               model=acfg.model, round=rnd_num)
                     w_tasks.append({
                         "prompt": worker_prompt,
                         "model": acfg.model,
@@ -668,70 +540,13 @@ class Orchestrator:
                         except OSError:
                             pass
 
-                            pass
-                    # 后置校验：检查 dataflow 文件结构完整性
-                    df_issues: list[str] = []
-                    if not df_file or len(df_content.strip()) < 100:
-                        df_issues.append(
-                            f"[F1] {wid} 未将分析结果写入 dataflow-*.md 文件（或文件为空）\n"
-                            f"     请使用 write 工具将完整分析写入 dataflow-{cfg.function_name}.md"
-                        )
-                    else:
-                        # 检查是否包含目标函数名
-                        func_short = cfg.function_name.split("::")[-1]
-                        if func_short not in df_content and cfg.function_name not in df_content:
-                            df_issues.append(
-                                f"[F2] dataflow 文件内容不包含目标函数名 '{cfg.function_name}'，"
-                                f"可能分析了错误的函数\n     请确认分析的是 {cfg.source_file} 中的 {cfg.function_name}"
-                            )
-                        # 检查是否包含 callee 表格
-                        if not any(kw in df_content for kw in ["函数调用", "callee", "跟入", "跟进"]):
-                            df_issues.append(
-                                "[F3] dataflow 文件缺少函数调用跟入表格（## 需要跟入的函数调用）\n"
-                                "     此表格是系统递归分析子函数的关键依据，即使为空也必须保留表头"
-                            )
                     self._emit("worker_done", task_id, worker_id=wid,
                                output=output[:500],
-                               dataflow_found=bool(df_file) and not df_issues,
-                               df_issues=df_issues,
-                               function=cfg.function_name)
+                               dataflow_found=bool(df_file))
                     round_workers.append(WorkerResult(
                         worker_id=wid, model=cfg.workers.agents[i].model,
                         output=output, dataflow_file=df_file or "",
-                        token_usage=wr.token_usage, error=wr.error,
-                        df_issues=df_issues))
-
-                    # 结构性失败时清除 session 和 workspace 旧数据流文件
-                    # 避免旧文件干扰下一轮（Worker 可能写了错误文件名或错误内容）
-                    if df_issues:
-                        try:
-                            Path(worker_sessions[i]).unlink(missing_ok=True)
-                        except OSError:
-                            pass
-                        # 清理 workspace 里所有 .md 文件（旧的数据流文件）
-                        try:
-                            for _md in Path(worker_cwds[i]).glob('*.md'):
-                                _md.unlink(missing_ok=True)
-                        except OSError:
-                            pass
-                        # 重新创建骨架（新骨架包含正确文件名）
-                        try:
-                            import subprocess as _sp2
-                            _inputs2 = []
-                            if cfg.context:
-                                _m2 = re.search(r'污染参数[::：]\s*([^\n]+)', cfg.context)
-                                if _m2:
-                                    _inputs2 = [x.strip() for x in _m2.group(1).split(',') if x.strip()]
-                            if not _inputs2:
-                                _inputs2 = ['input']
-                            _sp2.run(
-                                ['gen_dataflow', cfg.function_name,
-                                 cfg.source_file or '', 'L?-L?',
-                                 ','.join(_inputs2)],
-                                cwd=worker_cwds[i], capture_output=True, timeout=10)
-                        except Exception:
-                            pass
-                            pass
+                        token_usage=wr.token_usage, error=wr.error))
 
                     # 归档 worker 摘要输出
                     (rnd_workers_dir / f"{wid}-output.md").write_text(output, encoding="utf-8")
@@ -746,8 +561,7 @@ class Orchestrator:
                 # Judge 之间并行，每个 Judge 内部串行（逐个评 Worker → 总结）
                 for j_idx, j_acfg in enumerate(cfg.judges.agents):
                     self._emit("judge_start", task_id, judge_id=f"judge-{j_idx}",
-                               model=j_acfg.model, round=rnd_num,
-                               function=cfg.function_name)
+                               model=j_acfg.model, round=rnd_num)
 
                 async def _run_one_judge(j_idx: int, j_acfg: AgentInstanceConfig) -> JudgeRoundResult:
                     return await self._run_judge_evaluation(
@@ -822,8 +636,7 @@ class Orchestrator:
 
                 self._emit("round_end", task_id, round=rnd_num,
                            passed=is_passed, pass_count=pass_count,
-                           total_judges=cfg.judge_count, best_worker=best_wid,
-                           function=cfg.function_name)
+                           total_judges=cfg.judge_count, best_worker=best_wid)
 
                 if is_passed and rnd_num >= cfg.min_rounds:
                     result.status = TaskStatus.PASSED
@@ -858,8 +671,9 @@ class Orchestrator:
         (out_dir / "result.json").write_text(result.model_dump_json(indent=2), encoding="utf-8")
 
         if not archive:
-            # 子任务模式：不压缩/不清理/不写 result_dir，由根任务统一处理
-            # 不发 task_end（避免 callee 分析前过早触发 CLI banner）
+            # 子任务模式：不压缩/不清理/不写 result_dir，留给根任务统一处理
+            self._emit("task_end", task_id,
+                       status=result.status.value, function=cfg.function_name)
             self._cancel_event = None
             return result
 
@@ -974,8 +788,8 @@ class Orchestrator:
                 self._do_final_archive(result, root_out_dir)
             return result
 
-        # callee 解析：从 dataflow 文件（Worker 应该用 write 工具将分析内容写入这里）
         callees = _parse_callees(result.final_output)
+        # 防护：过滤自递归 + 已分析 + 单层上限
         MAX_CALLEES_PER_LEVEL = 10
         filtered: list[CalleeRef] = []
         for c in callees:
@@ -992,38 +806,24 @@ class Orchestrator:
                        function=cfg.function_name,
                        callees=[c.function_name for c in callees], depth=depth)
 
-        # ─── 步骤3：并行递归分析所有子函数 ───
+        # ─── 步骤3：递归分析每个子函数 ───
         sub_dataflow_files: list[tuple[str, str]] = []  # (func_name, dataflow_path)
 
-        # 预过滤： grep 预检（不预注册——子任务在自己的 execute_recursive 开头注册）
-        target_dir_abs = os.path.abspath(cfg.cwd)
-        valid_callees: list[CalleeRef] = []
         for callee in callees:
-            c_key = (callee.file or cfg.source_file) + "::" + callee.function_name
-            if c_key in analyzed:
-                self._emit("trace_skip", result.task_id,
-                           function=callee.function_name, reason="already analyzed")
-                continue
-            if not _function_has_definition(target_dir_abs, callee.function_name):
+            # 预检：grep 确认函数定义存在，不存在则跳过（避免浪费完整 Worker+Judge 流水线）
+            target_dir = os.path.abspath(cfg.cwd)
+            if not _function_has_definition(target_dir, callee.function_name):
                 self._emit("trace_skip", result.task_id,
                            function=callee.function_name,
                            reason="no definition found in source (grep pre-check)")
                 continue
-            # 不预注册：asyncio 单线程，子任务在第一个 await 前自己注册，天然 dedup
-            valid_callees.append(callee)
 
-        if valid_callees:
-            self._emit("trace_callees", result.task_id,
-                       function=cfg.function_name,
-                       callees=[c.function_name for c in valid_callees], depth=depth)
-
-        async def _analyze_callee(callee: CalleeRef) -> TaskResult:
-            """\u6784建子任务配置并递归分析（用于 asyncio.gather 并行）"""
             sub_file = callee.file or cfg.source_file
             sub_prompt = (
                 "分析文件 " + sub_file + " 中函数 " + callee.function_name + " 的数据流。"
                 + " 只追踪以下被污染的参数: " + (callee.tainted_params or "所有参数")
             )
+
             sub_cfg = cfg.model_copy(deep=True)
             sub_cfg.task = sub_prompt
             sub_cfg.function_name = callee.function_name
@@ -1032,39 +832,31 @@ class Orchestrator:
             if "# 调用者传入的脏数据" in ctx_base:
                 ctx_base = ctx_base.split("# 调用者传入的脏数据")[0].strip()
             sub_cfg.context = ctx_base
+
             tainted_ctx = ("函数 " + callee.function_name + " 被 " + cfg.function_name
                            + " 在 " + callee.line + " 调用。\n"
                            + "污染参数: " + callee.tainted_params + "\n"
                            + "说明: " + callee.description)
+
             sub_orch = Orchestrator(config=sub_cfg, on_event=self.on_event)
             sub_id = result.task_id + "-d" + str(depth + 1) + "-" + callee.function_name[:30]
-            return await sub_orch.execute_recursive(
+
+            sub_result = await sub_orch.execute_recursive(
                 task_id=sub_id, depth=depth + 1,
                 tainted_context=tainted_ctx, _analyzed=analyzed,
                 _root_out_dir=root_out_dir)
 
-        # 并行执行，支持并行数限制
-        _concur = cfg.callee_concurrency
-        if _concur == -1 or _concur >= len(valid_callees):
-            # 不限制并行数
-            sub_results = await asyncio.gather(*[_analyze_callee(c) for c in valid_callees])
-        else:
-            # Semaphore 限制最大并行数为 _concur
-            _sem = asyncio.Semaphore(max(1, _concur))
-            async def _analyze_with_sem(callee: CalleeRef) -> TaskResult:
-                async with _sem:
-                    return await _analyze_callee(callee)
-            sub_results = await asyncio.gather(*[_analyze_with_sem(c) for c in valid_callees])
-
-        # 收集并行结果
-        for sub_result, callee in zip(sub_results, valid_callees):
             result.total_tokens += sub_result.total_tokens
             result.total_duration_ms += sub_result.total_duration_ms
-            if sub_result.final_output and root_out_dir:
-                safe_name = re.sub(r'[^A-Za-z0-9_-]', '_', callee.function_name)
-                sub_df_path = root_out_dir / ("dataflow-" + safe_name + ".md")
-                sub_df_path.write_text(sub_result.final_output, encoding="utf-8")
-                sub_dataflow_files.append((callee.function_name, str(sub_df_path)))
+
+            # 收集子函数 dataflow 路径
+            if sub_result.final_output:
+                # 将子函数输出写入根工作目录
+                if root_out_dir:
+                    safe_name = re.sub(r'[^A-Za-z0-9_-]', '_', callee.function_name)
+                    sub_df_path = root_out_dir / ("dataflow-" + safe_name + ".md")
+                    sub_df_path.write_text(sub_result.final_output, encoding="utf-8")
+                    sub_dataflow_files.append((callee.function_name, str(sub_df_path)))
 
         # ─── 步骤4：根层合并 + 归档 ───
         if is_root:
@@ -1271,13 +1063,6 @@ class Orchestrator:
                 w.output, encoding="utf-8")
             # dataflow 文件
             df_dst = j_dir / f"{w.worker_id}-dataflow.md"
-
-            # 如果有结构性问题，写入问题描述作为代替文件
-            if w.df_issues:
-                df_dst.write_text(
-                    "# ⚠️ 结构性检查失败 — Worker 未正确交付\n\n"
-                    + "\n".join(w.df_issues),
-                    encoding="utf-8")
             if w.dataflow_file:
                 try:
                     df_content = Path(w.dataflow_file).read_text(encoding="utf-8")
@@ -1291,33 +1076,20 @@ class Orchestrator:
                     "# ⚠️ Worker did not produce a dataflow file",
                     encoding="utf-8")
 
-        # ═══ 步骤1：并行评判所有 Worker（每个 Worker 独立上下文）═════════
+        # ═══ 步骤1：逐个评判（每个 Worker 独立上下文）═══════════
 
-        async def _eval_one_worker(w: WorkerResult) -> tuple[WorkerEvaluation, object]:
-            # 结构性问题：直接生成 fail，不调用 LLM
-            if w.df_issues:
-                issues_text = "\n".join(w.df_issues)
-                ev = WorkerEvaluation(
-                    worker_id=w.worker_id,
-                    passed=False,
-                    score=0,
-                    feedback=f"结构性检查失败，自动不通过：\n{issues_text}",
-                    refinement=issues_text,
-                )
-                (j_dir / f"eval-{w.worker_id}.md").write_text(
-                    f"# {jid} → {w.worker_id} (Round {rnd_num}) — 自动不通过\n\n"
-                    f"- **原因**: 结构性检查失败\n\n"
-                    f"## 问题列表\n\n{issues_text}\n",
-                    encoding="utf-8",
-                )
-                return ev, TokenUsage()  # 不消耗 token
+        for w in round_workers:
             eval_prompt = self._build_eval_prompt(
                 cfg.task, w, rnd_num,
                 output_path=f"{w.worker_id}-output.md",
                 dataflow_path=f"{w.worker_id}-dataflow.md",
             )
+
+            # 独立上下文：session_file=None → --no-session
             ar = await run_agent(
                 prompt=eval_prompt, **base_kwargs, session_file=None)
+            j_result.token_usage += ar.token_usage
+
             parsed = _parse_eval_md(ar.output)
             ev = WorkerEvaluation(
                 worker_id=w.worker_id,
@@ -1326,8 +1098,11 @@ class Orchestrator:
                 feedback=parsed["feedback"],
                 refinement=parsed["refinement"],
             )
+            j_result.evaluations.append(ev)
+
+            # 归档 eval 结果
             (j_dir / f"eval-{w.worker_id}.md").write_text(
-                f"# {jid} \u2192 {w.worker_id} (Round {rnd_num})\n\n"
+                f"# {jid} → {w.worker_id} (Round {rnd_num})\n\n"
                 f"- **Model**: {judge_cfg.model}\n"
                 f"- **Pass**: {ev.passed}\n"
                 f"- **Score**: {ev.score}\n\n"
@@ -1335,12 +1110,6 @@ class Orchestrator:
                 f"## Refinement\n\n{ev.refinement}\n",
                 encoding="utf-8",
             )
-            return ev, ar.token_usage
-
-        eval_pairs = await asyncio.gather(*[_eval_one_worker(w) for w in round_workers])
-        for ev, tokens in eval_pairs:
-            j_result.evaluations.append(ev)
-            j_result.token_usage += tokens
 
         # ═══ 步骤2：综合对比（新上下文，读取 eval 文件）═══════════
 
@@ -1382,36 +1151,17 @@ class Orchestrator:
     # 提示词
     # ═══════════════════════════════════════════════════════════════════════
 
-    def _build_worker_prompt(self, task, context, rnd, feedback,
-                              function_name: str = "", source_file: str = ""):
-        # 主任务描述，显式注入输出文件名和只读警告
-        task_block = task
-        if function_name:
-            safe_fn = function_name
-            task_block += (
-                f"\n\n❗️ **必读：输出文件要求**\n"
-                f"- 使用 `write` 工具将分析写入：`dataflow-{safe_fn}.md`（**当前目录下**）\n"
-                f"- 文件名就是 `dataflow-{safe_fn}.md`，**不要**写成 `{safe_fn}.dataflow.md` 或加其他路径\n"
-                f"- `src-vul/` 目录是只读挂载，导新任何写入都会失败！请将文件写到当前目录"
-            )
-        parts = [f"# Task\n\n{task_block}"]
+    def _build_worker_prompt(self, task, context, rnd, feedback):
+        parts = [f"# Task\n\n{task}"]
         if context:
             parts.append(f"# Additional Context\n\n{context}")
         if rnd > 1 and feedback:
-            # 结构性问题（F1/F2/F3）置顶，避免被长上下文忽视
-            is_structural = any(tag in feedback for tag in ("[F1]", "[F2]", "[F3]"))
-            if is_structural:
-                parts.insert(0,
-                    f"⚠️ 上一轮交付失败，必须首先修复以下问题（否则本轮仍会自动不通过）:\n\n"
-                    f"{feedback}\n\n"
-                    f"修复完成后再输出分析内容和 <result>。")
-            else:
-                parts.append(
-                    f"# 第 {rnd - 1} 轮反馈\n\n"
-                    f"上一轮工作已评审，请针对以下反馈改进：\n\n"
-                    f"{feedback}\n\n"
-                    f"确保全面解决所有问题。")
-        parts.append("用 <result>...</result> 包裹摘要信息。")
+            parts.append(
+                f"# Feedback from Round {rnd - 1}\n\n"
+                f"Your previous work was evaluated. Here is the full feedback report:\n\n"
+                f"{feedback}\n\n"
+                f"Address ALL issues. Improve your output based on this feedback.")
+        parts.append("Wrap your final deliverable in <result>...</result> tags.")
         return "\n\n".join(parts)
 
     def _build_eval_prompt(self, task, worker: WorkerResult, rnd,
