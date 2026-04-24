@@ -1400,6 +1400,10 @@ class Orchestrator:
 
     def _build_worker_prompt(self, task, context, rnd, feedback,
                               function_name: str = "", source_file: str = ""):
+        import uuid
+        # 随机 nonce 确保每次请求 token 前缀不同，破坏 vllm prefix cache
+        # （防止 temperature=0 加 prefix cache 导致确定性复现“不调 write”的行为）
+        nonce = uuid.uuid4().hex[:8]
         # 主任务描述，显式注入输出文件名和只读警告
         task_block = task
         if function_name:
@@ -1410,7 +1414,7 @@ class Orchestrator:
                 f"- 文件名就是 `dataflow-{safe_fn}.md`，**不要**写成 `{safe_fn}.dataflow.md` 或加其他路径\n"
                 f"- `src-vul/` 目录是只读挂载，导新任何写入都会失败！请将文件写到当前目录"
             )
-        parts = [f"# Task\n\n{task_block}"]
+        parts = [f"<!-- {nonce} -->\n# Task\n\n{task_block}"]
         if context:
             parts.append(f"# Additional Context\n\n{context}")
         if rnd > 1 and feedback:
