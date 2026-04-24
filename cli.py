@@ -126,8 +126,15 @@ class CliRenderer:
         elif t == "worker_done":
             self._worker_active = False
             elapsed = f"{time.time() - self._round_t0:.0f}s"
+            df_issues = d.get("df_issues", [])
             df = "✓" if d.get("dataflow_found") else "∅"
             print(f" W[{df}] ({elapsed})", flush=True)
+            # 显示具体的结构性问题
+            if df_issues:
+                prefix = self._cont(self._task_depth.get(event.task_id, self._depth))
+                for issue in df_issues:
+                    first_line = issue.split('\n')[0]
+                    print(f"{prefix}  ⚠️  {first_line}", flush=True)
 
         elif t == "judge_start":
             _depth = self._task_depth.get(event.task_id, self._depth)

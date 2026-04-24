@@ -103,13 +103,15 @@ def _find_dataflow_file(worker_cwd: str, function_name: str = "") -> str:
     for search_dir in [cwd, Path("/tmp")]:
         if not search_dir.is_dir():
             continue
-        # 常见命名惯例
+        # 常见命名惯例（当前目录）
         for pat in ["dataflow-*.md", "dataflow_*.md", "*.dataflow.md",
                     "*dataflow*.md", "*_analysis.md"]:
             candidates.extend(search_dir.glob(pat))
-        # 函数名直接命名: HandleCommissioningSet.md, HandleCommissioningSet_df.md 等
+        # 递归搜索子目录（Worker 可能将文件写到源码子目录下）
         if function_name:
             short = function_name.split("::")[-1]
+            candidates.extend(search_dir.rglob(f"*{short}*.md"))
+            candidates.extend(search_dir.rglob("*.dataflow.md"))
             candidates.extend(search_dir.glob(f"{short}*.md"))
             candidates.extend(search_dir.glob(f"*{short}*.md"))
 
@@ -137,6 +139,16 @@ def _find_dataflow_file(worker_cwd: str, function_name: str = "") -> str:
                 if sz > 200:  # 排除空骨架
                     head = c.read_text(encoding='utf-8', errors='replace')[:500]
                     if short in head.lower() or func_lower in head.lower():
+                        # 如果文件不在 cwd 根目录，将内容拷贝到正确路径
+                        correct = cwd / f"dataflow-{function_name}.md"
+                        if c.resolve() != correct.resolve() and not correct.exists():
+                            try:
+                                correct.write_text(
+                                    c.read_text(encoding='utf-8', errors='replace'),
+                                    encoding='utf-8')
+                                return str(correct)
+                            except OSError:
+                                pass
                         return str(c)
             except OSError:
                 pass
@@ -613,7 +625,8 @@ class Orchestrator:
                 # ═══════════════════════════════════════════════════════
 
                 worker_prompt = self._build_worker_prompt(
-                    cfg.task, cfg.context, rnd_num, feedback_for_workers)
+                    cfg.task, cfg.context, rnd_num, feedback_for_workers,
+                    function_name=cfg.function_name, source_file=cfg.source_file)
 
                 w_tasks = []
                 for i, acfg in enumerate(cfg.workers.agents):
@@ -1392,8 +1405,19 @@ class Orchestrator:
     # 提示词
     # ═══════════════════════════════════════════════════════════════════════
 
-    def _build_worker_prompt(self, task, context, rnd, feedback):
-        parts = [f"# Task\n\n{task}"]
+    def _build_worker_prompt(self, task, context, rnd, feedback,
+                              function_name: str = "", source_file: str = ""):
+        # 主任务描述，显式注入输出文件名和只读警告
+        task_block = task
+        if function_name:
+            safe_fn = function_name
+            task_block += (
+                f"\n\n❗️ **必读：输出文件要求**\n"
+                f"- 使用 `write` 工具将分析写入：`dataflow-{safe_fn}.md`（**当前目录下**）\n"
+                f"- 文件名就是 `dataflow-{safe_fn}.md`，**不要**写成 `{safe_fn}.dataflow.md` 或加其他路径\n"
+                f"- `src-vul/` 目录是只读挂载，导新任何写入都会失败！请将文件写到当前目录"
+            )
+        parts = [f"# Task\n\n{task_block}"]
         if context:
             parts.append(f"# Additional Context\n\n{context}")
         if rnd > 1 and feedback:
