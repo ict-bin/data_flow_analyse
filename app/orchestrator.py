@@ -613,6 +613,20 @@ class Orchestrator:
                         except OSError:
                             pass
 
+                    # 自动同步：如果 dataflow 文件是空骨架（callee 表为空）
+                    # 而 Worker 输出文本有实际内容，自动将输出文本写入 dataflow 文件
+                    if df_file and df_content and output and len(output) > len(df_content) * 1.5:
+                        # Worker 输出文本有实质内容且比骨架大得多，同步
+                        _df_has_callee = any(k in df_content for k in ['\u51fd\u6570\u8c03\u7528', 'callee'])
+                        _df_callee_has_data = bool(_parse_callees(df_content))
+                        if not _df_callee_has_data and _parse_callees(output):
+                            # 骨架文件没有 callee 数据，Worker 输出文本有，直接替换
+                            try:
+                                Path(df_file).write_text(output, encoding='utf-8')
+                                df_content = output
+                            except OSError:
+                                pass
+
                     # 后置校验：检查 dataflow 文件结构完整性
                     df_issues: list[str] = []
                     if not df_file or len(df_content.strip()) < 100:
