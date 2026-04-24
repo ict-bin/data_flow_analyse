@@ -362,7 +362,7 @@ def _parse_eval_md(output: str) -> dict:
         m = re.search(r'##\s*[Pp]ass[::=：]\s*(是|否|true|false|yes|no)', output, re.IGNORECASE)
     if m:
         passed = m.group(1).lower() in ('是', 'true', 'yes', 'pass')
-    elif score >= 70:
+    elif score >= 60:
         passed = True
 
     # 提取评审意见
@@ -619,7 +619,8 @@ class Orchestrator:
                         # Worker 输出文本有实质内容且比骨架大得多，同步
                         _df_has_callee = any(k in df_content for k in ['\u51fd\u6570\u8c03\u7528', 'callee'])
                         _df_callee_has_data = bool(_parse_callees(df_content))
-                        if not _df_callee_has_data and _parse_callees(output):
+                        _has_real_lines = bool(__import__('re').search(r'L\d{2,}', output))
+                        if not _df_callee_has_data and _parse_callees(output) and _has_real_lines:
                             # 骨架文件没有 callee 数据，Worker 输出文本有，直接替换
                             try:
                                 Path(df_file).write_text(output, encoding='utf-8')
