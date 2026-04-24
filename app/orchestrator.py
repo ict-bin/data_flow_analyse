@@ -627,15 +627,6 @@ class Orchestrator:
                                 "[F6] dataflow 文件中没有树状图结构（├── / └──）\n"
                                 "     请按 '├── [Lxx] `代码行` → result 🔴 TAINTED (原因)' 格式重写"
                             )
-                        # 检查是否包含安全漏洞分析（F7）
-                        vuln_keywords = ['漏洞', 'CVE', '测试用例', 'PoC', 'exploit',
-                                         '薄弱性', '运漏', '追加', 'CRITICAL', 'RCE', 'bypass']
-                        found_vulns = [k for k in vuln_keywords if k in df_content]
-                        if found_vulns:
-                            df_issues.append(
-                                f"[F7] dataflow 文件包含安全漏洞分析内容（{', '.join(found_vulns[:3])}），辙超越了职责\n"
-                                "     请删除所有漏洞分析/测试用例/CVE 内容，只进行污点追踪"
-                            )
 
                     self._emit("worker_done", task_id, worker_id=wid,
                                output=output[:500],
