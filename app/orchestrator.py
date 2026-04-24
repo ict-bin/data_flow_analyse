@@ -891,7 +891,7 @@ class Orchestrator:
         # ─── 步骤3：并行递归分析所有子函数 ───
         sub_dataflow_files: list[tuple[str, str]] = []  # (func_name, dataflow_path)
 
-        # 预过滤： grep 预检 + 预注册（防止并行任务重复分析同一函数）
+        # 预过滤： grep 预检（不预注册——子任务在自己的 execute_recursive 开头注册）
         target_dir_abs = os.path.abspath(cfg.cwd)
         valid_callees: list[CalleeRef] = []
         for callee in callees:
@@ -905,7 +905,7 @@ class Orchestrator:
                            function=callee.function_name,
                            reason="no definition found in source (grep pre-check)")
                 continue
-            analyzed.add(c_key)  # 预注册，防止并行分支重复触发
+            # 不预注册：asyncio 单线程，子任务在第一个 await 前自己注册，天然 dedup
             valid_callees.append(callee)
 
         if valid_callees:
