@@ -215,14 +215,17 @@ def _function_has_definition(target_dir: str, function_name: str) -> bool:
     try:
         # 搜索 C 风格函数定义: "函数名(" 出现在行首附近
         result = subprocess.run(
-            ["grep", "-rl", "--include=*.c", "--include=*.h",
+            ["grep", "-rl",
+             "--include=*.c", "--include=*.h",
+             "--include=*.cpp", "--include=*.cc", "--include=*.cxx",
              function_name + "(", target_dir],
             capture_output=True, text=True, timeout=5)
         if result.returncode != 0:
             return False
         # 搜索 "type func_name(" 模式
         result2 = subprocess.run(
-            ["grep", "-rn", "--include=*.c",
+            ["grep", "-rn",
+             "--include=*.c", "--include=*.cpp", "--include=*.cc", "--include=*.cxx",
              "^[A-Za-z_].*" + function_name + "(", target_dir],
             capture_output=True, text=True, timeout=5)
         if result2.returncode != 0 or not result2.stdout.strip():
