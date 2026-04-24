@@ -860,6 +860,18 @@ class Orchestrator:
         if not archive:
             # 子任务模式：不压缩/不清理/不写 result_dir，由根任务统一处理
             # 不发 task_end（避免 callee 分析前过早触发 CLI banner）
+            #
+            # ★ 关键：将 dataflow 文件内容写入 final_output 供 callee 解析
+            # Worker 的 <result> 摘要只是简短总结，不含完整 callee 表格
+            # 真正的数据流分析和 callee 表格在 workspace 的 dataflow-*.md 里
+            _df_path = _find_dataflow_file(out_dir, cfg.function_name)
+            if _df_path:
+                try:
+                    _df_text = Path(_df_path).read_text(encoding="utf-8")
+                    if len(_df_text.strip()) > len((result.final_output or "").strip()):
+                        result.final_output = _df_text
+                except OSError:
+                    pass
             self._cancel_event = None
             return result
 
