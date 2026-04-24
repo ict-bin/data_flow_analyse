@@ -94,28 +94,70 @@ def _extract_result(output: str) -> str:
 
 
 def _find_dataflow_file(worker_cwd: str, function_name: str = "") -> str:
-    """从 Worker 工作目录搜索 dataflow-*.md 文件。"""
+    """从 Worker 工作目录搜索数据流分析文件。
+    兼容多种命名惯例：dataflow-*.md / *.dataflow.md / *dataflow*.md / <funcname>*.md
+    """
     cwd = Path(worker_cwd)
     candidates: list[Path] = []
 
-    # 搜索当前目录和常见位置
     for search_dir in [cwd, Path("/tmp")]:
-        if search_dir.is_dir():
-            candidates.extend(search_dir.glob("dataflow-*.md"))
-            candidates.extend(search_dir.glob("dataflow_*.md"))
+        if not search_dir.is_dir():
+            continue
+        # 常见命名惯例
+        for pat in ["dataflow-*.md", "dataflow_*.md", "*.dataflow.md",
+                    "*dataflow*.md", "*_analysis.md"]:
+            candidates.extend(search_dir.glob(pat))
+        # 函数名直接命名: HandleCommissioningSet.md, HandleCommissioningSet_df.md 等
+        if function_name:
+            short = function_name.split("::")[-1]
+            candidates.extend(search_dir.glob(f"{short}*.md"))
+            candidates.extend(search_dir.glob(f"*{short}*.md"))
+
+    # 去重
+    seen: set[str] = set()
+    uniq: list[Path] = []
+    for c in candidates:
+        k = str(c)
+        if k not in seen:
+            seen.add(k)
+            uniq.append(c)
+    candidates = uniq
 
     if not candidates:
         return ""
 
-    # 优先匹配函数名
+    # 优先匹配函数名，且内容 > 100 bytes
     if function_name:
+        short = function_name.split("::")[-1].lower()
+        func_lower = function_name.lower()
+        # 首先尝试内容匹配（文件名可能不包含函数名）
+        for c in sorted(candidates, key=lambda p: p.stat().st_mtime, reverse=True):
+            try:
+                sz = c.stat().st_size
+                if sz > 200:  # 排除空骨架
+                    head = c.read_text(encoding='utf-8', errors='replace')[:500]
+                    if short in head.lower() or func_lower in head.lower():
+                        return str(c)
+            except OSError:
+                pass
+        # 备选：文件名包含函数名
         for c in candidates:
-            if function_name.lower() in c.name.lower():
-                return str(c)
+            if short in c.name.lower() or func_lower in c.name.lower():
+                try:
+                    if c.stat().st_size > 200:
+                        return str(c)
+                except OSError:
+                    pass
 
-    # 取最新修改的
+    # 取最新且 > 200 bytes 的文件
     candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
-    return str(candidates[0])
+    for c in candidates:
+        try:
+            if c.stat().st_size > 200:
+                return str(c)
+        except OSError:
+            pass
+    return str(candidates[0]) if candidates else ""
 
 
 def _get_best_output(worker: WorkerResult) -> str:
@@ -653,11 +695,36 @@ class Orchestrator:
                         token_usage=wr.token_usage, error=wr.error,
                         df_issues=df_issues))
 
-                    # 结构性失败时清除 session：避免旧对话干扰下一轮
+                    # 结构性失败时清除 session 和 workspace 旧数据流文件
+                    # 避免旧文件干扰下一轮（Worker 可能写了错误文件名或错误内容）
                     if df_issues:
                         try:
                             Path(worker_sessions[i]).unlink(missing_ok=True)
                         except OSError:
+                            pass
+                        # 清理 workspace 里所有 .md 文件（旧的数据流文件）
+                        try:
+                            for _md in Path(worker_cwds[i]).glob('*.md'):
+                                _md.unlink(missing_ok=True)
+                        except OSError:
+                            pass
+                        # 重新创建骨架（新骨架包含正确文件名）
+                        try:
+                            import subprocess as _sp2
+                            _inputs2 = []
+                            if cfg.context:
+                                _m2 = re.search(r'污染参数[::：]\s*([^\n]+)', cfg.context)
+                                if _m2:
+                                    _inputs2 = [x.strip() for x in _m2.group(1).split(',') if x.strip()]
+                            if not _inputs2:
+                                _inputs2 = ['input']
+                            _sp2.run(
+                                ['gen_dataflow', cfg.function_name,
+                                 cfg.source_file or '', 'L?-L?',
+                                 ','.join(_inputs2)],
+                                cwd=worker_cwds[i], capture_output=True, timeout=10)
+                        except Exception:
+                            pass
                             pass
 
                     # 归档 worker 摘要输出

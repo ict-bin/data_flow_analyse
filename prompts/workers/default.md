@@ -26,7 +26,10 @@ extract_func src-vul/openthread/src/core/thread/network_data_leader_ftd.cpp Lead
 ls dataflow-*.md
 ```
 
-如果存在（正常情况），直接用 `edit` 填充内容。  
+如果存在（正常情况），**一定要使用这个文件名进行 edit**，不要幓自创建其他文件名。
+
+> ⚠️ **关键：文件名必须是 `dataflow-<函数名>.md`，不要写成 `<函数名>.dataflow.md` 或其他格式。Orchestrator 只认 `dataflow-*.md` 格式。**
+
 如果不存在，手动运行：
 
 ```bash
