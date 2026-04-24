@@ -219,9 +219,11 @@ def _parse_callees(dataflow_content: str) -> list[CalleeRef]:
         lower_cells = [c.lower() for c in cells]
         is_header = False
         for i, lc in enumerate(lower_cells):
-            if lc in ("函数名", "function", "func", "func_name"):
+            if lc in ("函数名", "函数调用", "调用函数", "function", "func", "func_name", "callee"):
                 func_col = i
                 is_header = True
+            elif lc in ("序号", "no", "#", "idx", "index"):
+                is_header = True  # 序号列不是函数名列
             elif lc in ("文件", "file"):
                 file_col = i
             elif "调用位置" in lc or "行号" in lc or "line" in lc or "call" in lc:
@@ -239,6 +241,15 @@ def _parse_callees(dataflow_content: str) -> list[CalleeRef]:
 
         # 提取各字段
         fname = cells[func_col] if func_col < len(cells) else ""
+        # 清理函数名：去掉反引号、-> 或 . 前缀的对象名
+        fname = fname.strip('`').strip()
+        # 处理 obj->Method() 或 obj.Method() → 取最后一个标识符
+        if '->' in fname:
+            fname = fname.split('->')[-1]
+        elif '.' in fname and '::' not in fname:
+            fname = fname.split('.')[-1]
+        # 去掉括号及参数
+        fname = re.sub(r'\(.*', '', fname).strip()
         ffile = cells[file_col] if 0 <= file_col < len(cells) else ""
         fline = cells[line_col] if 0 <= line_col < len(cells) else ""
         fparam = cells[param_col] if 0 <= param_col < len(cells) else ""
