@@ -928,6 +928,7 @@ class Orchestrator:
         tainted_context: str = "",
         _analyzed: set[str] | None = None,
         _root_out_dir: Path | None = None,
+        _global_sem: asyncio.Semaphore | None = None,
     ) -> TaskResult:
         """递归分析：当前函数 Worker+Judge → 解析子函数 → 递归 → merge。"""
         cfg = self.cfg
@@ -1053,18 +1054,21 @@ class Orchestrator:
             return await sub_orch.execute_recursive(
                 task_id=sub_id, depth=depth + 1,
                 tainted_context=tainted_ctx, _analyzed=analyzed,
-                _root_out_dir=root_out_dir)
+                _root_out_dir=root_out_dir,
+                _global_sem=_global_sem)
 
-        # 并行执行，支持并行数限制
+        # 并行执行：全局 Semaphore 跨所有递归层共享，防止指数级并发爆炸
+        # 根调用时创建，子调用时透传
         _concur = cfg.callee_concurrency
-        if _concur == -1 or _concur >= len(valid_callees):
-            # 不限制并行数
+        if _global_sem is None and _concur > 0:
+            _global_sem = asyncio.Semaphore(_concur)
+
+        if _global_sem is None:
+            # 无限制
             sub_results = await asyncio.gather(*[_analyze_callee(c) for c in valid_callees])
         else:
-            # Semaphore 限制最大并行数为 _concur
-            _sem = asyncio.Semaphore(max(1, _concur))
             async def _analyze_with_sem(callee: CalleeRef) -> TaskResult:
-                async with _sem:
+                async with _global_sem:
                     return await _analyze_callee(callee)
             sub_results = await asyncio.gather(*[_analyze_with_sem(c) for c in valid_callees])
 
