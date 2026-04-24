@@ -143,7 +143,7 @@ def _parse_callees(dataflow_content: str) -> list[CalleeRef]:
 
     for line in dataflow_content.split("\n"):
         stripped = line.strip()
-        if "需要跟入的函数调用" in stripped:
+        if "函数调用" in stripped:  # 兼容跟入/跟进/callee 等写法
             in_table = True
             func_col = -1
             continue
@@ -605,10 +605,10 @@ class Orchestrator:
                                 f"可能分析了错误的函数\n     请确认分析的是 {cfg.source_file} 中的 {cfg.function_name}"
                             )
                         # 检查是否包含 callee 表格
-                        if "需要跟入的函数调用" not in df_content:
+                        if not any(kw in df_content for kw in ["函数调用", "callee", "跟入", "跟进"]):
                             df_issues.append(
-                                f"[F3] dataflow 文件缺少 '## 需要跟入的函数调用' 表格\n"
-                                f"     此表格是系统递归分析子函数的关键依据，即使为空也必须保留表头"
+                                "[F3] dataflow 文件缺少函数调用跟入表格（## 需要跟入的函数调用）\n"
+                                "     此表格是系统递归分析子函数的关键依据，即使为空也必须保留表头"
                             )
                         # 检查污点标记（F5）
                         has_taint = any(m in df_content for m in
