@@ -458,6 +458,8 @@ async def run_agent(
                         pass
 
             # ── 提取最后一条 assistant 消息作为输出 ──────────
+            # 注：每个 Worker 应该使用 write 工具将分析内容写入 dataflow-*.md
+            # result.output 只用于采集摘要，不是主要内容来源
             for msg in reversed(result.messages):
                 if msg.get("role") == "assistant":
                     texts = [

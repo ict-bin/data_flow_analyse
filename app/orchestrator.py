@@ -668,18 +668,7 @@ class Orchestrator:
                         except OSError:
                             pass
 
-
-                    # 自动同步：使用全量 pi 输出（wr.output）而非提取的 <result> 摘要
-                    # Worker 常常只写短摘要没写文件，但 wr.output 有完整分析文本
-                    _raw_out = wr.output
-                    _sync_content = _raw_out if len(_raw_out.strip()) > len(output.strip()) else output
-                    if df_file and df_content and len(_sync_content.strip()) > 500:
-                        try:
-                            Path(df_file).write_text(_sync_content[:80000], encoding="utf-8")
-                            df_content = _sync_content[:80000]
-                        except OSError:
                             pass
-
                     # 后置校验：检查 dataflow 文件结构完整性
                     df_issues: list[str] = []
                     if not df_file or len(df_content.strip()) < 100:
@@ -985,24 +974,8 @@ class Orchestrator:
                 self._do_final_archive(result, root_out_dir)
             return result
 
-        # callee 解析：同时解析 dataflow 文件 + Worker 输出文本，取并集
-        # （Worker 可能将分析内容写入 <result> 文本而没有 edit 骨架文件）
-        _best_rnd = result.rounds[-1] if result.rounds else None
-        _worker_output_text = ""
-        if _best_rnd and _best_rnd.worker_results:
-            _bw = next((w for w in _best_rnd.worker_results if w.worker_id == _best_rnd.best_worker_id),
-                       _best_rnd.worker_results[0])
-            _worker_output_text = _bw.output
-        _df_callees  = _parse_callees(result.final_output)
-        _out_callees = _parse_callees(_worker_output_text) if _worker_output_text else []
-        # 合并去重
-        _seen_names: set[str] = set()
-        callees: list[CalleeRef] = []
-        for _c in _df_callees + _out_callees:
-            if _c.function_name not in _seen_names:
-                _seen_names.add(_c.function_name)
-                callees.append(_c)
-        # 防护：过滤自递归 + 已分析 + 单层上限
+        # callee 解析：从 dataflow 文件（Worker 应该用 write 工具将分析内容写入这里）
+        callees = _parse_callees(result.final_output)
         MAX_CALLEES_PER_LEVEL = 10
         filtered: list[CalleeRef] = []
         for c in callees:
