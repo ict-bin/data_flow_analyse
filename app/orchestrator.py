@@ -611,8 +611,10 @@ class Orchestrator:
                                 "     此表格是系统递归分析子函数的关键依据，即使为空也必须保留表头"
                             )
                         # 检查污点标记（F5）
-                        has_taint = any(m in df_content for m in
-                                        ['🔴', 'TAINTED', '🟢 CLEANED', '🟡 EXPORT', '📌 USED', '[☢]'])
+                        has_taint = any(m in df_content for m in [
+                            '🔴', 'TAINTED', '🟢', '🟡', '📌',
+                            '污点', '污染', '脏数据', 'taint', 'CLEAN', 'EXPORT', 'USED', 'DEFERRED',
+                        ])
                         if not has_taint:
                             df_issues.append(
                                 "[F5] dataflow 文件中没有污点标记（🔴/TAINTED/🟢/🟡）\n"
