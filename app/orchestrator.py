@@ -701,36 +701,14 @@ class Orchestrator:
                         token_usage=wr.token_usage, error=wr.error,
                         df_issues=df_issues))
 
-                    # 结构性失败时清除 session 和 workspace 旧数据流文件
-                    # 避免旧文件干扰下一轮（Worker 可能写了错误文件名或错误内容）
-                    if df_issues:
+
+                    # 每轮结束归档 session（不管成败都保留，供调试和下轮继续利用）
+                    _sess_src = Path(worker_sessions[i])
+                    if _sess_src.exists():
                         try:
-                            Path(worker_sessions[i]).unlink(missing_ok=True)
+                            import shutil as _shu
+                            _shu.copy2(str(_sess_src), str(rnd_workers_dir / f"{wid}-session.jsonl"))
                         except OSError:
-                            pass
-                        # 清理 workspace 里所有 .md 文件（旧的数据流文件）
-                        try:
-                            for _md in Path(worker_cwds[i]).glob('*.md'):
-                                _md.unlink(missing_ok=True)
-                        except OSError:
-                            pass
-                        # 重新创建骨架（新骨架包含正确文件名）
-                        try:
-                            import subprocess as _sp2
-                            _inputs2 = []
-                            if cfg.context:
-                                _m2 = re.search(r'污染参数[::：]\s*([^\n]+)', cfg.context)
-                                if _m2:
-                                    _inputs2 = [x.strip() for x in _m2.group(1).split(',') if x.strip()]
-                            if not _inputs2:
-                                _inputs2 = ['input']
-                            _sp2.run(
-                                ['gen_dataflow', cfg.function_name,
-                                 cfg.source_file or '', 'L?-L?',
-                                 ','.join(_inputs2)],
-                                cwd=worker_cwds[i], capture_output=True, timeout=10)
-                        except Exception:
-                            pass
                             pass
 
                     # 归档 worker 摘要输出
