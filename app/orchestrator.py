@@ -269,7 +269,7 @@ def _function_has_definition(target_dir: str, function_name: str) -> bool:
         result2 = subprocess.run(
             ["grep", "-rn", "-P",
              "--include=*.c", "--include=*.cpp", "--include=*.cc", "--include=*.cxx",
-             r"^[A-Za-z_][A-Za-z0-9_ *&:<>\[\]]*[\s*]" + re.escape(function_name) + r"\s*\(",
+             r"^[A-Za-z_][A-Za-z0-9_ *&:<>\[\]]*[\s*:]" + re.escape(function_name) + r"\s*\(",
              target_dir],
             capture_output=True, text=True, timeout=5)
         if result2.returncode != 0 or not result2.stdout.strip():
