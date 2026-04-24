@@ -202,6 +202,9 @@ def _parse_callees(dataflow_content: str) -> list[CalleeRef]:
             continue
         if fname in ('None', 'null', 'void', 'return', 'break', 'continue'):
             continue
+        # 标准库函数直接过滤
+        if fname in _STDLIB_SKIP:
+            continue
 
         callees.append(CalleeRef(
             function_name=fname, file=ffile, line=fline,
@@ -209,28 +212,69 @@ def _parse_callees(dataflow_content: str) -> list[CalleeRef]:
     return callees
 
 
+# 标准库 / 编译器内置函数黑名单，这些函数不在项目源码中有定义，无需追踪
+_STDLIB_SKIP: frozenset[str] = frozenset({
+    # 内存
+    'memcpy', 'memset', 'memmove', 'memcmp', 'memchr', 'memrchr',
+    # 字符串
+    'strlen', 'strcpy', 'strncpy', 'strcat', 'strncat', 'strcmp', 'strncmp',
+    'strchr', 'strrchr', 'strstr', 'strtok', 'strtok_r',
+    'strtol', 'strtoul', 'strtoll', 'strtoull', 'strtod', 'strtof',
+    'sprintf', 'snprintf', 'printf', 'fprintf', 'vprintf', 'vsprintf', 'vsnprintf',
+    'scanf', 'sscanf', 'fscanf',
+    # 内存管理
+    'malloc', 'calloc', 'realloc', 'free', 'alloca', 'valloc',
+    'new', 'delete',
+    # 文件 IO
+    'fopen', 'fclose', 'fread', 'fwrite', 'fgets', 'fputs', 'fflush',
+    'fseek', 'ftell', 'rewind', 'feof', 'ferror', 'clearerr', 'fileno',
+    'open', 'close', 'read', 'write', 'lseek',
+    # 数学
+    'abs', 'labs', 'llabs', 'fabs', 'fabsf', 'sqrt', 'sqrtf',
+    'sin', 'cos', 'tan', 'pow', 'log', 'log2', 'log10',
+    # 类型转换
+    'atoi', 'atol', 'atof', 'atoll',
+    # 控制
+    'assert', 'abort', 'exit', '_exit', 'atexit', 'rand', 'srand',
+    # POSIX
+    'pthread_create', 'pthread_join', 'pthread_mutex_lock', 'pthread_mutex_unlock',
+    'pthread_mutex_init', 'pthread_mutex_destroy',
+    'sleep', 'usleep', 'nanosleep', 'getpid', 'getppid',
+    # 网络
+    'socket', 'bind', 'connect', 'listen', 'accept', 'send', 'recv',
+    'sendto', 'recvfrom', 'setsockopt', 'getsockopt', 'htons', 'ntohs', 'htonl', 'ntohl',
+    # 其他 C++ 内置
+    'operator', 'swap',
+})
+
+
 def _function_has_definition(target_dir: str, function_name: str) -> bool:
     """快速 grep 检查函数定义（非 extern 声明）是否存在于目标目录的源文件中。"""
     import subprocess
+    # 标准库函数直接返回 False（不在项目源码中定义）
+    if function_name in _STDLIB_SKIP:
+        return False
     try:
-        # 搜索 C 风格函数定义: "函数名(" 出现在行首附近
+        # 第一步：全词匹配函数名（-w），避免 ltc_memcpy 误匹配 memcpy
         result = subprocess.run(
-            ["grep", "-rl",
+            ["grep", "-rl", "-w",
              "--include=*.c", "--include=*.h",
              "--include=*.cpp", "--include=*.cc", "--include=*.cxx",
-             function_name + "(", target_dir],
+             function_name, target_dir],
             capture_output=True, text=True, timeout=5)
         if result.returncode != 0:
             return False
-        # 搜索 "type func_name(" 模式
+        # 第二步：搜索函数定义行（返回类型 + 空白 + 函数名(）
+        #   使用 -P 珀尔正则，要求函数名前有空格/指针符，排除纯调用行
         result2 = subprocess.run(
-            ["grep", "-rn",
+            ["grep", "-rn", "-P",
              "--include=*.c", "--include=*.cpp", "--include=*.cc", "--include=*.cxx",
-             "^[A-Za-z_].*" + function_name + "(", target_dir],
+             r"^[A-Za-z_][A-Za-z0-9_ *&:<>\[\]]*[\s*]" + re.escape(function_name) + r"\s*\(",
+             target_dir],
             capture_output=True, text=True, timeout=5)
         if result2.returncode != 0 or not result2.stdout.strip():
             return False
-        # 排除 extern 声明（extern int func(...); 不是定义）
+        # 第三步：排除 extern 声明
         lines = result2.stdout.strip().split("\n")
         for line in lines:
             # 提取 grep 输出中冒号后的代码部分

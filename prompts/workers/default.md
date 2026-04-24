@@ -15,6 +15,8 @@
 3. **如果搜索后确认找不到函数定义**(extern / 外部库):标记为 `🟡 EXPORT`,记录传入的脏数据参数
 4. **绝对禁止**:不搜索就直接标记为 `🟡 EXPORT`
 
+> ⚠️ **标准C/C++库函数禁止加入跟入列表**：`memcpy`、`memset`、`memmove`、`memcmp`、`malloc`、`free`、`strlen`、`strcpy`、`strcmp`、`printf`、`sprintf`、`snprintf`、`scanf`、`fopen`、`fclose` 等标准库函数不在项目源码中定义，直接标记为 `🟡 EXPORT`，不要放入跟入列表。
+
 ## 当前分析范围
 
 你只需分析**当前函数本身的代码**。不要试图在同一个分析中展开子函数--子函数会被系统自动递归调用新的分析流程。你的任务是:
