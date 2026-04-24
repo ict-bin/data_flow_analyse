@@ -622,6 +622,13 @@ class Orchestrator:
                         token_usage=wr.token_usage, error=wr.error,
                         df_issues=df_issues))
 
+                    # 结构性失败时清除 session：避免旧对话干扰下一轮
+                    if df_issues:
+                        try:
+                            Path(worker_sessions[i]).unlink(missing_ok=True)
+                        except OSError:
+                            pass
+
                     # 归档 worker 摘要输出
                     (rnd_workers_dir / f"{wid}-output.md").write_text(output, encoding="utf-8")
                     # 归档 dataflow 文件（如果存在）
@@ -747,9 +754,8 @@ class Orchestrator:
         (out_dir / "result.json").write_text(result.model_dump_json(indent=2), encoding="utf-8")
 
         if not archive:
-            # 子任务模式：不压缩/不清理/不写 result_dir，留给根任务统一处理
-            self._emit("task_end", task_id,
-                       status=result.status.value, function=cfg.function_name)
+            # 子任务模式：不压缩/不清理/不写 result_dir，由根任务统一处理
+            # 不发 task_end（避免 callee 分析前过早触发 CLI banner）
             self._cancel_event = None
             return result
 
@@ -1277,12 +1283,20 @@ class Orchestrator:
         if context:
             parts.append(f"# Additional Context\n\n{context}")
         if rnd > 1 and feedback:
-            parts.append(
-                f"# Feedback from Round {rnd - 1}\n\n"
-                f"Your previous work was evaluated. Here is the full feedback report:\n\n"
-                f"{feedback}\n\n"
-                f"Address ALL issues. Improve your output based on this feedback.")
-        parts.append("Wrap your final deliverable in <result>...</result> tags.")
+            # 结构性问题（F1/F2/F3）置顶，避免被长上下文忽视
+            is_structural = any(tag in feedback for tag in ("[F1]", "[F2]", "[F3]"))
+            if is_structural:
+                parts.insert(0,
+                    f"⚠️ 上一轮交付失败，必须首先修复以下问题（否则本轮仍会自动不通过）:\n\n"
+                    f"{feedback}\n\n"
+                    f"修复完成后再输出分析内容和 <result>。")
+            else:
+                parts.append(
+                    f"# 第 {rnd - 1} 轮反馈\n\n"
+                    f"上一轮工作已评审，请针对以下反馈改进：\n\n"
+                    f"{feedback}\n\n"
+                    f"确保全面解决所有问题。")
+        parts.append("用 <result>...</result> 包裹摘要信息。")
         return "\n\n".join(parts)
 
     def _build_eval_prompt(self, task, worker: WorkerResult, rnd,
