@@ -642,24 +642,6 @@ class Orchestrator:
                                 "[F3] dataflow 文件缺少函数调用跟入表格（## 需要跟入的函数调用）\n"
                                 "     此表格是系统递归分析子函数的关键依据，即使为空也必须保留表头"
                             )
-                        # 检查污点标记（F5）
-                        has_taint = any(m in df_content for m in [
-                            '🔴', 'TAINTED', '🟢', '🟡', '📌',
-                            '污点', '污染', '脏数据', 'taint', 'CLEAN', 'EXPORT', 'USED', 'DEFERRED',
-                        ])
-                        if not has_taint:
-                            df_issues.append(
-                                "[F5] dataflow 文件中没有污点标记（🔴/TAINTED/🟢/🟡）\n"
-                                "     Worker 未进行污点追踪，请按 '### INPUT-N: var 🔴 TAINTED / ├── [Lxx] code → result 🔴 TAINTED' 格式重写"
-                            )
-                        # 检查树状图（F6）
-                        has_tree = '├──' in df_content or '└──' in df_content
-                        if not has_tree:
-                            df_issues.append(
-                                "[F6] dataflow 文件中没有树状图结构（├── / └──）\n"
-                                "     请按 '├── [Lxx] `代码行` → result 🔴 TAINTED (原因)' 格式重写"
-                            )
-
                     self._emit("worker_done", task_id, worker_id=wid,
                                output=output[:500],
                                dataflow_found=bool(df_file) and not df_issues,
