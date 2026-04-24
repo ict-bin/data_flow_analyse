@@ -325,7 +325,7 @@ async def run_agent(
         tmp_dir = tempfile.mkdtemp(prefix="dfa-")
         tmp_file = os.path.join(tmp_dir, "system.md")
         Path(tmp_file).write_text(system_prompt, encoding="utf-8")
-        args.extend(["--system-prompt", tmp_file])
+        args.extend(["--append-system-prompt", tmp_file])
 
     # 注意：prompt 不再作为命令行参数传递，而是通过 stdin pipe 写入。
     # 这样可以避免文件内容嵌入 prompt 时超出 Linux ARG_MAX 限制。
