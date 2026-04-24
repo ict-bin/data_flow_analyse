@@ -534,7 +534,8 @@ class Orchestrator:
                 if self._cancel_event.is_set():
                     break
 
-                self._emit("round_start", task_id, round=rnd_num)
+                self._emit("round_start", task_id, round=rnd_num,
+                           function=cfg.function_name)
                 rnd_dir = out_dir / f"round-{rnd_num}"
                 rnd_workers_dir = rnd_dir / "workers"
                 rnd_judges_dir = rnd_dir / "judges"
@@ -552,7 +553,8 @@ class Orchestrator:
                 for i, acfg in enumerate(cfg.workers.agents):
                     wid = f"worker-{i}"
                     self._emit("worker_start", task_id, worker_id=wid,
-                               model=acfg.model, round=rnd_num)
+                               model=acfg.model, round=rnd_num,
+                               function=cfg.function_name)
                     w_tasks.append({
                         "prompt": worker_prompt,
                         "model": acfg.model,
@@ -589,7 +591,8 @@ class Orchestrator:
 
                     self._emit("worker_done", task_id, worker_id=wid,
                                output=output[:500],
-                               dataflow_found=bool(df_file))
+                               dataflow_found=bool(df_file),
+                               function=cfg.function_name)
                     round_workers.append(WorkerResult(
                         worker_id=wid, model=cfg.workers.agents[i].model,
                         output=output, dataflow_file=df_file or "",
@@ -608,7 +611,8 @@ class Orchestrator:
                 # Judge 之间并行，每个 Judge 内部串行（逐个评 Worker → 总结）
                 for j_idx, j_acfg in enumerate(cfg.judges.agents):
                     self._emit("judge_start", task_id, judge_id=f"judge-{j_idx}",
-                               model=j_acfg.model, round=rnd_num)
+                               model=j_acfg.model, round=rnd_num,
+                               function=cfg.function_name)
 
                 async def _run_one_judge(j_idx: int, j_acfg: AgentInstanceConfig) -> JudgeRoundResult:
                     return await self._run_judge_evaluation(
@@ -683,7 +687,8 @@ class Orchestrator:
 
                 self._emit("round_end", task_id, round=rnd_num,
                            passed=is_passed, pass_count=pass_count,
-                           total_judges=cfg.judge_count, best_worker=best_wid)
+                           total_judges=cfg.judge_count, best_worker=best_wid,
+                           function=cfg.function_name)
 
                 if is_passed and rnd_num >= cfg.min_rounds:
                     result.status = TaskStatus.PASSED
@@ -853,24 +858,38 @@ class Orchestrator:
                        function=cfg.function_name,
                        callees=[c.function_name for c in callees], depth=depth)
 
-        # ─── 步骤3：递归分析每个子函数 ───
+        # ─── 步骤3：并行递归分析所有子函数 ───
         sub_dataflow_files: list[tuple[str, str]] = []  # (func_name, dataflow_path)
 
+        # 预过滤： grep 预检 + 预注册（防止并行任务重复分析同一函数）
+        target_dir_abs = os.path.abspath(cfg.cwd)
+        valid_callees: list[CalleeRef] = []
         for callee in callees:
-            # 预检：grep 确认函数定义存在，不存在则跳过（避免浪费完整 Worker+Judge 流水线）
-            target_dir = os.path.abspath(cfg.cwd)
-            if not _function_has_definition(target_dir, callee.function_name):
+            c_key = (callee.file or cfg.source_file) + "::" + callee.function_name
+            if c_key in analyzed:
+                self._emit("trace_skip", result.task_id,
+                           function=callee.function_name, reason="already analyzed")
+                continue
+            if not _function_has_definition(target_dir_abs, callee.function_name):
                 self._emit("trace_skip", result.task_id,
                            function=callee.function_name,
                            reason="no definition found in source (grep pre-check)")
                 continue
+            analyzed.add(c_key)  # 预注册，防止并行分支重复触发
+            valid_callees.append(callee)
 
+        if valid_callees:
+            self._emit("trace_callees", result.task_id,
+                       function=cfg.function_name,
+                       callees=[c.function_name for c in valid_callees], depth=depth)
+
+        async def _analyze_callee(callee: CalleeRef) -> TaskResult:
+            """\u6784建子任务配置并递归分析（用于 asyncio.gather 并行）"""
             sub_file = callee.file or cfg.source_file
             sub_prompt = (
                 "分析文件 " + sub_file + " 中函数 " + callee.function_name + " 的数据流。"
                 + " 只追踪以下被污染的参数: " + (callee.tainted_params or "所有参数")
             )
-
             sub_cfg = cfg.model_copy(deep=True)
             sub_cfg.task = sub_prompt
             sub_cfg.function_name = callee.function_name
@@ -879,31 +898,29 @@ class Orchestrator:
             if "# 调用者传入的脏数据" in ctx_base:
                 ctx_base = ctx_base.split("# 调用者传入的脏数据")[0].strip()
             sub_cfg.context = ctx_base
-
             tainted_ctx = ("函数 " + callee.function_name + " 被 " + cfg.function_name
                            + " 在 " + callee.line + " 调用。\n"
                            + "污染参数: " + callee.tainted_params + "\n"
                            + "说明: " + callee.description)
-
             sub_orch = Orchestrator(config=sub_cfg, on_event=self.on_event)
             sub_id = result.task_id + "-d" + str(depth + 1) + "-" + callee.function_name[:30]
-
-            sub_result = await sub_orch.execute_recursive(
+            return await sub_orch.execute_recursive(
                 task_id=sub_id, depth=depth + 1,
                 tainted_context=tainted_ctx, _analyzed=analyzed,
                 _root_out_dir=root_out_dir)
 
+        # 并行执行所有子函数分析
+        sub_results = await asyncio.gather(*[_analyze_callee(c) for c in valid_callees])
+
+        # 收集并行结果
+        for sub_result, callee in zip(sub_results, valid_callees):
             result.total_tokens += sub_result.total_tokens
             result.total_duration_ms += sub_result.total_duration_ms
-
-            # 收集子函数 dataflow 路径
-            if sub_result.final_output:
-                # 将子函数输出写入根工作目录
-                if root_out_dir:
-                    safe_name = re.sub(r'[^A-Za-z0-9_-]', '_', callee.function_name)
-                    sub_df_path = root_out_dir / ("dataflow-" + safe_name + ".md")
-                    sub_df_path.write_text(sub_result.final_output, encoding="utf-8")
-                    sub_dataflow_files.append((callee.function_name, str(sub_df_path)))
+            if sub_result.final_output and root_out_dir:
+                safe_name = re.sub(r'[^A-Za-z0-9_-]', '_', callee.function_name)
+                sub_df_path = root_out_dir / ("dataflow-" + safe_name + ".md")
+                sub_df_path.write_text(sub_result.final_output, encoding="utf-8")
+                sub_dataflow_files.append((callee.function_name, str(sub_df_path)))
 
         # ─── 步骤4：根层合并 + 归档 ───
         if is_root:
@@ -1123,20 +1140,16 @@ class Orchestrator:
                     "# ⚠️ Worker did not produce a dataflow file",
                     encoding="utf-8")
 
-        # ═══ 步骤1：逐个评判（每个 Worker 独立上下文）═══════════
+        # ═══ 步骤1：并行评判所有 Worker（每个 Worker 独立上下文）═════════
 
-        for w in round_workers:
+        async def _eval_one_worker(w: WorkerResult) -> tuple[WorkerEvaluation, object]:
             eval_prompt = self._build_eval_prompt(
                 cfg.task, w, rnd_num,
                 output_path=f"{w.worker_id}-output.md",
                 dataflow_path=f"{w.worker_id}-dataflow.md",
             )
-
-            # 独立上下文：session_file=None → --no-session
             ar = await run_agent(
                 prompt=eval_prompt, **base_kwargs, session_file=None)
-            j_result.token_usage += ar.token_usage
-
             parsed = _parse_eval_md(ar.output)
             ev = WorkerEvaluation(
                 worker_id=w.worker_id,
@@ -1145,11 +1158,8 @@ class Orchestrator:
                 feedback=parsed["feedback"],
                 refinement=parsed["refinement"],
             )
-            j_result.evaluations.append(ev)
-
-            # 归档 eval 结果
             (j_dir / f"eval-{w.worker_id}.md").write_text(
-                f"# {jid} → {w.worker_id} (Round {rnd_num})\n\n"
+                f"# {jid} \u2192 {w.worker_id} (Round {rnd_num})\n\n"
                 f"- **Model**: {judge_cfg.model}\n"
                 f"- **Pass**: {ev.passed}\n"
                 f"- **Score**: {ev.score}\n\n"
@@ -1157,6 +1167,12 @@ class Orchestrator:
                 f"## Refinement\n\n{ev.refinement}\n",
                 encoding="utf-8",
             )
+            return ev, ar.token_usage
+
+        eval_pairs = await asyncio.gather(*[_eval_one_worker(w) for w in round_workers])
+        for ev, tokens in eval_pairs:
+            j_result.evaluations.append(ev)
+            j_result.token_usage += tokens
 
         # ═══ 步骤2：综合对比（新上下文，读取 eval 文件）═══════════
 

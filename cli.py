@@ -39,9 +39,12 @@ class CliRenderer:
         self._t0 = time.time()
         self._in_round = False
         # 流式输出状态
-        self._stream_chars = 0          # 流式内容共收到字符数（每 N 字符打一个点）
-        self._stream_dots = 0           # 已打出点数
-        self._worker_active = False     # Worker 是否正在运行
+        self._stream_chars = 0
+        self._stream_dots = 0
+        self._worker_active = False
+        # 并行任务跟踪： task_id → (depth, func_name)
+        self._task_depth: dict[str, int] = {}
+        self._task_func: dict[str, str] = {}
 
     def __call__(self, event: SwarmEvent):
         if self.quiet:
@@ -74,6 +77,8 @@ class CliRenderer:
             depth = d.get("depth", 0)
             func = d.get("function", "?")
             self._depth = depth
+            self._task_depth[event.task_id] = depth
+            self._task_func[event.task_id] = func
             self._func_count += 1
             if depth == 0:
                 self._root_id = event.task_id
@@ -94,17 +99,19 @@ class CliRenderer:
             self._in_round = True
             self._stream_chars = 0
             self._stream_dots = 0
-            prefix = self._cont()
-            print(f"{prefix}R{rnd}:", flush=True)
+            _depth = self._task_depth.get(event.task_id, self._depth)
+            _func  = d.get("function", self._task_func.get(event.task_id, "?"))
+            prefix = self._cont(_depth)
 
         elif t == "worker_start":
             self._worker_active = True
             self._stream_chars = 0
             self._stream_dots = 0
-            prefix = self._cont()
-            wid = d.get('worker_id', 'worker-0')
+            _depth = self._task_depth.get(event.task_id, self._depth)
+            _func  = d.get("function", self._task_func.get(event.task_id, "?"))
+            prefix = self._cont(_depth)
             elapsed = f"{time.time() - self._round_t0:.0f}s"
-            print(f"{prefix}  [W] 分析中 ", end="", flush=True)
+            print(f"{prefix}  [{_func}] W ", end="", flush=True)
 
         elif t == "worker_stream":
             # 每 300 字符打一个点，表示进度
@@ -123,10 +130,11 @@ class CliRenderer:
             print(f" W[{df}] ({elapsed})", flush=True)
 
         elif t == "judge_start":
-            prefix = self._cont()
-            jid = d.get('judge_id', 'judge-0')
+            _depth = self._task_depth.get(event.task_id, self._depth)
+            _func  = d.get("function", self._task_func.get(event.task_id, "?"))
+            prefix = self._cont(_depth)
             elapsed = f"{time.time() - self._round_t0:.0f}s"
-            print(f"{prefix}  [J] 评审中 ", end="", flush=True)
+            print(f"{prefix}  [{_func}] J ", end="", flush=True)
             self._stream_chars = 0
             self._stream_dots = 0
 
@@ -142,8 +150,9 @@ class CliRenderer:
             tc = d.get("total_judges", 1)
             scores = "/".join(str(e["score"]) for e in self._round_evals)
             icon = "✅" if passed else "❌"
-            prefix = self._cont()
-            print(f" J[{scores}] {icon}")
+            _depth = self._task_depth.get(event.task_id, self._depth)
+            _func  = d.get("function", self._task_func.get(event.task_id, "?"))
+            prefix = self._cont(_depth)
             print(f"{prefix}  → {icon} {pc}/{tc} ({elapsed:.0f}s)")
             self._in_round = False
 
