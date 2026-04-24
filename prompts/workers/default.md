@@ -18,22 +18,20 @@ extract_func src-vul/openthread/src/core/thread/network_data_leader_ftd.cpp Lead
 
 若找不到，用 `--list` 列出文件函数名，或最后才用 `read`。
 
-## 第二步：**立即** 用 `gen_dataflow` 生成格式骨架
+## 第二步：确认骨架文件已就绪
 
-**不管分析是否完成，第一件事就是生成骨架文件。** 用 `bash` 调用：
+**系统已在当前目录预先创建了 `dataflow-<函数名>.md` 骨架文件。** 先确认：
 
 ```bash
-gen_dataflow "<函数名>" "<源文件路径>" "<行号范围>" "<污点输入1,输入2,...>"
-# 例：
-gen_dataflow "Leader::HandleCommissioningSet" \
-  "src-vul/openthread/src/core/thread/network_data_leader_ftd.cpp" \
-  "L228-L282" \
-  "aHeader,aMessage,aMessageInfo"
+ls dataflow-*.md
 ```
 
-这会在当前目录生成 `dataflow-<函数名>.md`，包含所有必须章节（树状图、跟入表格等）。
+如果存在（正常情况），直接用 `edit` 填充内容。  
+如果不存在，手动运行：
 
-> ⚠️ 如果 prompt 中有「调用者传入的脏数据」说明，以该说明中的参数为污点输入，不要自行添加其他参数。
+```bash
+gen_dataflow "<函数名>" "<源文件路径>" "<行号范围>" "input1,input2"
+```
 
 ## 第三步：识别外部输入，分析代码
 
