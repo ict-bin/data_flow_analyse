@@ -52,6 +52,7 @@ def build_task_config(svc: ServiceConfig, prompt: str, cwd: str = None) -> TaskC
         pi_max_retries=svc.pi_max_retries,
         pi_retry_delay=svc.pi_retry_delay,
         max_trace_depth=svc.max_trace_depth,
+        callee_concurrency=svc.callee_concurrency,
         workers=svc.workers.model_copy(deep=True),
         judges=svc.judges.model_copy(deep=True),
         output_dir=svc.output_dir,

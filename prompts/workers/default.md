@@ -30,8 +30,23 @@
 
 ## 第一步:定位目标函数
 
-1. 根据输入的文件路径和函数名,使用 `read` 工具阅读目标文件
-2. 定位到指定函数,记录函数签名、所在文件、起始位置
+1. 优先使用 `extract_func` 工具直接提取目标函数（避免读取整个文件）:
+
+   ```bash
+   extract_func <文件路径> <函数名>
+   # 示例:
+   extract_func src-vul/openthread/src/core/thread/network_data_leader_ftd.cpp Leader::HandleCommissioningSet
+   extract_func src-vul/foo.c process_packet
+   ```
+
+2. 如果 `extract_func` 未找到目标函数，尝试 `--list` 列出文件中所有函数名:
+
+   ```bash
+   extract_func <文件路径> --list
+   ```
+
+3. 最后才用 `read` 工具读取文件（只在 extract_func 完全失败时）
+4. 记录函数签名、所在文件、起始位置
 
 ## 第二步:识别外部输入数据
 

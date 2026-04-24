@@ -8,8 +8,12 @@ COPY app/               ./app/
 COPY cli.py main.py     ./
 COPY prompts/           ./prompts/
 COPY scripts/           ./scripts/
+COPY tools/             ./tools/
 COPY config.example.json .env.example ./
 RUN chmod +x scripts/*.sh 2>/dev/null || true
+# 安装 extract_func 工具：提取指定函数代码，避免读整个文件
+RUN cp tools/extract_func.py /usr/local/bin/extract_func \
+    && chmod +x /usr/local/bin/extract_func
 
 # ═══ pi 配置目录 ══════════════════════════════════════════════════════════════
 # pi 的全局配置目录，models.json 放这里才能被 pi 识别

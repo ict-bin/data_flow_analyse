@@ -7,6 +7,7 @@
     "pi_max_retries": -1,
     "pi_retry_delay": 10,
     "max_trace_depth": 5,
+    "callee_concurrency": -1,
 
     "workers": {
         "default_tools": ["read", "bash", "edit", "write", "find"],

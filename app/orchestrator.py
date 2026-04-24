@@ -909,8 +909,18 @@ class Orchestrator:
                 tainted_context=tainted_ctx, _analyzed=analyzed,
                 _root_out_dir=root_out_dir)
 
-        # 并行执行所有子函数分析
-        sub_results = await asyncio.gather(*[_analyze_callee(c) for c in valid_callees])
+        # 并行执行，支持并行数限制
+        _concur = cfg.callee_concurrency
+        if _concur == -1 or _concur >= len(valid_callees):
+            # 不限制并行数
+            sub_results = await asyncio.gather(*[_analyze_callee(c) for c in valid_callees])
+        else:
+            # Semaphore 限制最大并行数为 _concur
+            _sem = asyncio.Semaphore(max(1, _concur))
+            async def _analyze_with_sem(callee: CalleeRef) -> TaskResult:
+                async with _sem:
+                    return await _analyze_callee(callee)
+            sub_results = await asyncio.gather(*[_analyze_with_sem(c) for c in valid_callees])
 
         # 收集并行结果
         for sub_result, callee in zip(sub_results, valid_callees):
