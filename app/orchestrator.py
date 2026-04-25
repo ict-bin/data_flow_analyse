@@ -1115,6 +1115,17 @@ class Orchestrator:
         result.final_output = cleaned_output
 
         # 压缩全部（包含所有子任务工作目录）
+        # 将属于根任务的子任务目录移入 subtasks/ 子目录
+        subtasks_dir = root_out_dir / "subtasks"
+        output_parent = root_out_dir.parent
+        root_prefix = root_out_dir.name + "-"
+        for sibling in sorted(output_parent.iterdir()):
+            if sibling.is_dir() and sibling.name.startswith(root_prefix):
+                try:
+                    subtasks_dir.mkdir(exist_ok=True)
+                    shutil.move(str(sibling), str(subtasks_dir / sibling.name))
+                except OSError:
+                    pass
         archive_dir = Path(os.path.abspath(cfg.archive_dir))
         archive_dir.mkdir(parents=True, exist_ok=True)
         zip_name = self._make_result_filename(cfg, "zip", suffix="_log")
