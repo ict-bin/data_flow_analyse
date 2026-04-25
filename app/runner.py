@@ -317,15 +317,23 @@ async def run_agent(
     if thinking_level and thinking_level != "off":
         args.extend(["--thinking", thinking_level])
 
-    # ── System Prompt → 临时文件 ──────────────────────────────
-    tmp_dir: str | None = None
-    tmp_file: str | None = None
+
+    # ── System Prompt → workspace 目录（避免 tmp 被删除导致 pi 读取失败）────────────
+    # pi 的 resolvePromptInput 在 session reload 时才调用，若文件已删则当作文本直接用
+    sys_prompt_file: str | None = None
 
     if system_prompt.strip():
-        tmp_dir = tempfile.mkdtemp(prefix="dfa-")
-        tmp_file = os.path.join(tmp_dir, "system.md")
-        Path(tmp_file).write_text(system_prompt, encoding="utf-8")
-        args.extend(["--system-prompt", tmp_file])
+        _sp_path = Path(os.path.abspath(cwd)) / ".system_prompt.md"
+        try:
+            _sp_path.write_text(system_prompt, encoding="utf-8")
+            sys_prompt_file = str(_sp_path)
+        except OSError:
+            import tempfile as _tf_mod
+            _td = _tf_mod.mkdtemp(prefix="dfa-")
+            _sp_path = Path(_td) / "system.md"
+            _sp_path.write_text(system_prompt, encoding="utf-8")
+            sys_prompt_file = str(_sp_path)
+        args.extend(["--system-prompt", sys_prompt_file])
 
     # 注意：prompt 不再作为命令行参数传递，而是通过 stdin pipe 写入。
     # 这样可以避免文件内容嵌入 prompt 时超出 Linux ARG_MAX 限制。
@@ -539,16 +547,7 @@ async def run_agent(
         return result
 
     finally:
-        if tmp_file and os.path.exists(tmp_file):
-            try:
-                os.unlink(tmp_file)
-            except OSError:
-                pass
-        if tmp_dir and os.path.exists(tmp_dir):
-            try:
-                os.rmdir(tmp_dir)
-            except OSError:
-                pass
+        pass  # .system_prompt.md 随 workspace 清理
 
 
 def _process_line(
