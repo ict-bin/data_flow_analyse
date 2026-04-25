@@ -546,7 +546,7 @@ class Orchestrator:
         except Exception:
             pass
 
-    async def execute(self, task_id: str | None = None, *, archive: bool = True) -> TaskResult:
+    async def execute(self, task_id: str | None = None, *, archive: bool = True, depth: int = 0, max_depth: int = 0) -> TaskResult:
         cfg = self.cfg
         task_id = task_id or make_id()
         start = time.time()
@@ -594,7 +594,17 @@ class Orchestrator:
 
         agents_desc = ([f"worker-{i}={a.model}" for i, a in enumerate(cfg.workers.agents)]
                        + [f"judge-{i}={a.model}" for i, a in enumerate(cfg.judges.agents)])
-        self._emit("task_start", task_id, task=cfg.task, agents=agents_desc)
+        self._emit("task_start", task_id, task=cfg.task, agents=agents_desc,
+                   function=cfg.function_name, depth=depth)
+
+        # 将 depth/max_depth 注入 context，Worker 据此决定是否需要追踪 callee
+        # max_depth=0 时不注入（外部调用者未指定深度）
+        if max_depth > 0:
+            _depth_note = f"\n\n# 当前追踪深度: {depth}/{max_depth}" + (
+                "（已达最大深度，callee 表格仍需填写但系统不会递归）"
+                if depth >= max_depth else ""
+            )
+            cfg.context = (cfg.context or "").rstrip() + _depth_note
 
         try:
             feedback_for_workers = ""
@@ -604,7 +614,7 @@ class Orchestrator:
                     break
 
                 self._emit("round_start", task_id, round=rnd_num,
-                           function=cfg.function_name)
+                           function=cfg.function_name, depth=depth)
                 rnd_dir = out_dir / f"round-{rnd_num}"
                 rnd_workers_dir = rnd_dir / "workers"
                 rnd_judges_dir = rnd_dir / "judges"
@@ -907,8 +917,7 @@ class Orchestrator:
 
         # ── 非根任务：直接执行 W+J 并返回，由根任务的工作池调度 ──────────────
         if not is_root:
-            result = await self.execute(task_id, archive=False)
-            # 读取 dataflow 文件内容更新 final_output（供 callee 解析）
+            result = await self.execute(task_id, archive=False, depth=depth, max_depth=cfg.max_trace_depth)
             out_dir = Path(os.path.abspath(cfg.output_dir)) / (task_id or result.task_id)
             df_path = _find_dataflow_file(out_dir, cfg.function_name)
             if df_path:
@@ -958,16 +967,15 @@ class Orchestrator:
         async def process_item(item: tuple) -> None:
             func_name, src_file, task_cfg, tid, dep, taint_ctx = item
 
-            # 注入 tainted_context
+            # 注入 tainted_context（深度信息由 execute() 内部统一注入 context）
             if taint_ctx and dep > 0:
                 ctx_base = task_cfg.context or ""
                 if "# 调用者传入的脏数据" in ctx_base:
                     ctx_base = ctx_base.split("# 调用者传入的脏数据")[0].strip()
-                task_cfg.context = (ctx_base + "\n\n# 调用者传入的脏数据\n" + taint_ctx
-                                    + "\n\n# 追踪深度: " + str(dep) + "/" + str(max_depth))
+                task_cfg.context = ctx_base + "\n\n# 调用者传入的脏数据\n" + taint_ctx
 
             sub_orch = Orchestrator(config=task_cfg, on_event=self.on_event)
-            result = await sub_orch.execute(tid, archive=False)
+            result = await sub_orch.execute(tid, archive=False, depth=dep, max_depth=max_depth)
 
             # 读取 dataflow 文件
             out_dir = Path(os.path.abspath(task_cfg.output_dir)) / tid
