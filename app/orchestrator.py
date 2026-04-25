@@ -897,187 +897,196 @@ class Orchestrator:
         tainted_context: str = "",
         _analyzed: set[str] | None = None,
         _root_out_dir: Path | None = None,
-        _global_sem: asyncio.Semaphore | None = None,
     ) -> TaskResult:
-        """递归分析：当前函数 Worker+Judge → 解析子函数 → 递归 → merge。"""
+        """BFS 队列 + 工作池架构：
+        A 进入队列 → Worker 执行 W+J 分析 → 解析 callee B,C,D → 加入队列 → Worker 执行 B,C,D...
+        并发数 = callee_concurrency（worker 数量），无 Semaphore 死锁问题。
+        """
         cfg = self.cfg
-        max_depth = cfg.max_trace_depth
         is_root = (depth == 0)
-        analyzed = _analyzed if _analyzed is not None else set()
 
-        # 根任务入口：立即写 flag=0（任何崩溃/中断都保证有 flag 文件）
-        if is_root:
-            flag_dir = Path(os.path.abspath(cfg.result_dir))
-            flag_dir.mkdir(parents=True, exist_ok=True)
-            (flag_dir / "flag").write_text("0", encoding="utf-8")
-
-        # 防止重复分析
-        func_key = cfg.source_file + "::" + cfg.function_name
-        if func_key in analyzed:
-            self._emit("trace_skip", task_id or "",
-                       function=cfg.function_name, reason="already analyzed")
-            skip_out = "# " + cfg.function_name + "\n\n(已在其他分支中分析，跳过)"
-            return TaskResult(
-                task_id=task_id or make_id(), status=TaskStatus.PASSED,
-                task=cfg.task, final_output=skip_out)
-        analyzed.add(func_key)
-
-        # 注入深度和污染上下文
-        if depth > 0:
-            depth_note = "\n\n# 追踪深度: " + str(depth) + "/" + str(max_depth)
-        else:
-            depth_note = ""
-        if tainted_context:
-            cfg.context = (cfg.context or "") + "\n\n# 调用者传入的脏数据\n" + tainted_context + depth_note
-        elif depth_note:
-            cfg.context = (cfg.context or "") + depth_note
-
-        # 子任务的 output_dir 放在根任务目录下
-        if _root_out_dir and not is_root:
-            sub_dir_name = "depth" + str(depth) + "-" + cfg.function_name[:40]
-            cfg.output_dir = str(_root_out_dir / sub_dir_name)
-
-        self._emit("trace_start", task_id or "",
-                   function=cfg.function_name, depth=depth, max_depth=max_depth)
-
-        # ─── 步骤1：当前函数的 Worker+Judge 分析（子任务不归档）───
-        result = await self.execute(task_id, archive=is_root and max_depth == 0)
-
-        # 确定根任务工作目录
-        root_out_dir = _root_out_dir
-        if is_root and root_out_dir is None:
-            root_out_dir = Path(os.path.abspath(cfg.output_dir)) / result.task_id
-
-        # ─── 步骤2：解析子函数列表 ───
-        if depth >= max_depth:
-            self._emit("trace_depth_limit", result.task_id,
-                       function=cfg.function_name, depth=depth)
-            if is_root:
-                self._do_final_archive(result, root_out_dir)
+        # ── 非根任务：直接执行 W+J 并返回，由根任务的工作池调度 ──────────────
+        if not is_root:
+            result = await self.execute(task_id, archive=False)
+            # 读取 dataflow 文件内容更新 final_output（供 callee 解析）
+            out_dir = Path(os.path.abspath(cfg.output_dir)) / (task_id or result.task_id)
+            df_path = _find_dataflow_file(out_dir, cfg.function_name)
+            if df_path:
+                try:
+                    df_text = Path(df_path).read_text(encoding="utf-8")
+                    if len(df_text.strip()) > len((result.final_output or "").strip()):
+                        result.final_output = df_text
+                except OSError:
+                    pass
             return result
 
-        # callee 解析：从 dataflow 文件（Worker 应该用 write 工具将分析内容写入这里）
-        callees = _parse_callees(result.final_output)
+        # ── 根任务：BFS 队列 + 工作池 ────────────────────────────────────────
+        max_depth = cfg.max_trace_depth
+        n_workers = max(1, cfg.callee_concurrency) if cfg.callee_concurrency > 0 else 4
+        analyzed: set[str] = _analyzed if _analyzed is not None else set()
         MAX_CALLEES_PER_LEVEL = 10
-        filtered: list[CalleeRef] = []
-        for c in callees:
-            c_key = (c.file or cfg.source_file) + "::" + c.function_name
-            if c.function_name == cfg.function_name:
-                continue
-            if c_key in analyzed:
-                continue
-            filtered.append(c)
-        callees = filtered[:MAX_CALLEES_PER_LEVEL]
 
-        if callees:
-            self._emit("trace_callees", result.task_id,
-                       function=cfg.function_name,
-                       callees=[c.function_name for c in callees], depth=depth)
+        # 初始化根目录
+        root_task_id = task_id or make_id()
+        root_out_dir = _root_out_dir
+        if root_out_dir is None:
+            root_out_dir = Path(os.path.abspath(cfg.output_dir)) / root_task_id
+        root_out_dir.mkdir(parents=True, exist_ok=True)
 
-        # ─── 步骤3：并行递归分析所有子函数 ───
-        sub_dataflow_files: list[tuple[str, str]] = []  # (func_name, dataflow_path)
+        # flag=0
+        flag_dir = Path(os.path.abspath(cfg.result_dir))
+        flag_dir.mkdir(parents=True, exist_ok=True)
+        (flag_dir / "flag").write_text("0", encoding="utf-8")
 
-        # 预过滤： grep 预检（不预注册——子任务在自己的 execute_recursive 开头注册）
-        target_dir_abs = os.path.abspath(cfg.cwd)
-        valid_callees: list[CalleeRef] = []
-        for callee in callees:
-            c_key = (callee.file or cfg.source_file) + "::" + callee.function_name
-            if c_key in analyzed:
-                self._emit("trace_skip", result.task_id,
-                           function=callee.function_name, reason="already analyzed")
-                continue
-            if not _function_has_definition(target_dir_abs, callee.function_name):
-                self._emit("trace_skip", result.task_id,
-                           function=callee.function_name,
-                           reason="no definition found in source (grep pre-check)")
-                continue
-            # 不预注册：asyncio 单线程，子任务在第一个 await 前自己注册，天然 dedup
-            valid_callees.append(callee)
+        queue: asyncio.Queue = asyncio.Queue()
+        all_results: dict[str, TaskResult] = {}   # func_key -> TaskResult
+        sub_dataflow_files: list[tuple[str, str]] = []
 
-        if valid_callees:
-            self._emit("trace_callees", result.task_id,
-                       function=cfg.function_name,
-                       callees=[c.function_name for c in valid_callees], depth=depth)
+        # 注册根函数
+        root_key = cfg.source_file + "::" + cfg.function_name
+        analyzed.add(root_key)
 
-        async def _analyze_callee(callee: CalleeRef) -> TaskResult:
-            """\u6784建子任务配置并递归分析（用于 asyncio.gather 并行）"""
-            sub_file = callee.file or cfg.source_file
-            sub_prompt = (
-                "分析文件 " + sub_file + " 中函数 " + callee.function_name + " 的数据流。"
-                + " 只追踪以下被污染的参数: " + (callee.tainted_params or "所有参数")
-            )
-            sub_cfg = cfg.model_copy(deep=True)
-            sub_cfg.task = sub_prompt
-            sub_cfg.function_name = callee.function_name
-            sub_cfg.source_file = sub_file
-            ctx_base = cfg.context or ""
-            if "# 调用者传入的脏数据" in ctx_base:
-                ctx_base = ctx_base.split("# 调用者传入的脏数据")[0].strip()
-            sub_cfg.context = ctx_base
-            tainted_ctx = ("函数 " + callee.function_name + " 被 " + cfg.function_name
-                           + " 在 " + callee.line + " 调用。\n"
-                           + "污染参数: " + callee.tainted_params + "\n"
-                           + "说明: " + callee.description)
-            sub_orch = Orchestrator(config=sub_cfg, on_event=self.on_event)
-            sub_id = result.task_id + "-d" + str(depth + 1) + "-" + callee.function_name[:30]
-            return await sub_orch.execute_recursive(
-                task_id=sub_id, depth=depth + 1,
-                tainted_context=tainted_ctx, _analyzed=analyzed,
-                _root_out_dir=root_out_dir,
-                _global_sem=_global_sem)
+        self._emit("task_start", root_task_id, task=cfg.task,
+                   agents=f"W={cfg.worker_count} J={cfg.judge_count}")
+        self._emit("trace_start", root_task_id,
+                   function=cfg.function_name, depth=0, max_depth=max_depth)
 
-        # 并行执行：全局 Semaphore 跨所有递归层共享，防止指数级并发爆炸
-        # 根调用时创建，子调用时透传
-        _concur = cfg.callee_concurrency
-        if _global_sem is None and _concur > 0:
-            _global_sem = asyncio.Semaphore(_concur)
+        # 根任务入队
+        await queue.put((cfg.function_name, cfg.source_file,
+                         cfg.model_copy(deep=True), root_task_id, 0, tainted_context))
 
-        if _global_sem is None:
-            # 无限制
-            sub_results = await asyncio.gather(*[_analyze_callee(c) for c in valid_callees])
-        else:
-            async def _analyze_with_sem(callee: CalleeRef) -> TaskResult:
-                async with _global_sem:
-                    return await _analyze_callee(callee)
-            sub_results = await asyncio.gather(*[_analyze_with_sem(c) for c in valid_callees])
+        async def process_item(item: tuple) -> None:
+            func_name, src_file, task_cfg, tid, dep, taint_ctx = item
 
-        # 收集并行结果
-        for sub_result, callee in zip(sub_results, valid_callees):
-            result.total_tokens += sub_result.total_tokens
-            result.total_duration_ms += sub_result.total_duration_ms
-            if sub_result.final_output and root_out_dir:
-                safe_name = re.sub(r'[^A-Za-z0-9_-]', '_', callee.function_name)
-                sub_df_path = root_out_dir / ("dataflow-" + safe_name + ".md")
-                sub_df_path.write_text(sub_result.final_output, encoding="utf-8")
-                sub_dataflow_files.append((callee.function_name, str(sub_df_path)))
+            # 注入 tainted_context
+            if taint_ctx and dep > 0:
+                ctx_base = task_cfg.context or ""
+                if "# 调用者传入的脏数据" in ctx_base:
+                    ctx_base = ctx_base.split("# 调用者传入的脏数据")[0].strip()
+                task_cfg.context = (ctx_base + "\n\n# 调用者传入的脏数据\n" + taint_ctx
+                                    + "\n\n# 追踪深度: " + str(dep) + "/" + str(max_depth))
 
-        # ─── 步骤4：根层合并 + 归档 ───
-        if is_root:
-            # 保存根函数 dataflow
-            if root_out_dir and result.final_output:
-                root_df_path = root_out_dir / ("dataflow-" + cfg.function_name + ".md")
-                root_df_path.write_text(result.final_output, encoding="utf-8")
+            sub_orch = Orchestrator(config=task_cfg, on_event=self.on_event)
+            result = await sub_orch.execute(tid, archive=False)
 
-            # 扫描 root_out_dir 下所有 dataflow-*.md（包含所有深度的子函数）
-            all_dataflow_files: list[tuple[str, str]] = []
-            if root_out_dir:
-                for df_path in sorted(root_out_dir.glob("dataflow-*.md")):
-                    fname = df_path.stem.replace("dataflow-", "")
-                    all_dataflow_files.append((fname, str(df_path)))
+            # 读取 dataflow 文件
+            out_dir = Path(os.path.abspath(task_cfg.output_dir)) / tid
+            df_path = _find_dataflow_file(out_dir, func_name)
+            if df_path:
+                try:
+                    df_text = Path(df_path).read_text(encoding="utf-8")
+                    if len(df_text.strip()) > len((result.final_output or "").strip()):
+                        result.final_output = df_text
+                except OSError:
+                    pass
 
-            # 运行 merge agent
-            if all_dataflow_files and root_out_dir:
+            func_key = src_file + "::" + func_name
+            all_results[func_key] = result
+
+            # 保存 dataflow 文件到根目录
+            if result.final_output and root_out_dir:
+                safe_name = re.sub(r'[^A-Za-z0-9_:.-]', '_', func_name)
+                df_dest = root_out_dir / f"dataflow-{safe_name}.md"
+                try:
+                    df_dest.write_text(result.final_output, encoding="utf-8")
+                    sub_dataflow_files.append((func_name, str(df_dest)))
+                except OSError:
+                    pass
+
+            # 解析 callee 并加入队列
+            if dep < max_depth and result.final_output:
+                callees = _parse_callees(result.final_output)
+                target_dir = os.path.abspath(task_cfg.cwd)
+                valid: list[CalleeRef] = []
+                for callee in callees:
+                    c_key = (callee.file or src_file) + "::" + callee.function_name
+                    if callee.function_name == func_name:
+                        continue
+                    if c_key in analyzed:
+                        self._emit("trace_skip", tid, function=callee.function_name,
+                                   reason="already analyzed")
+                        continue
+                    if callee.function_name in _STDLIB_SKIP:
+                        continue
+                    if not _function_has_definition(target_dir, callee.function_name):
+                        self._emit("trace_skip", tid, function=callee.function_name,
+                                   reason="no definition found")
+                        continue
+                    analyzed.add(c_key)
+                    valid.append(callee)
+
+                if valid:
+                    self._emit("trace_callees", tid, function=func_name,
+                               callees=[c.function_name for c in valid], depth=dep)
+
+                for callee in valid[:MAX_CALLEES_PER_LEVEL]:
+                    sub_file = callee.file or src_file
+                    sub_cfg = task_cfg.model_copy(deep=True)
+                    sub_cfg.function_name = callee.function_name
+                    sub_cfg.source_file = sub_file
+                    sub_cfg.task = (
+                        f"对 {sub_file} 的 {callee.function_name} 函数进行静态污点分析，"
+                        f"外部输入参数（已污染）为：{callee.tainted_params or '所有参数'}"
+                    )
+                    ctx_base = task_cfg.context or ""
+                    if "# 调用者传入的脏数据" in ctx_base:
+                        ctx_base = ctx_base.split("# 调用者传入的脏数据")[0].strip()
+                    sub_cfg.context = ctx_base
+                    tainted_ctx_str = (
+                        f"函数 {callee.function_name} 被 {func_name} 在 {callee.line} 调用。\n"
+                        f"污染参数: {callee.tainted_params}\n说明: {callee.description}"
+                    )
+                    sub_tid = tid + f"-d{dep + 1}-{callee.function_name[:25]}"
+                    await queue.put((callee.function_name, sub_file, sub_cfg,
+                                     sub_tid, dep + 1, tainted_ctx_str))
+
+        async def worker(wid: int) -> None:
+            while True:
+                item = await queue.get()
+                if item is None:      # sentinel → 退出
+                    queue.task_done()
+                    break
+                try:
+                    await process_item(item)
+                except Exception as e:
+                    tid = item[3] if len(item) > 3 else "?"
+                    self._emit("error", tid, error=str(e))
+                finally:
+                    queue.task_done()
+
+        # 启动工作池（n_workers 个并发 Worker+Judge 会话）
+        workers = [asyncio.create_task(worker(i)) for i in range(n_workers)]
+
+        # 等待所有任务处理完毕
+        await queue.join()
+
+        # 发送终止 sentinel
+        for _ in range(n_workers):
+            await queue.put(None)
+        await asyncio.gather(*workers)
+
+        # ── 根函数结果 ────────────────────────────────────────────────────────
+        root_result = all_results.get(root_key)
+        if root_result is None:
+            root_result = TaskResult(task_id=root_task_id, status=TaskStatus.ERROR,
+                                     error="root function analysis failed")
+
+        # ── merge agent ───────────────────────────────────────────────────────
+        if sub_dataflow_files:
+            try:
                 merged = await self._run_merge_agent(
                     root_function=cfg.function_name,
-                    dataflow_files=all_dataflow_files,
+                    dataflow_files=sub_dataflow_files,
                     cwd=str(root_out_dir),
-                    result=result)
+                    result=root_result)
                 if merged:
-                    result.final_output = merged
+                    root_result.final_output = merged
+            except Exception as e:
+                self._emit("error", root_task_id, error=f"merge failed: {e}")
 
-            self._do_final_archive(result, root_out_dir)
-
-        return result
+        # ── 最终归档 ──────────────────────────────────────────────────────────
+        self._do_final_archive(root_result, root_out_dir)
+        return root_result
 
     def _do_final_archive(self, result: TaskResult, root_out_dir: Path | None):
         """统一归档：写报告 + 压缩 + 输出结果文件 + 清理。"""
