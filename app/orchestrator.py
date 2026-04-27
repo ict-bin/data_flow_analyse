@@ -319,37 +319,40 @@ _STDLIB_SKIP: frozenset[str] = frozenset({
 def _function_has_definition(target_dir: str, function_name: str) -> bool:
     """快速 grep 检查函数定义（非 extern 声明）是否存在于目标目录的源文件中。"""
     import subprocess
-    # 标准库函数直接返回 False（不在项目源码中定义）
     if function_name in _STDLIB_SKIP:
         return False
     try:
-        # 第一步：全词匹配函数名（-w），避免 ltc_memcpy 误匹配 memcpy
+        exts = ["--include=*.c", "--include=*.h", "--include=*.hpp",
+                "--include=*.cpp", "--include=*.cc", "--include=*.cxx"]
+        # 第一步：全词匹配函数名，避免 ltc_memcpy 误匹配 memcpy
         result = subprocess.run(
-            ["grep", "-rl", "-w",
-             "--include=*.c", "--include=*.h",
-             "--include=*.cpp", "--include=*.cc", "--include=*.cxx",
-             function_name, target_dir],
+            ["grep", "-rl", "-w"] + exts + [function_name, target_dir],
             capture_output=True, text=True, timeout=5)
         if result.returncode != 0:
             return False
         # 第二步：搜索函数定义行（返回类型 + 空白 + 函数名(）
-        #   使用 -P 珀尔正则，要求函数名前有空格/指针符，排除纯调用行
         result2 = subprocess.run(
-            ["grep", "-rn", "-P",
-             "--include=*.c", "--include=*.cpp", "--include=*.cc", "--include=*.cxx",
+            ["grep", "-rn", "-P"] + exts + [
              r"^[A-Za-z_][A-Za-z0-9_ *&:<>\[\]]*[\s*:]" + re.escape(function_name) + r"\s*\(",
              target_dir],
             capture_output=True, text=True, timeout=5)
         if result2.returncode != 0 or not result2.stdout.strip():
-            return False
-        # 第三步：排除 extern 声明
-        lines = result2.stdout.strip().split("\n")
+            # 内联定义 fallback：匹配 { 同行内联定义
+            result3 = subprocess.run(
+                ["grep", "-rn", "-P"] + exts + [
+                 re.escape(function_name) + r"\s*\([^)]*\)\s*(?:const)?\s*\{?",
+                 target_dir],
+                capture_output=True, text=True, timeout=5)
+            if result3.returncode != 0 or not result3.stdout.strip():
+                return False
+            lines = result3.stdout.strip().split("\n")
+        else:
+            lines = result2.stdout.strip().split("\n")
         for line in lines:
-            # 提取 grep 输出中冒号后的代码部分
             code_part = line.split(":", 2)[-1] if ":" in line else line
             if not re.search(r'\bextern\b', code_part, re.IGNORECASE):
-                return True  # 至少有一行是非 extern 的定义
-        return False  # 所有匹配行都是 extern 声明
+                return True
+        return False
     except (subprocess.TimeoutExpired, OSError):
         return True  # 超时/出错时保守返回 True，不跳过
 
@@ -967,47 +970,105 @@ class Orchestrator:
         async def process_item(item: tuple) -> None:
             func_name, src_file, task_cfg, tid, dep, taint_ctx = item
 
-            # 注入 tainted_context（深度信息由 execute() 内部统一注入 context）
+            # 注入 tainted_context
             if taint_ctx and dep > 0:
                 ctx_base = task_cfg.context or ""
                 if "# 调用者传入的脏数据" in ctx_base:
                     ctx_base = ctx_base.split("# 调用者传入的脏数据")[0].strip()
                 task_cfg.context = ctx_base + "\n\n# 调用者传入的脏数据\n" + taint_ctx
 
-            sub_orch = Orchestrator(config=task_cfg, on_event=self.on_event)
-            result = await sub_orch.execute(tid, archive=False, depth=dep, max_depth=max_depth)
+            # ── 解析本函数的污点参数列表 ──────────────────────────────────
+            # 从 task_cfg.task 提取 "外部输入参数（已污染）为：X,Y,Z"
+            _taint_match = re.search(r'外部输入参数.*?为[：:]\s*([^\n]+)', task_cfg.task or "")
+            _taint_list: list[str] = []
+            if _taint_match:
+                _taint_list = [t.strip() for t in _taint_match.group(1).split(',') if t.strip()]
+            if not _taint_list:
+                # fallback: taint_ctx 中的污染参数
+                _tc_match = re.search(r'污染参数[：:]\s*([^\n]+)', taint_ctx or "")
+                if _tc_match:
+                    _taint_list = [t.strip() for t in _tc_match.group(1).split(',') if t.strip()]
+            if not _taint_list:
+                _taint_list = ["all"]
 
-            # 读取 dataflow 文件
-            out_dir = Path(os.path.abspath(task_cfg.output_dir)) / tid
-            df_path = _find_dataflow_file(out_dir, func_name)
-            if df_path:
+            # dataflow 输出目录
+            df_dir = root_out_dir / "dataflow"
+            df_dir.mkdir(exist_ok=True)
+
+            # ── 每个污点单独 execute，输出 dataflow/funcname-taint.md ──────
+            per_taint_results: list[TaskResult] = []
+            for taint_name in _taint_list:
+                # 构建单污点任务配置
+                st_cfg = task_cfg.model_copy(deep=True)
+                safe_taint = re.sub(r'[^A-Za-z0-9_]', '_', taint_name)
+                safe_func  = re.sub(r'[^A-Za-z0-9_:.-]', '_', func_name)
+                st_cfg.task = (
+                    f"对 {st_cfg.source_file} 的 {func_name} 函数进行静态污点分析。\n"
+                    f"**本次只追踪单个污点参数：{taint_name}**\n"
+                    f"忽略其他参数，专注追踪 {taint_name} 的完整传播路径。\n"
+                    f"输出文件名：dataflow-{func_name}-{safe_taint}.md"
+                )
+                st_cfg.function_name = func_name  # keep original for file search
+
+                st_tid = tid + f"-t-{safe_taint[:20]}"
+                st_orch = Orchestrator(config=st_cfg, on_event=self.on_event)
+                st_result = await st_orch.execute(st_tid, archive=False, depth=dep, max_depth=max_depth)
+
+                # 读取 dataflow 文件（Worker 可能用不同文件名）
+                st_out_dir = Path(os.path.abspath(st_cfg.output_dir)) / st_tid
+                # 优先找 funcname-taint.md
+                st_df_path = _find_dataflow_file(st_out_dir, f"{func_name}-{safe_taint}")
+                if not st_df_path:
+                    st_df_path = _find_dataflow_file(st_out_dir, func_name)
+                if st_df_path:
+                    try:
+                        df_text = Path(st_df_path).read_text(encoding="utf-8")
+                        if len(df_text.strip()) > len((st_result.final_output or "").strip()):
+                            st_result.final_output = df_text
+                    except OSError:
+                        pass
+
+                # 保存到 dataflow/funcname-taint.md
+                if st_result.final_output:
+                    dest = df_dir / f"{safe_func}-{safe_taint}.md"
+                    try:
+                        dest.write_text(st_result.final_output, encoding="utf-8")
+                        sub_dataflow_files.append((f"{func_name}[{taint_name}]", str(dest)))
+                    except OSError:
+                        pass
+
+                per_taint_results.append(st_result)
+
+            # ── 合并所有污点分析结果 ──────────────────────────────────────
+            # 取最长的内容作为主 final_output（含 callee 表格的那份）
+            combined = max(per_taint_results,
+                           key=lambda r: len(r.final_output or ""),
+                           default=per_taint_results[0] if per_taint_results else None)
+            result = combined or TaskResult(task_id=tid, status=TaskStatus.FAILED)
+
+            # 同时保存合并版到 dataflow/funcname.md（供 callee 解析使用）
+            all_taint_text = "\n\n---\n\n".join(
+                r.final_output for r in per_taint_results if r.final_output
+            )
+            if all_taint_text:
+                merged_dest = df_dir / f"{safe_func}.md"
                 try:
-                    df_text = Path(df_path).read_text(encoding="utf-8")
-                    if len(df_text.strip()) > len((result.final_output or "").strip()):
-                        result.final_output = df_text
+                    merged_dest.write_text(all_taint_text, encoding="utf-8")
+                    result.final_output = all_taint_text
                 except OSError:
                     pass
 
             func_key = src_file + "::" + func_name
             all_results[func_key] = result
 
-            # 保存 dataflow 文件到根目录
-            if result.final_output and root_out_dir:
-                safe_name = re.sub(r'[^A-Za-z0-9_:.-]', '_', func_name)
-                df_dest = root_out_dir / f"dataflow-{safe_name}.md"
-                try:
-                    df_dest.write_text(result.final_output, encoding="utf-8")
-                    sub_dataflow_files.append((func_name, str(df_dest)))
-                except OSError:
-                    pass
-
-            # 解析 callee 并加入队列
+            # ── 解析 callee 并加入队列 ─────────────────────────────────────
             if dep < max_depth and result.final_output:
                 callees = _parse_callees(result.final_output)
                 target_dir = os.path.abspath(task_cfg.cwd)
                 valid: list[CalleeRef] = []
                 for callee in callees:
-                    c_key = (callee.file or src_file) + "::" + callee.function_name
+                    # 标准化 c_key：只用函数名（不含文件），避免路径差异导致误 dup
+                    c_key = callee.function_name
                     if callee.function_name == func_name:
                         continue
                     if c_key in analyzed:
@@ -1174,13 +1235,19 @@ class Orchestrator:
             for name, path in dataflow_files
         )
         merge_prompt = (
-            "# 合并任务\n\n"
+            "# 数据流分析合并任务\n\n"
             "根函数: " + root_function + "\n"
-            "共 " + str(len(dataflow_files)) + " 个数据流文档需要合并。\n\n"
-            "请使用 `read` 工具读取以下文件，然后按照 system prompt 中的格式规范合并：\n\n"
-            + file_list + "\n\n"
-            "调用树结构文件: `trace-tree.md`\n\n"
-            "合并结果写入: `merged-dataflow.md`"
+            "共 " + str(len(dataflow_files)) + " 个数据流分析文档需要合并。\n\n"
+            "**要求**：\n"
+            "1. 用 `read` 工具逐个读取以下全部文件\n"
+            "2. 输出一份**详细完整**的合并报告，要求：\n"
+            "   - 每个函数的完整污点传播路径（保留原文格式）\n"
+            "   - 调用链树状图（含深度和污点状态）\n"
+            "   - 每个函数的关键污点变量汇总表\n"
+            "   - 污点终点汇总（EXPORT/USED/CLEANED/DEFERRED）\n"
+            "3. 用 `write` 工具将完整报告写入 `merged-dataflow.md`\n\n"
+            "文件列表：\n" + file_list + "\n\n"
+            "调用树结构文件: `trace-tree.md`"
         )
 
         # 加载 merge 专用 system prompt
