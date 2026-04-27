@@ -1198,6 +1198,17 @@ class Orchestrator:
             base_dir=root_out_dir.name,
         )
 
+        # 将 dataflow/ 文件夹复制到 result_dir（小切文件 + 已归档到 zip）
+        df_folder = root_out_dir / "dataflow"
+        if df_folder.exists():
+            dest_df = result_dir / "dataflow"
+            if dest_df.exists():
+                shutil.rmtree(dest_df, ignore_errors=True)
+            try:
+                shutil.copytree(str(df_folder), str(dest_df))
+            except OSError:
+                pass
+
         # 清理
         shutil.rmtree(root_out_dir, ignore_errors=True)
 
