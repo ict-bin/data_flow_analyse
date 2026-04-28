@@ -227,19 +227,23 @@ def _parse_callees(dataflow_content: str) -> list[CalleeRef]:
                 is_header = True
             elif lc in ("序号", "no", "#", "idx", "index"):
                 is_header = True  # 序号列不是函数名列
-            elif lc in ("文件", "file"):
+            elif lc in ("文件", "file") or ("file" in lc and "pos" not in lc and "loc" not in lc):
                 file_col = i
-            elif "调用位置" in lc or "行号" in lc or "line" in lc or "call" in lc:
+            elif "调用位置" in lc or "调用行" in lc or "行号" in lc or lc in ("line", "line no", "lineno"):
                 line_col = i
             elif lc in ("污染参数", "污点参数", "已污染参数", "tainted", "tainted params",
                         "tainted_params", "taint params", "污染实参"):
                 param_col = i
             elif "taint" in lc and "param" in lc:
                 param_col = i
+            elif "是否传递" in lc or "是否传入" in lc or "是否把污" in lc:
+                # "是否传递污染数据": 値如 "是 (offset, length)" 或 "否"
+                # 兼当 skip_col + param_col
+                param_col = i  # 后面专長解析
+                is_header = True
             elif "说明" in lc or "备注" in lc or "原因" in lc or "desc" in lc or "remark" in lc:
                 desc_col = i
             elif "数据" in lc and ("传播" in lc or "流动" in lc):
-                # “污染数据传播” 等列无法用于识别参数名，当作 desc
                 desc_col = i
         if is_header:
             continue
@@ -249,16 +253,11 @@ def _parse_callees(dataflow_content: str) -> list[CalleeRef]:
             func_col = 0
 
         # 提取各字段
-        # 跳过明确标注不需要跟入的行——新表格格式不再有此列，如果旧格式残留则兼容过滤
-        # （跳过 ❌ / 否 行）
-        all_cols_str = " ".join(cells)
-        if "❌" in all_cols_str or ("否" in all_cols_str and "是否" not in all_cols_str
-                                   and "不否" not in all_cols_str):
-            # 只有当行含 ❌ 或“否”且是在第4列后（就是以前的 skip_col 位置）才跳过
-            if len(cells) >= 4:
-                fourth = cells[3].strip()
-                if "❌" in fourth or fourth.lower() in ("否", "no", "false"):
-                    continue
+        # 跳过明确标注「不需要跟入」的行：如果第4列包含 ❌ / 否（历史格式兼容）
+        if len(cells) >= 4:
+            fourth = cells[3].strip()
+            if "❌" in fourth or fourth.lower() in ("否", "no", "false"):
+                continue
 
         fname = cells[func_col] if func_col < len(cells) else ""
         # 清理函数名:去掉反引号、-> 或 . 前缀的对象名
@@ -273,7 +272,19 @@ def _parse_callees(dataflow_content: str) -> list[CalleeRef]:
         ffile = cells[file_col] if 0 <= file_col < len(cells) else ""
         fline = cells[line_col] if 0 <= line_col < len(cells) else ""
         fparam = cells[param_col] if 0 <= param_col < len(cells) else ""
-        fdesc = cells[desc_col] if 0 <= desc_col < len(cells) else ""
+        fdesc  = cells[desc_col]  if 0 <= desc_col  < len(cells) else ""
+
+        # 处理 "是否传递污染数据" 式列:値如 "否", "是 (aOffset, aLength)" 等
+        if fparam:
+            fp_s = fparam.strip().strip('*').strip()
+            if fp_s.startswith('否') or fp_s.lower().startswith('no'):
+                continue  # 明确不传递污点,跳过
+            # 提取括号内的形参名: "是 (aOffset, aLength)" → "aOffset, aLength"
+            m_paren = re.search(r'[((]([^))]{1,80})[))]', fp_s)
+            if m_paren:
+                fparam = m_paren.group(1).strip()
+            elif fp_s.startswith('是') or fp_s.startswith('yes') or fp_s.startswith('true'):
+                fparam = ""  # 带 "是" 但无括号--保留空字符串,后续 fallback 到 所有参数
 
         # 双重校验:如果"污染参数"列明确为空/无,说明未有污点流入,跳过
         # (补充 Worker 提示词的防线)
@@ -1507,7 +1518,7 @@ class Orchestrator:
             "## 评审意见\n"
             "<详细评审,引用具体行号、变量名、函数名>\n"
             "## 改进指令\n"
-            "<按优先级列出可操作的改进项，如果通过则写『无』>\n"
+            "<按优先级列出可操作的改进项,如果通过则写『无』>\n"
             "```")
         return "\n\n".join(parts)
 
