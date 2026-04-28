@@ -739,13 +739,16 @@ class Orchestrator:
                     function_name=cfg.function_name, source_file=cfg.source_file)
 
                 w_tasks = []
+                # write-dataflow skill 已安装到 ~/.pi/agent/skills/，pi 自动发现
+                # 将 /skill:write-dataflow 注入 prompt 末尾强制加载
+                _skill_force_load = "\n\n/skill:write-dataflow"
                 for i, acfg in enumerate(cfg.workers.agents):
                     wid = f"worker-{i}"
                     self._emit("worker_start", task_id, worker_id=wid,
                                model=acfg.model, round=rnd_num,
                                function=cfg.function_name)
                     w_tasks.append({
-                        "prompt": worker_prompt,
+                        "prompt": worker_prompt + _skill_force_load,
                         "model": acfg.model,
                         "tools": acfg.tools or cfg.workers.default_tools,
                         "system_prompt": resolve_system_prompt(i, acfg, worker_dir_prompts),

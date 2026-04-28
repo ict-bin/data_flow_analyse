@@ -272,6 +272,7 @@ async def run_agent(
     cwd: str = ".",
     thinking_level: str = "off",
     session_file: str | None = None,
+    skill_paths: list[str] | None = None,
     on_stream: Callable[[str], None] | None = None,
     cancel_event: asyncio.Event | None = None,
     max_retries: int = 3,               # API 错误最大重试次数（-1=无限）
@@ -313,6 +314,10 @@ async def run_agent(
 
     if tools:
         args.extend(["--tools", ",".join(tools)])
+
+    if skill_paths:
+        for sp in skill_paths:
+            args.extend(["--skill", sp])
 
     if thinking_level and thinking_level != "off":
         args.extend(["--thinking", thinking_level])

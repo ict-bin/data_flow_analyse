@@ -76,61 +76,24 @@
 └── [L272] SetCommissioningData(tlvs,length) 📎 见跟入列表
 ```
 
-## 阶段四：调用专用工具输出结果（**两个工具都必须调用**）
+## 阶段四：调用 write-dataflow skill 输出结果
 
-> ❗️ 不要用 `write` 工具直接写文件——必须通过以下专用工具，系统会验证工具调用记录。
+分析完成后，执行：
 
-### 步骤1：调用 `gen_dataflow` 写入数据流报告
-
-```bash
-bash gen_dataflow "FuncName" <<'REPORT'
-# 数据流追踪: FuncName
-
-## 函数信息
-- 文件: src-vul/openthread/.../foo.cpp
-- 行号: L228-L282
-- 签名: `ReturnType FuncName(Type arg1, ...)`
-
-## 数据流树状图
-
-### INPUT-1: paramName (Type) 🔴 TAINTED
-├── [L230] `code` → result 🔴 TAINTED
-│   └── [L240] SubFunc(result) → 📎 见 tainted.list
-└── [L280] 📌 USED
-
-## 污点终点汇总
-| 脏数据 | 终点类型 | 位置 | 说明 |
-|--------|---------|------|------|
-| paramName | 📌 USED | L280 | 传递给子函数 |
-REPORT
+```
+/skill:write-dataflow
 ```
 
-### 步骤2：调用 `gen_tainted_list` 写入跟入列表
-
-每行一个需要递归分析的子函数（**只写实际接收污点参数的函数**）：
-
-```bash
-bash gen_tainted_list <<'CALLEES'
-src-vul/openthread/src/core/common/message.cpp###Message::Read###L245###aOffset,aLength
--###LeaderBase::SetCommissioningData###L301###aValue,aValueLength
-CALLEES
-```
-
-如果是叶函数（无需跟入任何子函数），空输入也必须调用：
-```bash
-echo "" | bash gen_tainted_list
-```
-
-**字段规则**：文件路径不确定填 `-`，行号不确定填 `-`，参数不确定填 `*`。
+按 skill 的指引调用 `gen_dataflow` 和 `gen_tainted_list` 两个工具写出结果。
 
 ---
 
 # 改进轮次须知
 
-收到 Judge 反馈后:
+收到 Judge 反馈后：
 1. 仔细阅读具体问题
-2. 重新追踪遗漏的路径
-3. **重新调用 `gen_dataflow` 和 `gen_tainted_list` 覆盖更新文件**
+2. 补充遗漏的传播路径
+3. **重新调用 `/skill:write-dataflow` 覆盖更新文件**
 
 # 最终交付
 
