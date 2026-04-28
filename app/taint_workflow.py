@@ -44,6 +44,33 @@ from .models import (
 from .runner import run_agent
 
 
+
+def _extract_function_body(ws, src_file: str, func_name: str) -> str:
+    """Orchestrator extracts function body. Inject into prompt so model skips file reading."""
+    import subprocess
+    try:
+        r = subprocess.run(
+            ['extract_func', src_file, func_name],
+            cwd=str(ws), capture_output=True, text=True, timeout=15)
+        if r.returncode == 0 and r.stdout.strip():
+            return r.stdout.strip()
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        pass
+    from pathlib import Path as _Path
+    for cand in [_Path(str(ws)) / src_file, _Path(str(ws)) / src_file.split("/")[-1]]:
+        if not cand.exists():
+            continue
+        try:
+            fl = cand.read_text(encoding="utf-8", errors="replace").splitlines()
+            short = func_name.split("::")[-1]
+            for i, ln in enumerate(fl):
+                if short in ln and "(" in ln and not ln.strip().startswith("//"):
+                    return chr(10).join(fl[max(0, i-2):min(len(fl), i+100)])
+        except OSError:
+            pass
+    return ""
+
+
 def _find_df_file(worker_cwd: str, function_name: str = "") -> str:
     """Thin wrapper — locate dataflow file in task output dir."""
     from .orchestrator import _find_dataflow_file
@@ -81,26 +108,37 @@ def _build_base_prompt(func_name: str, src_file: str, taint_params: list[str],
 
 
 def _build_taint_prompt(param: str, func_name: str,
+                        func_body: str = "",
                         feedback: str = "", rnd: int = 1) -> str:
     import uuid
     nonce = uuid.uuid4().hex[:8]
     safe_p = _safe_param(param)
     fb_block = ""
     if rnd > 1 and feedback:
-        fb_block = f"\n\n# 上一轮反馈（针对 `{param}` 的分析）\n\n{feedback}\n\n请修正后重新分析。"
+        fb_block = (
+            chr(10)*2 + "# Round " + str(rnd) + " feedback for `" + param + "`"
+            + chr(10)*2 + feedback + chr(10)*2 + "Please revise your analysis."
+        )
+    src_block = ""
+    if func_body:
+        src_block = (
+            "## Function Source Code (provided -- DO NOT read files)" + chr(10)*2
+            + "```cpp" + chr(10) + func_body + chr(10) + "```" + chr(10)*2
+        )
     return (
-        f"<!-- {nonce} -->\n"
-        f"# 阶段二：深入追踪污点参数 `{param}`\n\n"
-        f"**只追踪 `{param}` 在 `{func_name}` 函数内部的传播路径。**\n\n"
-        f"要求：\n"
-        f"- 逐行追踪 `{param}` 的每一个使用点\n"
-        f"- 标记所有派生变量（用 🔴 TAINTED 标注）\n"
-        f"- 找出所有将 `{param}` 或其派生变量作为实参传入的子函数调用\n"
-        f"- 不要展开子函数内部，只需识别调用点和传入的形参名\n\n"
-        f"分析完成后，调用 write 工具写入 `taint-flow-{safe_p}.md`（当前目录）。"
-        f"{fb_block}"
+        "<!-- " + nonce + " -->" + chr(10)
+        + "# Deep taint analysis: `" + param + "` in `" + func_name + "`" + chr(10)*2
+        + "**Analyze ONLY this one parameter within the current function.**" + chr(10)*2
+        + src_block
+        + "Requirements:" + chr(10)
+        + "- Trace every use of `" + param + "` line-by-line" + chr(10)
+        + "- Mark derived variables with 🔴 TAINTED" + chr(10)
+        + "- Identify sub-function calls receiving `" + param + "` or derived values" + chr(10)
+        + "- Do NOT analyze sub-function internals" + chr(10)
+        + "- Source provided -- **DO NOT use read/bash to open files**" + chr(10)*2
+        + "After analysis write `taint-flow-" + safe_p + ".md` using the write tool."
+        + fb_block
     )
-
 
 def _build_taint_post_skill(param: str) -> str:
     safe_p = _safe_param(param)
@@ -343,7 +381,12 @@ class PerTaintWorkflow:
         # 跟踪各 session 已完成的轮次（用于反馈路由）
         taint_feedbacks: dict[str, str] = {p: "" for p in self.taint_params}
         summary_feedback: str = ""
-        base_done = False
+        # Extract function body ONCE on the orchestrator side.
+        # Inject into taint prompts so model never needs to read files.
+        func_body = _extract_function_body(self.ws, self.src_file, self.func_name)
+        func_body_log = f"({len(func_body)}B)" if func_body else "(empty)"
+        self._emit("debug", function=self.func_name,
+                   message="func_body extracted " + func_body_log)
 
         for rnd in range(1, max_rounds + 1):
             rnd_dir = self.out_dir / f"round-{rnd}"
@@ -353,36 +396,10 @@ class PerTaintWorkflow:
 
             self._emit("round_start", round=rnd)
 
-            # ── Phase 1: Base session（只在第一轮执行）────────────────────────
-            if not base_done:
-                self._emit("worker_start", worker_id="worker-base",
-                           model=self.worker_model, round=rnd,
-                           function=self.func_name)
-                base_prompt = _build_base_prompt(
-                    self.func_name, self.src_file, self.taint_params,
-                    self.taint_ctx, self.dep, self.max_depth
-                )
-                base_result = await run_agent(
-                    prompt=base_prompt,
-                    **self._agent_kwargs(self.base_sess)
-                )
-                (rnd_workers_dir / "worker-0-base-output.md").write_text(
-                    base_result.output, encoding="utf-8")
-                self._emit("worker_done", worker_id="worker-base",
-                           output=base_result.output[:200])
-
-                # Fork base → taint sessions + summary session
-                for p, taint_s in self.taint_sess.items():
-                    if not os.path.exists(taint_s):
-                        shutil.copy2(self.base_sess, taint_s)
-                if not os.path.exists(self.summary_sess):
-                    shutil.copy2(self.base_sess, self.summary_sess)
-                base_done = True
-
             # ── Phase 2: 并行 taint sessions ──────────────────────────────────
             async def run_taint(param: str) -> tuple[str, object]:
                 fb = taint_feedbacks.get(param, "")
-                prompt = _build_taint_prompt(param, self.func_name, fb, rnd)
+                prompt = _build_taint_prompt(param, self.func_name, func_body, fb, rnd)
                 post_skill = _build_taint_post_skill(param)
                 self._emit("worker_start",
                            worker_id=f"worker-taint-{_safe_param(param)}",
