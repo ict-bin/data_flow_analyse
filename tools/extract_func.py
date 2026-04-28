@@ -200,10 +200,13 @@ def main():
         print(f"// Function '{func_name}' not found in {filepath}")
         sys.exit(0)
 
-    # 如果指定了行号提示，优先选择 >= line_hint 的候选；否则按顺序
+    # 如果指定了行号提示，找包含该行的函数：找 start_line 最大且 <= line_hint 的候选
+    # （即最近的前驱）；其他候选作为备用
     if line_hint > 0:
-        preferred = [c for c in candidates if c + 1 >= line_hint]
-        ordered = preferred + [c for c in candidates if c + 1 < line_hint]
+        before = [c for c in candidates if c + 1 <= line_hint]
+        after  = [c for c in candidates if c + 1 >  line_hint]
+        # 最近前驱 → before 按行号降序（最大的在前）
+        ordered = list(reversed(before)) + after
     else:
         ordered = candidates
 

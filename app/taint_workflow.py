@@ -77,8 +77,10 @@ def _extract_function_body(ws, src_file: str, func_name: str,
             matches = [i for i, ln in enumerate(fl)
                        if short in ln and "(" in ln and not ln.strip().startswith("/")]
             if hint_num > 0:
-                preferred = [i for i in matches if i + 1 >= hint_num]
-                matches = preferred + [i for i in matches if i + 1 < hint_num]
+                # Pick the closest preceding match (start_line <= hint)
+                before = [i for i in matches if i + 1 <= hint_num]
+                after  = [i for i in matches if i + 1 >  hint_num]
+                matches = list(reversed(before)) + after
             if matches:
                 i = matches[0]
                 return chr(10).join(fl[max(0, i-2):min(len(fl), i+100)])
