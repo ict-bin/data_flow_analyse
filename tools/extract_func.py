@@ -175,20 +175,40 @@ def main():
 
     func_name = args[1]
     context_n = 0
-    for i, a in enumerate(args[2:], 2):
+    line_hint = 0  # if >0, prefer candidates at or after this 1-indexed line
+    i = 2
+    while i < len(args):
+        a = args[i]
         if a == '--context' and i + 1 < len(args):
             try:
                 context_n = int(args[i+1])
             except ValueError:
                 pass
+            i += 2
+        elif a == '--line' and i + 1 < len(args):
+            try:
+                raw = args[i+1].lstrip('Ll')  # accept 'L228' or '228'
+                line_hint = int(raw)
+            except ValueError:
+                pass
+            i += 2
+        else:
+            i += 1
 
     candidates = find_function_start(lines, func_name)
     if not candidates:
         print(f"// Function '{func_name}' not found in {filepath}")
         sys.exit(0)
 
+    # 如果指定了行号提示，优先选择 >= line_hint 的候选；否则按顺序
+    if line_hint > 0:
+        preferred = [c for c in candidates if c + 1 >= line_hint]
+        ordered = preferred + [c for c in candidates if c + 1 < line_hint]
+    else:
+        ordered = candidates
+
     # 找第一个有函数体的候选
-    for start in candidates:
+    for start in ordered:
         func_lines, s_line, e_line = extract_function(lines, start)
         full = ''.join(func_lines)
         if '{' in full and '}' in full:
@@ -200,7 +220,7 @@ def main():
             return
 
     # 只有声明
-    start = candidates[0]
+    start = ordered[0]
     print(f"// {filepath}  L{start+1} (declaration only)")
     sys.stdout.write(lines[start])
 

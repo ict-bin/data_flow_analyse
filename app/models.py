@@ -59,6 +59,7 @@ class TaskConfig(BaseModel):
     task: str = Field(..., description="用户的一句话 prompt")
     source_file: str = Field(default="", description="从 prompt 解析出的文件名")
     function_name: str = Field(default="", description="从 prompt 解析出的函数名")
+    line_hint: str = Field(default="", description="函数起始行号提示，如 'L228'，用于区分同名重载")
     cwd: str = Field(default="/data/target", description="待分析文件所在目录")
 
     # 服务配置部分（从 ServiceConfig 合并）

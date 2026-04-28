@@ -45,27 +45,43 @@ from .runner import run_agent
 
 
 
-def _extract_function_body(ws, src_file: str, func_name: str) -> str:
-    """Orchestrator extracts function body. Inject into prompt so model skips file reading."""
+def _extract_function_body(ws, src_file: str, func_name: str,
+                           line_hint: str = "") -> str:
+    """Orchestrator extracts function body. Inject into prompt so model skips file reading.
+    line_hint: e.g. 'L228' — used to prefer the overload at or after that line.
+    """
     import subprocess
+    cmd = ['extract_func', src_file, func_name]
+    if line_hint:
+        cmd += ['--line', line_hint.lstrip('Ll')]
     try:
-        r = subprocess.run(
-            ['extract_func', src_file, func_name],
-            cwd=str(ws), capture_output=True, text=True, timeout=15)
+        r = subprocess.run(cmd, cwd=str(ws), capture_output=True, text=True, timeout=15)
         if r.returncode == 0 and r.stdout.strip():
             return r.stdout.strip()
     except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
         pass
+    # fallback: grep function range from file, respecting line_hint
     from pathlib import Path as _Path
+    hint_num = 0
+    if line_hint:
+        try:
+            hint_num = int(line_hint.lstrip('Ll'))
+        except ValueError:
+            pass
     for cand in [_Path(str(ws)) / src_file, _Path(str(ws)) / src_file.split("/")[-1]]:
         if not cand.exists():
             continue
         try:
             fl = cand.read_text(encoding="utf-8", errors="replace").splitlines()
             short = func_name.split("::")[-1]
-            for i, ln in enumerate(fl):
-                if short in ln and "(" in ln and not ln.strip().startswith("//"):
-                    return chr(10).join(fl[max(0, i-2):min(len(fl), i+100)])
+            matches = [i for i, ln in enumerate(fl)
+                       if short in ln and "(" in ln and not ln.strip().startswith("/")]
+            if hint_num > 0:
+                preferred = [i for i in matches if i + 1 >= hint_num]
+                matches = preferred + [i for i in matches if i + 1 < hint_num]
+            if matches:
+                i = matches[0]
+                return chr(10).join(fl[max(0, i-2):min(len(fl), i+100)])
         except OSError:
             pass
     return ""
@@ -292,17 +308,19 @@ class PerTaintWorkflow:
         cfg: TaskConfig,
         func_name: str,
         src_file: str,
-        taint_params: list[str],
-        taint_ctx: str,
-        task_id: str,
-        out_dir: Path,
-        dep: int,
-        max_depth: int,
+        line_hint: str = "",
+        taint_params: list[str] = None,
+        taint_ctx: str = "",
+        task_id: str = "",
+        out_dir: Path = None,
+        dep: int = 0,
+        max_depth: int = 5,
         on_event: Callable | None = None,
     ):
         self.cfg = cfg
         self.func_name = func_name
         self.src_file = src_file
+        self.line_hint = line_hint
         self.taint_params = taint_params if taint_params else ["all"]
         self.taint_ctx = taint_ctx
         self.task_id = task_id
@@ -383,10 +401,16 @@ class PerTaintWorkflow:
         summary_feedback: str = ""
         # Extract function body ONCE on the orchestrator side.
         # Inject into taint prompts so model never needs to read files.
-        func_body = _extract_function_body(self.ws, self.src_file, self.func_name)
+        func_body = _extract_function_body(self.ws, self.src_file, self.func_name,
+                                           self.line_hint)
         func_body_log = f"({len(func_body)}B)" if func_body else "(empty)"
         self._emit("debug", function=self.func_name,
                    message="func_body extracted " + func_body_log)
+
+        # Concurrency limit: taint sessions share the same worker slot.
+        # Max parallel taint pi processes = worker_count (from config).
+        _taint_concurrency = max(1, self.cfg.worker_count)
+        _taint_sem = asyncio.Semaphore(_taint_concurrency)
 
         for rnd in range(1, max_rounds + 1):
             rnd_dir = self.out_dir / f"round-{rnd}"
@@ -396,24 +420,25 @@ class PerTaintWorkflow:
 
             self._emit("round_start", round=rnd)
 
-            # ── Phase 2: 并行 taint sessions ──────────────────────────────────
+            # ── Phase 2: 并行 taint sessions（受 _taint_sem 并发限制）──────────
             async def run_taint(param: str) -> tuple[str, object]:
-                fb = taint_feedbacks.get(param, "")
-                prompt = _build_taint_prompt(param, self.func_name, func_body, fb, rnd)
-                post_skill = _build_taint_post_skill(param)
-                self._emit("worker_start",
-                           worker_id=f"worker-taint-{_safe_param(param)}",
-                           model=self.worker_model, round=rnd,
-                           function=f"{self.func_name}[{param}]")
-                res = await run_agent(
-                    prompt=prompt,
-                    post_skill_prompt=post_skill,
-                    **self._agent_kwargs(self.taint_sess[param])
-                )
-                self._emit("worker_done",
-                           worker_id=f"worker-taint-{_safe_param(param)}",
-                           output=res.output[:200])
-                return (param, res)
+                async with _taint_sem:
+                    fb = taint_feedbacks.get(param, "")
+                    prompt = _build_taint_prompt(param, self.func_name, func_body, fb, rnd)
+                    post_skill = _build_taint_post_skill(param)
+                    self._emit("worker_start",
+                               worker_id=f"worker-taint-{_safe_param(param)}",
+                               model=self.worker_model, round=rnd,
+                               function=f"{self.func_name}[{param}]")
+                    res = await run_agent(
+                        prompt=prompt,
+                        post_skill_prompt=post_skill,
+                        **self._agent_kwargs(self.taint_sess[param])
+                    )
+                    self._emit("worker_done",
+                               worker_id=f"worker-taint-{_safe_param(param)}",
+                               output=res.output[:200])
+                    return (param, res)
 
             taint_results_raw = await asyncio.gather(*[
                 run_taint(p) for p in self.taint_params

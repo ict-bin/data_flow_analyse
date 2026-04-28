@@ -508,11 +508,11 @@ class Orchestrator(JudgeMixin):
                    function=cfg.function_name, depth=0, max_depth=max_depth)
 
         # 根任务入队
-        await queue.put((cfg.function_name, cfg.source_file,
+        await queue.put((cfg.function_name, cfg.source_file, cfg.line_hint,
                          cfg.model_copy(deep=True), root_task_id, 0, tainted_context))
 
         async def process_item(item: tuple) -> None:
-            func_name, src_file, task_cfg, tid, dep, taint_ctx = item
+            func_name, src_file, line_hint, task_cfg, tid, dep, taint_ctx = item
 
             # 注入 tainted_context
             if taint_ctx and dep > 0:
@@ -548,6 +548,7 @@ class Orchestrator(JudgeMixin):
                 cfg=task_cfg,
                 func_name=func_name,
                 src_file=src_file,
+                line_hint=line_hint,
                 taint_params=_taint_list,
                 taint_ctx=taint_ctx or "",
                 task_id=tid,
@@ -650,7 +651,9 @@ class Orchestrator(JudgeMixin):
                         f"污染参数: {callee.tainted_params}\n说明: {callee.description}"
                     )
                     sub_tid = tid + f"-d{dep + 1}-{callee.function_name[:25]}"
-                    await queue.put((callee.function_name, sub_file, sub_cfg,
+                    sub_line_hint = callee.line if callee.line.startswith("L") else (
+                        "L" + callee.line.lstrip("L") if callee.line else "")
+                    await queue.put((callee.function_name, sub_file, sub_line_hint, sub_cfg,
                                      sub_tid, dep + 1, tainted_ctx_str))
 
         async def worker(wid: int) -> None:

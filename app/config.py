@@ -37,12 +37,13 @@ def build_task_config(svc: ServiceConfig, prompt: str, cwd: str = None) -> TaskC
     """
     if cwd is None:
         cwd = TARGET_DIR
-    source_file, function_name = parse_prompt(prompt)
+    source_file, function_name, line_hint = parse_prompt(prompt)
 
     cfg = TaskConfig(
         task=prompt,
         source_file=source_file,
         function_name=function_name,
+        line_hint=line_hint,
         cwd=cwd,
         max_rounds=svc.max_rounds,
         min_rounds=svc.min_rounds,
@@ -81,6 +82,7 @@ def parse_prompt(prompt: str) -> tuple[str, str]:
     """
     source_file = ""
     function_name = ""
+    line_hint = ""
 
     # 尝试匹配文件名（含路径，如 src/foo.c）
     file_patterns = [
@@ -112,7 +114,12 @@ def parse_prompt(prompt: str) -> tuple[str, str]:
                 function_name = candidate
                 break
 
-    return source_file, function_name
+    # 尝试匹配行号提示 L228 / L_228 / 行228
+    m_line = re.search(r'\bL[_]?(\d+)\b', prompt, re.IGNORECASE)
+    if m_line:
+        line_hint = "L" + m_line.group(1)
+
+    return source_file, function_name, line_hint
 
 
 def _backfill_role(role: RoleConfig) -> None:
