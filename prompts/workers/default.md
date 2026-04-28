@@ -76,15 +76,47 @@
 └── [L272] SetCommissioningData(tlvs,length) 📎 见跟入列表
 ```
 
-## 阶段四：调用 write-dataflow skill 输出结果
+## 阶段四：输出结果（**必须按顺序执行以下两步**）
 
-分析完成后，执行：
+### 步骤1：调用 `gen_dataflow` 写入报告
 
+```bash
+bash gen_dataflow "当前函数名" <<'DATA_FLOW_DOC'
+# 数据流追踪: 函数名
+
+## 函数信息
+- 文件: src-vul/.../foo.cpp
+- 行号: L228-L282
+- 签名: `ReturnType FuncName(args)`
+
+## 数据流树状图
+
+### INPUT-1: param1 (Type) 🔴 TAINTED
+├── [L230] 操作 → result 🔴 TAINTED
+│   └── [L240] SubFunc(result) → 📎 子函数
+└── [L280] 📌 USED
+
+## 污点终点汇总
+| 脏数据 | 终点 | 位置 | 说明 |
+|--------|------|------|------|
+DATA_FLOW_DOC
 ```
-/skill:write-dataflow
+
+### 步骤2：调用 `gen_tainted_list` 写入跟入列表
+
+**只写实际接收污点参数的函数**，getter/条件判断/标准库不写：
+
+```bash
+bash gen_tainted_list <<'TAINTED_CALLEE_LIST'
+src-vul/openthread/src/core/common/message.cpp###Message::Read###L245###aOffset,aLength
+-###LeaderBase::SetCommissioningData###L301###aValue,aValueLength
+TAINTED_CALLEE_LIST
 ```
 
-按 skill 的指引调用 `gen_dataflow` 和 `gen_tainted_list` 两个工具写出结果。
+叶函数（无需跟入任何子函数）：
+```bash
+echo "" | bash gen_tainted_list
+```
 
 ---
 
@@ -93,7 +125,7 @@
 收到 Judge 反馈后：
 1. 仔细阅读具体问题
 2. 补充遗漏的传播路径
-3. **重新调用 `/skill:write-dataflow` 覆盖更新文件**
+3. **重新调用 `gen_dataflow` 和 `gen_tainted_list` 覆盖更新文件**
 
 # 最终交付
 

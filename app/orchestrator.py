@@ -739,22 +739,28 @@ class Orchestrator:
                     function_name=cfg.function_name, source_file=cfg.source_file)
 
                 w_tasks = []
-                # write-dataflow skill 已安装到 ~/.pi/agent/skills/，pi 自动发现
-                # 将 /skill:write-dataflow 注入 prompt 末尾强制加载
-                _skill_force_load = "\n\n/skill:write-dataflow"
+                # write-dataflow skill 已安装到 ~/.pi/agent/skills/（支持该机制的模型可自动发现）
+                # GLM-5 不支持 /skill: 命令，阶段4指令已直接内嵌入 Worker system prompt
                 for i, acfg in enumerate(cfg.workers.agents):
                     wid = f"worker-{i}"
                     self._emit("worker_start", task_id, worker_id=wid,
                                model=acfg.model, round=rnd_num,
                                function=cfg.function_name)
                     w_tasks.append({
-                        "prompt": worker_prompt + _skill_force_load,
+                        "prompt": worker_prompt,
                         "model": acfg.model,
                         "tools": acfg.tools or cfg.workers.default_tools,
                         "system_prompt": resolve_system_prompt(i, acfg, worker_dir_prompts),
                         "cwd": worker_cwds[i],
                         "thinking_level": acfg.thinking_level or cfg.workers.default_thinking_level,
                         "session_file": worker_sessions[i],
+                        # RPC 第二轮：分析完成后强制调用 write-dataflow skill
+                        "post_skill_prompt": (
+                            "Now execute the write-dataflow skill output steps:\n"
+                            "1. Call gen_dataflow with your complete analysis\n"
+                            "2. Call gen_tainted_list with the callee list\n"
+                            "Run /skill:write-dataflow and follow its instructions."
+                        ),
                         "cancel_event": self._cancel_event,
                         "max_retries": cfg.agent_max_retries,
                         "retry_delay": cfg.agent_retry_delay,
