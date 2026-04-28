@@ -99,28 +99,22 @@
 |--------|---------|------|------|
 ```
 
-### 4b. 跟入列表 `tainted.list`（**系统必读，格式严格**）
+### 4b. 跟入列表 `tainted.list`（可选但强烈推荐，比报告表格更准确）
 
-每行一个需要递归分析的子函数，格式：
+如果你能确认需要跟入的函数及其形参，请写入 `tainted.list`，格式：
 
 ```
 文件路径###Class::FuncName###L行号###污点形参1,污点形参2
 ```
 
-**字段规则**：
-- `文件路径`：相对工作目录的路径（如 `src-vul/openthread/src/core/common/message.cpp`），不确定填 `-`
-- `Class::FuncName`：全限定名，不确定类名先 `bash grep -rn "FuncName" src-vul/` 确认
-- `L行号`：调用行号（如 `L245`），不确定填 `-`
-- `污点形参`：被调函数的**形参名**（逗号分隔），不确定填 `*`
-
-**示例**：
+示例：
 ```
 src-vul/openthread/src/core/common/message.cpp###Message::Read###L245###aOffset,aLength
 src-vul/openthread/src/core/thread/network_data_leader.cpp###LeaderBase::SetCommissioningData###L301###aValue,aValueLength
-src-vul/openthread/src/core/meshcop/meshcop_tlvs.hpp###MeshCoP::Tlv::GetNext###L119###*
 ```
 
-**只写实际接收污点的函数**；条件判断/getter/标准库/日志一律不写。
+字段不确定时：文件路径填 `-`，参数列表填 `*`。
+**只写实际接收污点参数的函数**，getter/条件判断/标准库不写。
 
 > ⚠️ 两个文件都写到**当前工作目录根目录**，不加任何路径前缀，`src-vul/` 只读。
 

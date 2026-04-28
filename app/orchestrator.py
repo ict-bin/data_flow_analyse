@@ -173,19 +173,29 @@ def _find_dataflow_file(worker_cwd: str, function_name: str = "") -> str:
 
 
 def _read_tainted_list(worker_cwd: str) -> list[CalleeRef]:
-    """读取 Worker 写入的 tainted.list 文件，返回 CalleeRef 列表。
+    """读取 tainted.list 文件，返回 CalleeRef 列表。
 
-    每行格式: 文件路径###Class::FuncName###L行号###污点形参
+    搜索顺序: workspace-worker-*/ → round-*/workers/ → 任意子目录
     """
     callees: list[CalleeRef] = []
-    cwd = Path(worker_cwd)
-    # 搜索所有 workspace 子目录下的 tainted.list
-    candidates = list(cwd.glob("tainted.list")) + list(cwd.rglob("tainted.list"))
-    if not candidates:
+    task_dir = Path(worker_cwd)
+    # 搜索所有可能位置
+    candidates: list[Path] = []
+    candidates.extend(task_dir.glob("workspace-worker-*/tainted.list"))
+    candidates.extend(task_dir.glob("round-*/workers/*/tainted.list"))
+    candidates.extend(task_dir.rglob("tainted.list"))
+    # 去重并按修改时间排序
+    seen: set[str] = set()
+    unique: list[Path] = []
+    for c in candidates:
+        k = str(c.resolve())
+        if k not in seen:
+            seen.add(k)
+            unique.append(c)
+    if not unique:
         return []
-    # 取最新的
-    candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
-    tainted_file = candidates[0]
+    unique.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    tainted_file = unique[0]
     try:
         content = tainted_file.read_text(encoding="utf-8", errors="replace")
     except OSError:
@@ -1073,6 +1083,26 @@ class Orchestrator:
                         result.final_output = df_text
                 except OSError:
                     pass
+
+            # 强制生成 tainted.list：不依赖 LLM 自觉写文件
+            # 优先保留 LLM 已写的版本（文件路径/参数名更准确），否则由 Orchestrator 从 _parse_callees 生成
+            if result.final_output:
+                _callees_for_list = _parse_callees(result.final_output)
+                if _callees_for_list:
+                    for _ws in out_dir.glob("workspace-worker-*/"):
+                        _tainted_path = _ws / "tainted.list"
+                        if not _tainted_path.exists():
+                            _lines = []
+                            for _c in _callees_for_list:
+                                _f = _c.file or "-"
+                                _l = _c.line or "-"
+                                _p = _c.tainted_params or "*"
+                                _lines.append(f"{_f}###{_c.function_name}###{_l}###{_p}")
+                            try:
+                                _tainted_path.write_text(
+                                    "\n".join(_lines) + "\n", encoding="utf-8")
+                            except OSError:
+                                pass
 
             # 保存 dataflow/funcname.md(供 callee 解析 + merge)
             if result.final_output:
