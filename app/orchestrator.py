@@ -364,6 +364,25 @@ def _parse_callees(dataflow_content: str) -> list[CalleeRef]:
         callees.append(CalleeRef(
             function_name=fname, file=ffile, line=fline,
             tainted_params=fparam, description=fdesc))
+
+    # Fallback: 如果表格解析为空，尝试从 "已跟入函数分析" 章节标题中提取函数名
+    # 支持 "### N.N FuncName(args)" 和 "#### FuncName" 格式
+    if not callees:
+        for line in dataflow_content.split(chr(10)):
+            s = line.strip()
+            # 匹配 "已跟入" 等关键词所在的 markdown 标题
+            if s.startswith('#') and any(kw in s for kw in [
+                    '已跟入', '跟入分析', '追踪分析', '子函数']):
+                # 提取标题中的函数名: '### 2.1 SetCommissioning(...)' → 'SetCommissioning'
+                m = re.search(r'[`\"\']?([A-Za-z_][\w:<>*&\s]*?)\s*\(', s)
+                if m:
+                    fn = re.sub(r'\(.*', '', m.group(1)).strip()
+                    fn = fn.split()[-1] if ' ' in fn else fn  # take last token
+                    fn = re.sub(r'[^A-Za-z0-9_:.]', '', fn)
+                    if fn and len(fn) >= 3 and fn not in _STDLIB_SKIP:
+                        callees.append(CalleeRef(
+                            function_name=fn, file='', line='',
+                            tainted_params='*', description='已跟入内联分析'))
     return callees
 
 
