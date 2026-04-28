@@ -172,7 +172,48 @@ def _find_dataflow_file(worker_cwd: str, function_name: str = "") -> str:
     return str(candidates[0]) if candidates else ""
 
 
-def _get_best_output(worker: WorkerResult) -> str:
+def _read_tainted_list(worker_cwd: str) -> list[CalleeRef]:
+    """读取 Worker 写入的 tainted.list 文件，返回 CalleeRef 列表。
+
+    每行格式: 文件路径###Class::FuncName###L行号###污点形参
+    """
+    callees: list[CalleeRef] = []
+    cwd = Path(worker_cwd)
+    # 搜索所有 workspace 子目录下的 tainted.list
+    candidates = list(cwd.glob("tainted.list")) + list(cwd.rglob("tainted.list"))
+    if not candidates:
+        return []
+    # 取最新的
+    candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    tainted_file = candidates[0]
+    try:
+        content = tainted_file.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return []
+    for raw_line in content.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split("###")
+        if len(parts) < 2:
+            continue
+        fpath  = parts[0].strip() if parts[0].strip() not in ("-", "") else ""
+        fname  = parts[1].strip() if len(parts) > 1 else ""
+        fline  = parts[2].strip() if len(parts) > 2 else ""
+        fparam = parts[3].strip() if len(parts) > 3 else "*"
+        if not fname or fname in _STDLIB_SKIP:
+            continue
+        # 清理函数名: 去尾括号
+        fname = re.sub(r'\(.*', '', fname).strip()
+        if fparam == "*":
+            fparam = ""
+        callees.append(CalleeRef(
+            function_name=fname, file=fpath, line=fline,
+            tainted_params=fparam, description=""))
+    return callees
+
+
+
     """获取最佳 Worker 的输出:优先用 dataflow 文件,回退用 result 摘要。"""
     if worker.dataflow_file:
         try:
@@ -1047,7 +1088,11 @@ class Orchestrator:
 
             # ── 解析 callee 并加入队列 ─────────────────────────────────────
             if dep < max_depth and result.final_output:
-                callees = _parse_callees(result.final_output)
+                # 优先读取 tainted.list，无则 fallback 到解析 dataflow 文件
+                worker_cwd = str(Path(os.path.abspath(task_cfg.output_dir)) / tid)
+                callees = _read_tainted_list(worker_cwd)
+                if not callees:
+                    callees = _parse_callees(result.final_output)
                 target_dir = os.path.abspath(task_cfg.cwd)
                 valid: list[CalleeRef] = []
                 for callee in callees:

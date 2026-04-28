@@ -74,9 +74,9 @@
 └── [L272] SetCommissioningData(tlvs,length) 📎 见跟入列表
 ```
 
-## 阶段四:使用 `write` 工具写入报告文件
+## 阶段四：使用 `write` 工具写入两个文件
 
-按以下格式写入 `dataflow-<函数名>.md`(**当前工作目录根目录**):
+### 4a. 数据流报告 `dataflow-<函数名>.md`（当前工作目录根目录）
 
 ```markdown
 # 数据流追踪:<函数名>
@@ -90,36 +90,39 @@
 
 ### INPUT-1: <变量名> (<类型>) 🔴 TAINTED
 ├── [L<行号>] `<代码片段>` → <结果变量> 🔴 TAINTED(<说明>)
-│   ├── [L<行号>] 调用: <函数名>(污染参数) → 📎 见子函数跟入列表
+│   ├── [L<行号>] 调用: <函数名>(污染参数) → 📎 见 tainted.list
 │   └── [L<行号>] → 🟡 EXPORT / 📌 USED / 🟢 CLEANED
 └── [L<行号>] → ...
-
-## 需要跟入的函数调用
-
-> **只列实际接收污点参数的函数**，条件判断/纯getter/日志函数不写。
-> 函数名使用 `Class::Method` 全限定名；不确定类名时先 grep 确认。
-
-| 函数名 | 文件 | 调用位置 | 污染参数 | 说明 |
-|--------|------|---------|---------|------|
-| Message::Read | common/message.cpp | L210 | aOffset🔴,aLength🔴 | 读消息数据 |
-| LeaderBase::SetCommissioningData | network_data_leader.cpp | L272 | aValue🔴,aValueLength🔴 | 写网络数据 |
-
-> **污染参数列必填被调用函数的形参名**（如 `aOffset`, `aLength`），不得写描述文字。
-
-## 数据处理函数清单
-| 函数名 | 文件位置 | 接收的脏数据 | 参数位置 | 作用 |
-|--------|---------|-------------|---------|------|
 
 ## 污点终点汇总
 | 脏数据 | 终点类型 | 位置 | 说明 |
 |--------|---------|------|------|
-
-## 自检报告
-- 遗漏检查: 是否每条路径都到达终点
-- 函数覆盖: 已覆盖X个函数调用
 ```
 
-> ⚠️ 文件写到**工作目录根目录**,直接 `write dataflow-<函数名>.md`,不加任何路径前缀,源码目录只读。
+### 4b. 跟入列表 `tainted.list`（**系统必读，格式严格**）
+
+每行一个需要递归分析的子函数，格式：
+
+```
+文件路径###Class::FuncName###L行号###污点形参1,污点形参2
+```
+
+**字段规则**：
+- `文件路径`：相对工作目录的路径（如 `src-vul/openthread/src/core/common/message.cpp`），不确定填 `-`
+- `Class::FuncName`：全限定名，不确定类名先 `bash grep -rn "FuncName" src-vul/` 确认
+- `L行号`：调用行号（如 `L245`），不确定填 `-`
+- `污点形参`：被调函数的**形参名**（逗号分隔），不确定填 `*`
+
+**示例**：
+```
+src-vul/openthread/src/core/common/message.cpp###Message::Read###L245###aOffset,aLength
+src-vul/openthread/src/core/thread/network_data_leader.cpp###LeaderBase::SetCommissioningData###L301###aValue,aValueLength
+src-vul/openthread/src/core/meshcop/meshcop_tlvs.hpp###MeshCoP::Tlv::GetNext###L119###*
+```
+
+**只写实际接收污点的函数**；条件判断/getter/标准库/日志一律不写。
+
+> ⚠️ 两个文件都写到**当前工作目录根目录**，不加任何路径前缀，`src-vul/` 只读。
 
 ---
 
