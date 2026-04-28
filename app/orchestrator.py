@@ -194,6 +194,7 @@ def _parse_callees(dataflow_content: str) -> list[CalleeRef]:
     line_col = -1
     param_col = -1
     desc_col = -1
+    skip_col  = -1  # “是否需要跟入”列
 
     for line in dataflow_content.split(chr(10)):
         stripped = line.strip()
@@ -227,6 +228,9 @@ def _parse_callees(dataflow_content: str) -> list[CalleeRef]:
                 is_header = True
             elif lc in ("序号", "no", "#", "idx", "index"):
                 is_header = True  # 序号列不是函数名列
+            elif "是否" in lc or "需要跟" in lc or "track" in lc or "follow" in lc:
+                skip_col = i
+                is_header = True
             elif lc in ("文件", "file"):
                 file_col = i
             elif "调用位置" in lc or "行号" in lc or "line" in lc or "call" in lc:
@@ -243,6 +247,12 @@ def _parse_callees(dataflow_content: str) -> list[CalleeRef]:
             func_col = 0
 
         # 提取各字段
+        # 跳过明确标注不需要跟入的行（包含 ❌ / 否）
+        if 0 <= skip_col < len(cells):
+            sv = cells[skip_col].strip()
+            if "❌" in sv or "否" in sv or sv.lower() in ("no", "false", "0", "不"):
+                continue
+
         fname = cells[func_col] if func_col < len(cells) else ""
         # 清理函数名：去掉反引号、-> 或 . 前缀的对象名
         fname = fname.strip('`').strip()
@@ -977,14 +987,12 @@ class Orchestrator:
                     ctx_base = ctx_base.split("# 调用者传入的脏数据")[0].strip()
                 task_cfg.context = ctx_base + "\n\n# 调用者传入的脏数据\n" + taint_ctx
 
-            # ── 解析本函数的污点参数列表 ──────────────────────────────────
-            # 从 task_cfg.task 提取 "外部输入参数（已污染）为：X,Y,Z"
+            # ── 解析污点参数列表 ──────────────────────────────────────────
             _taint_match = re.search(r'外部输入参数.*?为[：:]\s*([^\n]+)', task_cfg.task or "")
             _taint_list: list[str] = []
             if _taint_match:
                 _taint_list = [t.strip() for t in _taint_match.group(1).split(',') if t.strip()]
             if not _taint_list:
-                # fallback: taint_ctx 中的污染参数
                 _tc_match = re.search(r'污染参数[：:]\s*([^\n]+)', taint_ctx or "")
                 if _tc_match:
                     _taint_list = [t.strip() for t in _tc_match.group(1).split(',') if t.strip()]
@@ -994,67 +1002,59 @@ class Orchestrator:
             # dataflow 输出目录
             df_dir = root_out_dir / "dataflow"
             df_dir.mkdir(exist_ok=True)
+            safe_func = re.sub(r'[^A-Za-z0-9_:.-]', '_', func_name)
 
-            # ── 每个污点单独 execute，输出 dataflow/funcname-taint.md ──────
-            per_taint_results: list[TaskResult] = []
-            for taint_name in _taint_list:
-                # 构建单污点任务配置
-                st_cfg = task_cfg.model_copy(deep=True)
-                safe_taint = re.sub(r'[^A-Za-z0-9_]', '_', taint_name)
-                safe_func  = re.sub(r'[^A-Za-z0-9_:.-]', '_', func_name)
-                st_cfg.task = (
-                    f"对 {st_cfg.source_file} 的 {func_name} 函数进行静态污点分析。\n"
-                    f"**本次只追踪单个污点参数：{taint_name}**\n"
-                    f"忽略其他参数，专注追踪 {taint_name} 的完整传播路径。\n"
-                    f"输出文件名：dataflow-{func_name}-{safe_taint}.md"
-                )
-                st_cfg.function_name = func_name  # keep original for file search
-
-                st_tid = tid + f"-t-{safe_taint[:20]}"
-                st_orch = Orchestrator(config=st_cfg, on_event=self.on_event)
-                st_result = await st_orch.execute(st_tid, archive=False, depth=dep, max_depth=max_depth)
-
-                # 读取 dataflow 文件（Worker 可能用不同文件名）
-                st_out_dir = Path(os.path.abspath(st_cfg.output_dir)) / st_tid
-                # 优先找 funcname-taint.md
-                st_df_path = _find_dataflow_file(st_out_dir, f"{func_name}-{safe_taint}")
-                if not st_df_path:
-                    st_df_path = _find_dataflow_file(st_out_dir, func_name)
-                if st_df_path:
-                    try:
-                        df_text = Path(st_df_path).read_text(encoding="utf-8")
-                        if len(df_text.strip()) > len((st_result.final_output or "").strip()):
-                            st_result.final_output = df_text
-                    except OSError:
-                        pass
-
-                # 保存到 dataflow/funcname-taint.md
-                if st_result.final_output:
-                    dest = df_dir / f"{safe_func}-{safe_taint}.md"
-                    try:
-                        dest.write_text(st_result.final_output, encoding="utf-8")
-                        sub_dataflow_files.append((f"{func_name}[{taint_name}]", str(dest)))
-                    except OSError:
-                        pass
-
-                per_taint_results.append(st_result)
-
-            # ── 合并所有污点分析结果 ──────────────────────────────────────
-            # 取最长的内容作为主 final_output（含 callee 表格的那份）
-            combined = max(per_taint_results,
-                           key=lambda r: len(r.final_output or ""),
-                           default=per_taint_results[0] if per_taint_results else None)
-            result = combined or TaskResult(task_id=tid, status=TaskStatus.FAILED)
-
-            # 同时保存合并版到 dataflow/funcname.md（供 callee 解析使用）
-            all_taint_text = "\n\n---\n\n".join(
-                r.final_output for r in per_taint_results if r.final_output
+            # ── 单次 execute，多阶段 task prompt（同一 session 内完成所有污点分析）──
+            # 构建分阶段 task：阶读源码→逐污点分析→写报告
+            taint_steps = "\n".join(
+                f"### 阶段{i+2}：追踪污点参数 `{t}`\n"
+                f"只追踪 `{t}` 的传播路径，标记所有接收 `{t}` 的函数调用（排除条件判断函数）。"
+                for i, t in enumerate(_taint_list)
             )
-            if all_taint_text:
-                merged_dest = df_dir / f"{safe_func}.md"
+            taint_names = "、".join(f"`{t}`" for t in _taint_list)
+            final_step_idx = len(_taint_list) + 2
+
+            task_cfg.task = (
+                f"对 {src_file} 的 {func_name} 函数进行静态污点分析，"
+                f"污点参数为：{taint_names}\n\n"
+                f"## 工作流程（严格按阶段顺序执行）\n\n"
+                f"### 阶段1：阅读源码\n"
+                f"使用 `read` 或 `bash extract_func` 读取 {func_name} 函数的完整代码。\n\n"
+                f"{taint_steps}\n\n"
+                f"### 阶段{final_step_idx}：汇总并写入报告\n"
+                f"综合以上各污点分析，使用 `write` 工具写入 `dataflow-{func_name}.md`。\n"
+                f"报告必须包含：\n"
+                f"- 每个污点的数据流树状图\n"
+                f"- `## 需要跟入的函数调用` 表格（**只列接收了污点参数的函数**，条件判断/纯getter不列）\n"
+                f"- `是否需要跟入` 列：不接收污点参数的函数填 `❌ 否`\n\n"
+                f"## 交付清单（write 前逐项确认）\n"
+                f"- [ ] `## 需要跟入的函数调用` 表格已填写（哪怕空表也要有表头）\n"
+                f"- [ ] 表格里每行的 `是否需要跟入` 列已填写 ✅/❌\n"
+                f"- [ ] `write` 工具已调用，文件名 `dataflow-{func_name}.md`\n"
+                f"- [ ] `<result>...</result>` 已包裹摘要"
+            )
+
+            # 执行（单次 execute，单会话内多轮直到 Judge 通过）
+            orch = Orchestrator(config=task_cfg, on_event=self.on_event)
+            result = await orch.execute(tid, archive=False, depth=dep, max_depth=max_depth)
+
+            # 读取 dataflow 文件更新 final_output
+            out_dir = Path(os.path.abspath(task_cfg.output_dir)) / tid
+            df_path = _find_dataflow_file(out_dir, func_name)
+            if df_path:
                 try:
-                    merged_dest.write_text(all_taint_text, encoding="utf-8")
-                    result.final_output = all_taint_text
+                    df_text = Path(df_path).read_text(encoding="utf-8")
+                    if len(df_text.strip()) > len((result.final_output or "").strip()):
+                        result.final_output = df_text
+                except OSError:
+                    pass
+
+            # 保存 dataflow/funcname.md（供 callee 解析 + merge）
+            if result.final_output:
+                dest = df_dir / f"{safe_func}.md"
+                try:
+                    dest.write_text(result.final_output, encoding="utf-8")
+                    sub_dataflow_files.append((func_name, str(dest)))
                 except OSError:
                     pass
 

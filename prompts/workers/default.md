@@ -19,6 +19,11 @@
 
 > ⚠️ **标准C/C++库函数禁止加入跟入列表**：`memcpy`、`memset`、`malloc`、`free`、`strlen`、`strcpy`、`strcmp`、`printf`、`sprintf`等直接标记为 `🟡 EXPORT`。
 
+> ⚠️ **以下函数不得列入跟入表**：
+> - 条件判断函数（如 `GetRole()`、`IsLeader()`、`GetState()` 等 getter 用于 if 判断）：不接收污点参数，填 `❌ 否`
+> - 纯 getter 方法（只返回成员变量，无污点输入）：不得列入，标记为 `📤 USED`
+> - 日志/调试函数：不得列入
+
 ## 当前分析范围
 
 你只需分析**当前函数本身的代码**，子函数由系统自动递归分析。
