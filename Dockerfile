@@ -28,7 +28,8 @@ RUN mkdir -p /root/.pi/agent/bin \
     # 将 write-dataflow skill 安装到 pi 全局发现目录
     # ~/.pi/agent/skills/ 是 pi 全局 skill 目录，任何 cwd 都能发现
     && mkdir -p /root/.pi/agent/skills \
-    && ln -sf /opt/data_flow_analyse/skills/write-dataflow /root/.pi/agent/skills/write-dataflow
+    && ln -sf /opt/data_flow_analyse/skills/write-dataflow /root/.pi/agent/skills/write-dataflow \
+    && ln -sf /opt/data_flow_analyse/skills/write-taint-flow /root/.pi/agent/skills/write-taint-flow
 
 # ═══ 预装 ripgrep（pi grep 工具依赖）═══════════════════════════════════════════
 # pi 首次使用 grep 工具时会尝试从外网下载 ripgrep，服务器无外网时会卡死。
