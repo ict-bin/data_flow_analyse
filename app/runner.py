@@ -301,6 +301,12 @@ async def run_agent(
     内层：API 级重试（连接超时、限流、服务器错误）
     致命：Model not found / Unauthorized → 不重试，result.fatal=True
     """
+    # DRYRUN 模式：不调模型，写入模拟文件，验证控制流
+    if os.environ.get('DRYRUN') == '1':
+        from .dryrun import run_agent_dryrun as _dr
+        return await _dr(prompt, cwd=cwd, session_file=session_file,
+                         post_skill_prompt=post_skill_prompt,
+                         on_stream=on_stream)
     try:
         pi_cmd = _find_pi_command()
     except FileNotFoundError as e:
