@@ -231,9 +231,15 @@ def _parse_callees(dataflow_content: str) -> list[CalleeRef]:
                 file_col = i
             elif "调用位置" in lc or "行号" in lc or "line" in lc or "call" in lc:
                 line_col = i
-            elif "污染" in lc or "taint" in lc or "参数" in lc:
+            elif lc in ("污染参数", "污点参数", "已污染参数", "tainted", "tainted params",
+                        "tainted_params", "taint params", "污染实参"):
                 param_col = i
-            elif "说明" in lc or "desc" in lc:
+            elif "taint" in lc and "param" in lc:
+                param_col = i
+            elif "说明" in lc or "备注" in lc or "原因" in lc or "desc" in lc or "remark" in lc:
+                desc_col = i
+            elif "数据" in lc and ("传播" in lc or "流动" in lc):
+                # “污染数据传播” 等列无法用于识别参数名，当作 desc
                 desc_col = i
         if is_header:
             continue

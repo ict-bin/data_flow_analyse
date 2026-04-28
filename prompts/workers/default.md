@@ -104,6 +104,8 @@
 | Message::Read | common/message.cpp | L210 | aOffset🔴,aLength🔴 | 读消息数据 |
 | LeaderBase::SetCommissioningData | network_data_leader.cpp | L272 | aValue🔴,aValueLength🔴 | 写网络数据 |
 
+> **污染参数列必填被调用函数的形参名**（如 `aOffset`, `aLength`），不得写描述文字。
+
 ## 数据处理函数清单
 | 函数名 | 文件位置 | 接收的脏数据 | 参数位置 | 作用 |
 |--------|---------|-------------|---------|------|
