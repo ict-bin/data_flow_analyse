@@ -794,21 +794,6 @@ class Orchestrator:
                                 f"[F2] dataflow 文件内容不包含目标函数名 '{cfg.function_name}',"
                                 f"可能分析了错误的函数\n     请确认分析的是 {cfg.source_file} 中的 {cfg.function_name}"
                             )
-                        # 检查是否包含 callee 表格 或 tainted.list 文件
-                        _tainted_list_exists = bool(
-                            list((Path(os.path.abspath(cfg.output_dir)) /
-                                  task_id).glob("workspace-worker-*/tainted.list"))
-                        )
-                        _has_callee_section = any(
-                            kw in df_content for kw in ["函数调用", "callee", "跟入", "跟进",
-                                                         "已跟入", "无需跟", "无子函数",
-                                                         "不需要跟", "tainted.list"]
-                        )
-                        if not _tainted_list_exists and not _has_callee_section:
-                            df_issues.append(
-                                "[F3] dataflow 文件缺少函数调用跟入表格(或 tainted.list)，\n"
-                                "     即使无需跟入任何子函数，也请写明：’无需跟入子函数’"
-                            )
                     self._emit("worker_done", task_id, worker_id=wid,
                                output=output[:500],
                                dataflow_found=bool(df_file) and not df_issues,

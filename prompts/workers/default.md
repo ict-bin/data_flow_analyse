@@ -76,50 +76,52 @@
 └── [L272] SetCommissioningData(tlvs,length) 📎 见跟入列表
 ```
 
-## 阶段四：使用 `write` 工具写入两个文件
+## 阶段四：调用专用工具输出结果（**两个工具都必须调用**）
 
-### 4a. 数据流报告 `dataflow-<函数名>.md`（当前工作目录根目录）
+> ❗️ 不要用 `write` 工具直接写文件——必须通过以下专用工具，系统会验证工具调用记录。
 
-```markdown
-# 数据流追踪:<函数名>
+### 步骤1：调用 `gen_dataflow` 写入数据流报告
+
+```bash
+bash gen_dataflow "FuncName" <<'REPORT'
+# 数据流追踪: FuncName
 
 ## 函数信息
-- 文件: <路径>
-- 行号: L<起>-L<止>
-- 签名: `<完整函数签名>`
+- 文件: src-vul/openthread/.../foo.cpp
+- 行号: L228-L282
+- 签名: `ReturnType FuncName(Type arg1, ...)`
 
 ## 数据流树状图
 
-### INPUT-1: <变量名> (<类型>) 🔴 TAINTED
-├── [L<行号>] `<代码片段>` → <结果变量> 🔴 TAINTED(<说明>)
-│   ├── [L<行号>] 调用: <函数名>(污染参数) → 📎 见 tainted.list
-│   └── [L<行号>] → 🟡 EXPORT / 📌 USED / 🟢 CLEANED
-└── [L<行号>] → ...
+### INPUT-1: paramName (Type) 🔴 TAINTED
+├── [L230] `code` → result 🔴 TAINTED
+│   └── [L240] SubFunc(result) → 📎 见 tainted.list
+└── [L280] 📌 USED
 
 ## 污点终点汇总
 | 脏数据 | 终点类型 | 位置 | 说明 |
 |--------|---------|------|------|
+| paramName | 📌 USED | L280 | 传递给子函数 |
+REPORT
 ```
 
-### 4b. 跟入列表 `tainted.list`（可选但强烈推荐，比报告表格更准确）
+### 步骤2：调用 `gen_tainted_list` 写入跟入列表
 
-如果你能确认需要跟入的函数及其形参，请写入 `tainted.list`，格式：
+每行一个需要递归分析的子函数（**只写实际接收污点参数的函数**）：
 
-```
-文件路径###Class::FuncName###L行号###污点形参1,污点形参2
-```
-
-示例：
-```
+```bash
+bash gen_tainted_list <<'CALLEES'
 src-vul/openthread/src/core/common/message.cpp###Message::Read###L245###aOffset,aLength
-src-vul/openthread/src/core/thread/network_data_leader.cpp###LeaderBase::SetCommissioningData###L301###aValue,aValueLength
+-###LeaderBase::SetCommissioningData###L301###aValue,aValueLength
+CALLEES
 ```
 
-字段不确定时：文件路径填 `-`，参数列表填 `*`。
-**只写实际接收污点参数的函数**，getter/条件判断/标准库不写。
-如果无任何子函数需要跟入，写一个空文件或写明 `# 无需跟入子函数`。
+如果是叶函数（无需跟入任何子函数），空输入也必须调用：
+```bash
+echo "" | bash gen_tainted_list
+```
 
-> ⚠️ 两个文件都写到**当前工作目录根目录**，不加任何路径前缀，`src-vul/` 只读。
+**字段规则**：文件路径不确定填 `-`，行号不确定填 `-`，参数不确定填 `*`。
 
 ---
 
@@ -128,8 +130,8 @@ src-vul/openthread/src/core/thread/network_data_leader.cpp###LeaderBase::SetComm
 收到 Judge 反馈后:
 1. 仔细阅读具体问题
 2. 重新追踪遗漏的路径
-3. **重新执行 `write` 工具覆盖更新文件**
+3. **重新调用 `gen_dataflow` 和 `gen_tainted_list` 覆盖更新文件**
 
 # 最终交付
 
-用 `<result>...</result>` 包裹摘要:已写入文件名 + 发现的 callee 数量。
+用 `<result>...</result>` 包裹摘要：已写入的文件名 + tainted.list 条目数。
