@@ -754,12 +754,24 @@ class Orchestrator:
                         "cwd": worker_cwds[i],
                         "thinking_level": acfg.thinking_level or cfg.workers.default_thinking_level,
                         "session_file": worker_sessions[i],
-                        # RPC 第二轮：分析完成后强制调用 write-dataflow skill
+                        # RPC 第二轮：分析完成后强制写入 tainted.list
                         "post_skill_prompt": (
-                            "Now execute the write-dataflow skill output steps:\n"
-                            "1. Call gen_dataflow with your complete analysis\n"
-                            "2. Call gen_tainted_list with the callee list\n"
-                            "Run /skill:write-dataflow and follow its instructions."
+                            "Based on your taint analysis above, now write the tainted.list file.\n\n"
+                            "Use the **write** tool to create `tainted.list` in the current directory.\n"
+                            "Format — one line per callee function that receives tainted parameters:\n\n"
+                            "```\n"
+                            "file_path###Class::FuncName###L_line###param1,param2\n"
+                            "```\n\n"
+                            "Rules:\n"
+                            "- Only functions where tainted data flows IN as arguments\n"
+                            "- NO getters, condition checks, logging, or stdlib functions\n"
+                            "- file_path: path relative to workspace root (e.g. src-vul/openthread/...)\n"
+                            "- Class::FuncName: fully qualified name\n"
+                            "- params: the CALLEE's formal parameter names (not caller's variable names)\n"
+                            "- Unknown field: use `-` for path/line, `*` for params\n\n"
+                            "If no functions need follow-up (leaf function), write:\n"
+                            "`# no callees`\n\n"
+                            "Write ONLY tainted.list — do not rewrite the dataflow file."
                         ),
                         "cancel_event": self._cancel_event,
                         "max_retries": cfg.agent_max_retries,
