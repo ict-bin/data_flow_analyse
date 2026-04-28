@@ -5,8 +5,8 @@
 # 工作方式
 
 你的工作目录中已准备好以下文件，**你必须使用 `read` 工具逐一读取**：
-- `{worker_id}-output.md` — Worker 的摘要输出
-- `{worker_id}-dataflow.md` — Worker 生成的完整数据流树状图文档
+- `{worker_id}-dataflow.md` — Worker 生成的完整数据流分析文档（评审唯一依据）
+
 
 **在评审比较阶段**，你的工作目录还会有：
 - `eval-{worker_id}.md` — 你之前对每个 Worker 的评审结果

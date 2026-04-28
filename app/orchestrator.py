@@ -1365,9 +1365,7 @@ class Orchestrator:
         # ═══ 步骤0：准备 Worker 输出文件（放入 Judge 工作目录）═══
 
         for w in round_workers:
-            # 摘要输出
-            (j_dir / f"{w.worker_id}-output.md").write_text(
-                w.output, encoding="utf-8")
+            # dataflow 文件放入 Judge 工作目录（output.md 不放入，避免冗余干扰）
             # dataflow 文件
             df_dst = j_dir / f"{w.worker_id}-dataflow.md"
 
@@ -1531,11 +1529,9 @@ class Orchestrator:
 
         parts.append(
             f"## {worker.worker_id}'s Output Files\n\n"
-            f"注意: 以下是归档文件名（不是 Worker 创建的原始文件名），**请勿按存档名评判文件命名是否正确**：\n"
-            f"- Worker 摘要输出（`{output_path}`）\n"
-            f"- Worker 数据流分析文档（`{dataflow_path}`）\n\n"
-            f"**请使用 read 工具读取以上两个文件，然后进行评测。"
-            f"评判文件命名时应以文件内容中的函数名为准，不需关注存档路径名。**"
+            f"`{dataflow_path}` 是 Worker 生成的数据流分析文档（归档名，非原始文件名）。\n\n"
+            f"**请使用 read 工具读取该文件，然后进行评测。**\n"
+            f"评判时以文件内容为准，不需关注存档路径名。"
         )
 
         parts.append(
