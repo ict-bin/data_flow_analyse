@@ -117,6 +117,7 @@ src-vul/openthread/src/core/thread/network_data_leader.cpp###LeaderBase::SetComm
 
 字段不确定时：文件路径填 `-`，参数列表填 `*`。
 **只写实际接收污点参数的函数**，getter/条件判断/标准库不写。
+如果无任何子函数需要跟入，写一个空文件或写明 `# 无需跟入子函数`。
 
 > ⚠️ 两个文件都写到**当前工作目录根目录**，不加任何路径前缀，`src-vul/` 只读。
 
