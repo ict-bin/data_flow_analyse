@@ -268,6 +268,14 @@ def _parse_callees(dataflow_content: str) -> list[CalleeRef]:
         fparam = cells[param_col] if 0 <= param_col < len(cells) else ""
         fdesc = cells[desc_col] if 0 <= desc_col < len(cells) else ""
 
+        # 双重校验：如果“污染参数”列明确为空/无，说明未有污点流入，跳过
+        # （补充 Worker 提示词的防线）
+        if param_col >= 0 and fparam:
+            param_lower = fparam.lower().strip('` ')
+            if param_lower in ("无", "none", "null", "不传入污点", "no taint",
+                               "无污点", "无直接污点", "-", "—"):
+                continue
+
         # 过滤外部函数
         all_cols = " ".join(cells)
         if "未找到定义" in all_cols or "EXPORT" in all_cols.upper() or "extern" in all_cols.lower():
