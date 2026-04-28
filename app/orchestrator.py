@@ -1531,9 +1531,11 @@ class Orchestrator:
 
         parts.append(
             f"## {worker.worker_id}'s Output Files\n\n"
-            f"Worker 的摘要输出文件: `{output_path}`\n"
-            f"Worker 的数据流分析文档: `{dataflow_path}`\n\n"
-            f"**请使用 read 工具读取以上两个文件，然后进行评测。**"
+            f"注意: 以下是归档文件名（不是 Worker 创建的原始文件名），**请勿按存档名评判文件命名是否正确**：\n"
+            f"- Worker 摘要输出（`{output_path}`）\n"
+            f"- Worker 数据流分析文档（`{dataflow_path}`）\n\n"
+            f"**请使用 read 工具读取以上两个文件，然后进行评测。"
+            f"评判文件命名时应以文件内容中的函数名为准，不需关注存档路径名。**"
         )
 
         parts.append(
