@@ -96,9 +96,13 @@
 
 ## 需要跟入的函数调用
 
+> **只列实际接收污点参数的函数**，条件判断/纯getter/日志函数不写。
+> 函数名使用 `Class::Method` 全限定名；不确定类名时先 grep 确认。
+
 | 函数名 | 文件 | 调用位置 | 污染参数 | 说明 |
 |--------|------|---------|---------|------|
-| SetCommissioningData | network_data_leader.cpp | L272 | tlvs🔴,length🔴 | 写入网络数据 |
+| Message::Read | common/message.cpp | L210 | aOffset🔴,aLength🔴 | 读消息数据 |
+| LeaderBase::SetCommissioningData | network_data_leader.cpp | L272 | aValue🔴,aValueLength🔴 | 写网络数据 |
 
 ## 数据处理函数清单
 | 函数名 | 文件位置 | 接收的脏数据 | 参数位置 | 作用 |
