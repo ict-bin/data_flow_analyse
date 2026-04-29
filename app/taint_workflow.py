@@ -383,7 +383,8 @@ class PerTaintWorkflow:
     def _emit(self, etype: str, **data):
         if self.on_event:
             try:
-                self.on_event(etype, self.task_id, **data)
+                from .models import SwarmEvent
+                self.on_event(SwarmEvent(type=etype, task_id=self.task_id, data=data))
             except Exception:
                 pass
 

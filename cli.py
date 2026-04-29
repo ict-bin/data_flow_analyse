@@ -171,12 +171,17 @@ class CliRenderer:
             self._slots.append(task_id)
         self._refresh(task_id)
 
-    def _refresh(self, task_id: str):
+    def _refresh(self, task_id: str, force: bool = False):
+        """TTY: ANSI redraw. non-TTY: append status line only when force=True."""
         fs = self._fstate.get(task_id)
-        if fs:
+        if not fs:
+            return
+        if self._tty:
             self._slot_text[task_id] = fs.line()
-        self._clr()
-        self._draw()
+            self._clr()
+            self._draw()
+        elif force:
+            print(fs.line(ts=True), flush=True)
 
     def _commit(self, task_id: str):
         fs = self._fstate.get(task_id)
