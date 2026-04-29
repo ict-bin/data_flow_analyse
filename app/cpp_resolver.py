@@ -122,6 +122,55 @@ def _resolve_cpp_name(target_dir: str, raw_name: str,
     return (method, '')
 
 
+def _get_definition_line(target_dir: str, function_name: str, file_hint: str = "") -> str:
+    """返回函数定义的起始行号，格式 'L123'。
+    优先在 file_hint 文件中搜索；失败则全局搜索。
+    找不到时返回空字符串。
+    """
+    import subprocess, os, re
+    method = function_name.split('::')[-1]
+    pat = re.escape(method) + r'\s*\('
+
+    def _search_file(fpath: str) -> str:
+        try:
+            r = subprocess.run(['grep', '-nP', pat, fpath],
+                               capture_output=True, text=True, timeout=5)
+            for ln in r.stdout.strip().split('\n'):
+                if not ln:
+                    continue
+                lineno, _, code = ln.partition(':')
+                # 跳过声明（无大括号、含 extern/;）
+                if re.search(r';\s*$', code.strip()) and '{' not in code:
+                    continue
+                if 'extern' in code:
+                    continue
+                return 'L' + lineno.strip()
+        except (subprocess.TimeoutExpired, OSError):
+            pass
+        return ''
+
+    if file_hint:
+        full = os.path.join(target_dir, file_hint)
+        if os.path.isfile(full):
+            hit = _search_file(full)
+            if hit:
+                return hit
+
+    exts = ['--include=*.cpp', '--include=*.cc', '--include=*.cxx', '--include=*.c']
+    try:
+        r = subprocess.run(['grep', '-rlnP'] + exts + [pat, target_dir],
+                           capture_output=True, text=True, timeout=5)
+        for f in r.stdout.strip().split('\n'):
+            if not f or '/usr/' in f:
+                continue
+            hit = _search_file(f)
+            if hit:
+                return hit
+    except (subprocess.TimeoutExpired, OSError):
+        pass
+    return ''
+
+
 def _function_has_definition(target_dir: str, function_name: str) -> bool:
     import subprocess
     if function_name in _STDLIB_SKIP:

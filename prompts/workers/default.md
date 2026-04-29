@@ -64,6 +64,16 @@
 | 传入外部库函数 | 🟡 EXPORT |
 | 函数最终消费 | 📌 USED |
 
+**⚠️ 必须额外标记以下高危模式**（即使不是子函数调用也要标注 `⚠️ DIRECT_SINK`）：
+
+| 高危模式 | 标注方法 |
+|---------|----------|
+| `memcpy(dst, src, n)` 其中 n 或 src/dst 由污点控制 | `⚠️ DIRECT_SINK: memcpy 大小/指针受污点控制` |
+| `static_cast<uint8_t>(uint16_t_var)` 类型截断 | `⚠️ DIRECT_SINK: uint16_t→uint8_t 截断，高字节丢失` |
+| `for(cur=...; cur<end; cur=cur->GetNext())` 中 GetNext() 步长来自污点数据 | `⚠️ DIRECT_SINK: TLV GetNext() 越界风险，length 字段可控` |
+| `buf + tainted_offset` 指针运算 | `⚠️ DIRECT_SINK: 污点偏移量控制指针` |
+| `buf[tainted_index]` 数组下标 | `⚠️ DIRECT_SINK: 污点下标，越界读写风险` |
+
 ## 阶段三:整理传播路径图与跟入表格
 
 将阶段二的追踪结果整理为树状图:

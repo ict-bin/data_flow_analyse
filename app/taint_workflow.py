@@ -151,6 +151,11 @@ def _build_taint_prompt(param: str, func_name: str,
         + "Requirements:" + chr(10)
         + "- Trace every use of `" + param + "` line-by-line" + chr(10)
         + "- Mark derived variables with 🔴 TAINTED" + chr(10)
+        + "- **DIRECT SINK**: flag dangerous operations in THIS function body using `"
+            + param + "` or derived values DIRECTLY:" + chr(10)
+        + "  e.g. memcpy/strcpy/sprintf with tainted size or pointer, tainted array index," + chr(10)
+        + "  integer truncation (uint16_t→uint8_t cast), loop bounds from tainted length." + chr(10)
+        + "  Mark these ⚠️ DIRECT_SINK even if not a sub-function call." + chr(10)
         + "- Identify sub-function calls receiving `" + param + "` or derived values" + chr(10)
         + "- Do NOT analyze sub-function internals" + chr(10)
         + "- Source provided -- **DO NOT use read/bash to open files**" + chr(10)*2
@@ -183,20 +188,28 @@ def _build_summary_prompt(func_name: str, taint_params: list[str],
     taint_files = ", ".join(
         f"`taint-flow-{_safe_param(p)}.md`" for p in taint_params
     )
+    valid_files = ", ".join(
+        f"taint-flow-{_safe_param(p)}.md" for p in taint_params
+    )
     fb_block = ""
     if rnd > 1 and feedback:
-        fb_block = f"\n\n# 上一轮反馈（针对汇总报告）\n\n{feedback}\n\n请修正汇总报告。"
+        fb_block = (chr(10)*2 + "# Round " + str(rnd) + " feedback (summary)" +
+                    chr(10)*2 + feedback + chr(10)*2 + "Please revise.")
     return (
-        f"<!-- {nonce} -->\n"
-        f"# 阶段三：汇总所有污点分析\n\n"
-        f"请读取以下各污点的分析文件并汇总：{taint_files}\n\n"
-        f"使用 `read` 工具依次读取每个文件，然后：\n"
-        f"1. 将所有污点传播路径合并到一份完整报告 `dataflow-{func_name}.md`\n"
-        f"2. 从各文件的「接收此污点的子函数」表格汇总 `tainted.list`\n\n"
-        f"**输出步骤（必须按顺序）：**\n"
-        f"1. 用 write 工具写入 `dataflow-{func_name}.md`\n"
-        f"2. 用 write 工具写入 `tainted.list`（格式：`file###Class::Func###L行号###形参`）"
-        f"{fb_block}"
+        "<!-- " + nonce + " -->" + chr(10)
+        + "# Phase 3: Merge all taint analyses for `" + func_name + "`" + chr(10)*2
+        + "Current function: `" + func_name + "` (file: `" + src_file + "`)" + chr(10)*2
+        + "Read the following **specific files only** (ignore all other .md files in directory):" + chr(10)
+        + taint_files + chr(10)*2
+        + "Use `read` tool for each, then:" + chr(10)
+        + "1. Merge all taint paths into `dataflow-" + func_name + ".md`" + chr(10)
+        + "2. From each file's callee table, generate `tainted.list`" + chr(10)*2
+        + "**IMPORTANT**: Only valid input files are: " + valid_files + chr(10)
+        + "Do NOT read any other .md or source files." + chr(10)*2
+        + "Output steps (must follow order):" + chr(10)
+        + "1. write tool -> `dataflow-" + func_name + ".md`" + chr(10)
+        + "2. write tool -> `tainted.list` (format: `file###Class::Func###L_line###params`)"
+        + fb_block
     )
 
 
@@ -420,6 +433,14 @@ class PerTaintWorkflow:
             rnd_workers_dir = rnd_dir / "workers"
             rnd_workers_dir.mkdir(exist_ok=True)
 
+            # 清除上一轮残留的 taint-flow-*.md，避免 summary session 读到错误文件
+            if rnd > 1:
+                for old_tf in self.ws.glob("taint-flow-*.md"):
+                    try:
+                        old_tf.unlink()
+                    except OSError:
+                        pass
+
             self._emit("round_start", round=rnd)
 
             # ── Phase 2: 并行 taint sessions（受 _taint_sem 并发限制）──────────
@@ -569,18 +590,33 @@ class PerTaintWorkflow:
                                  passed=False)
 
     def _ensure_tainted_list(self, df_content: str):
-        """如 tainted.list 未生成，从 dataflow 内容中提取。"""
+        """fallback: parse callees from dataflow doc, resolve file + defline."""
         from .orchestrator import _parse_callees as _pc
+        from .cpp_resolver import _resolve_cpp_name, _get_definition_line
         tl = self.ws / "tainted.list"
-        if not tl.exists() and df_content:
-            callees = _pc(df_content)
-            if callees:
-                lines = [f"{c.file or '-'}###{c.function_name}###{c.line or '-'}###{c.tainted_params or '*'}"
-                         for c in callees]
-                try:
-                    tl.write_text("\n".join(lines) + "\n", encoding="utf-8")
-                except OSError:
-                    pass
+        if tl.exists():
+            return
+        if not df_content:
+            return
+        callees = _pc(df_content)
+        if not callees:
+            return
+        target_dir = str(self.cfg.cwd)
+        out_lines = []
+        for c in callees:
+            qname, rfile = _resolve_cpp_name(target_dir, c.function_name, c.file or "")
+            if not rfile:
+                rfile = c.file or "-"
+            defline = _get_definition_line(target_dir, qname, rfile)
+            if not defline:
+                defline = c.line or "-"
+            params = c.tainted_params or "*"
+            out_lines.append(rfile + "###" + qname + "###" + defline + "###" + params)
+        try:
+            nl = chr(10)
+            tl.write_text(nl.join(out_lines) + nl, encoding="utf-8")
+        except OSError:
+            pass
 
     def _make_result(self, df_content: str, summary_result, passed: bool) -> TaskResult:
         from .models import TaskStatus

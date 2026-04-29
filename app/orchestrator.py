@@ -46,7 +46,7 @@ from .parsers import (
     _parse_summary_md,
     _STDLIB_SKIP,
 )
-from .cpp_resolver import _function_has_definition, _resolve_cpp_name
+from .cpp_resolver import _function_has_definition, _resolve_cpp_name, _get_definition_line
 from .prompt_builder import (
     _build_worker_prompt,
     _build_eval_prompt,
@@ -654,8 +654,12 @@ class Orchestrator(JudgeMixin):
                         f"污染参数: {callee.tainted_params}\n说明: {callee.description}"
                     )
                     sub_tid = tid + f"-d{dep + 1}-{callee.function_name[:25]}"
-                    sub_line_hint = callee.line if callee.line.startswith("L") else (
-                        "L" + callee.line.lstrip("L") if callee.line else "")
+                    sub_line_hint = _get_definition_line(
+                        target_dir, callee.function_name, sub_file)
+                    if not sub_line_hint:
+                        # fallback: 调用点行号（粗略）
+                        sub_line_hint = callee.line if callee.line.startswith("L") else (
+                            "L" + callee.line.lstrip("L") if callee.line else "")
                     await queue.put((callee.function_name, sub_file, sub_line_hint, sub_cfg,
                                      sub_tid, dep + 1, tainted_ctx_str))
 
