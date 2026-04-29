@@ -28,47 +28,90 @@ from typing import Optional
 
 # ─── 进度状态数据类 ──────────────────────────────────────────────────────────
 
+
+def _fmt_stat(t_in: int, t_out: int, secs: float) -> str:
+    """Format [Xs,i:NNK,o:NNK] stats tag."""
+    def k(n):
+        return f"{n//1000}K" if n >= 1000 else str(n)
+    if t_in == 0 and t_out == 0:
+        return f"[{secs:.0f}s]"
+    return f"[{secs:.0f}s,i:{k(t_in)},o:{k(t_out)}]"
+
+
 @dataclasses.dataclass
-class _RndState:
-    """单轮次进度：污点 session + summary + judge 结果。"""
-    num: int
-    # safe_param → "·"(运行中) | "✓"(完成)
-    taints: dict[str, str] = dataclasses.field(default_factory=dict)
-    summary: str = ""      # "" | "·" | "✓"
-    j_passed: Optional[bool] = None
-    j_score: Optional[int] = None
+class _TaintStat:
+    """Per-taint-param progress: status + timing + tokens."""
+    status: str = "·"   # · running  ✓ done
+    t0: float = dataclasses.field(default_factory=time.time)
+    secs: float = 0.0
+    tokens_in: int = 0
+    tokens_out: int = 0
 
     def fmt(self) -> str:
-        items = [f"{p}({s})" for p, s in self.taints.items()]
-        if self.summary:
-            items.append(f"Σ({self.summary})")
-        inner = ",".join(items) if items else "·"
-        r = f"R{self.num}({inner})"
+        if self.status == "✓" and (self.secs > 0 or self.tokens_in > 0):
+            return f"({self.status}){_fmt_stat(self.tokens_in, self.tokens_out, self.secs)}"
+        return f"({self.status})"
+
+
+@dataclasses.dataclass
+class _RndState:
+    """Per-round progress: taint sessions + summary + judge."""
+    num: int
+    taints: dict = dataclasses.field(default_factory=dict)  # safe_param -> _TaintStat
+    # summary
+    sum_status: str = ""     # "" | "·" | "✓"
+    sum_t0: float = 0.0
+    sum_secs: float = 0.0
+    sum_in: int = 0
+    sum_out: int = 0
+    # judge
+    j_passed: Optional[bool] = None
+    j_score: Optional[int] = None
+    j_secs: float = 0.0
+    j_in: int = 0
+    j_out: int = 0
+    j_t0: float = 0.0
+
+    def fmt(self) -> str:
+        # Taint parts
+        parts = [ts.fmt() for p, ts in self.taints.items()]
+        label = ",".join(f"{p}{ts.fmt()}" for p, ts in self.taints.items())
+        # Summary
+        if self.sum_status:
+            if self.sum_status == "✓" and (self.sum_secs > 0 or self.sum_in > 0):
+                label += f",Σ(✓){_fmt_stat(self.sum_in, self.sum_out, self.sum_secs)}"
+            else:
+                label += f",Σ({self.sum_status})"
+        r = f"R{self.num}({label})" if label else f"R{self.num}(·)"
+        # Round-level stats bracket (shown when summary done, before judge)
+        # Judge
         if self.j_passed is not None:
             j = "✓" if self.j_passed else f"✗{self.j_score or ''}"
-            r += f"-J{j}"
+            r += f"-J{j}{_fmt_stat(self.j_in, self.j_out, self.j_secs)}"
         return r
 
 
 @dataclasses.dataclass
 class _FuncState:
-    """一个函数的全部进度。"""
+    """Full progress for one function."""
     task_id: str
-    name: str           # 完整函数名
-    short: str          # 显示用短名 (≤16 chars)
+    name: str
+    short: str
     depth: int
-    rounds: list[_RndState] = dataclasses.field(default_factory=list)
-    final: str = ""     # "" | "✅" | "❌"
+    rounds: list = dataclasses.field(default_factory=list)  # list[_RndState]
+    final: str = ""
     t0: float = dataclasses.field(default_factory=time.time)
 
     @property
     def cur_round(self) -> Optional[_RndState]:
         return self.rounds[-1] if self.rounds else None
 
-    def line(self) -> str:
+    def line(self, ts: bool = False) -> str:
         hist = "→".join(r.fmt() for r in self.rounds)
         elapsed = f" {time.time()-self.t0:.0f}s"
-        return f"  {self.short:<16} {hist}{self.final}{elapsed}"
+        prefix = f"[{time.strftime('%H:%M:%S')}] " if ts else "  "
+        return f"{prefix}{self.short:<16} {hist}{self.final}{elapsed}"
+
 
 
 # ─── 美化 CLI 渲染器 ─────────────────────────────────────────────────────────
@@ -172,10 +215,11 @@ class CliRenderer:
             fs = _FuncState(task_id=tid, name=func,
                             short=self._short(func), depth=depth)
             self._fstate[tid] = fs
+            sep = "━" * 60
             if depth == 0:
-                self._print("\n" + "\u2501" * 60)
-                self._print("  \u25b6 " + func)
-                self._print("\u2501" * 60)
+                self._print("\n" + sep)
+                self._print("  ▶ " + func)
+                self._print(sep)
             else:
                 self._print(self._prefix_tree(depth) + f"[d{depth}] " + func)
             self._push(tid)
@@ -188,7 +232,7 @@ class CliRenderer:
             fs = self._fstate.get(tid)
             if fs:
                 fs.rounds.append(_RndState(num=d.get("round", len(fs.rounds) + 1)))
-                self._refresh(tid)
+                self._refresh(tid, force=not self._tty)
 
         elif t == "worker_start":
             wid = d.get("worker_id", "")
@@ -200,30 +244,58 @@ class CliRenderer:
                 rnd = _RndState(num=1)
                 fs.rounds.append(rnd)
             if wid.startswith("worker-taint-"):
-                rnd.taints[wid[len("worker-taint-"):]] = "\u00b7"
+                param = wid[len("worker-taint-"):]
+                rnd.taints[param] = _TaintStat(status="·")
             elif wid == "worker-summary":
-                rnd.summary = "\u00b7"
+                rnd.sum_status = "·"
+                rnd.sum_t0 = time.time()
             self._refresh(tid)
 
         elif t == "worker_stream":
             pass
 
         elif t == "worker_done":
-            wid = d.get("worker_id", "")
-            fs  = self._fstate.get(tid)
+            wid   = d.get("worker_id", "")
+            t_in  = d.get("tokens_in", 0)
+            t_out = d.get("tokens_out", 0)
+            fs    = self._fstate.get(tid)
             if not fs:
                 return
             rnd = fs.cur_round
             if not rnd:
                 return
             if wid.startswith("worker-taint-"):
-                rnd.taints[wid[len("worker-taint-"):]] = "\u2713"
+                param = wid[len("worker-taint-"):]
+                ts = rnd.taints.get(param)
+                if ts is None:
+                    ts = _TaintStat()
+                    rnd.taints[param] = ts
+                ts.status = "✓"
+                ts.secs = time.time() - ts.t0
+                ts.tokens_in  = t_in
+                ts.tokens_out = t_out
+                self._refresh(tid, force=not self._tty)
             elif wid == "worker-summary":
-                rnd.summary = "\u2713"
-            self._refresh(tid)
+                rnd.sum_status = "✓"
+                rnd.sum_secs = time.time() - rnd.sum_t0
+                rnd.sum_in  = t_in
+                rnd.sum_out = t_out
+                self._refresh(tid, force=not self._tty)
 
-        elif t in ("judge_start", "judge_done"):
-            pass
+        elif t == "judge_start":
+            fs = self._fstate.get(tid)
+            if fs and fs.cur_round:
+                fs.cur_round.j_t0 = time.time()
+
+        elif t == "judge_done":
+            t_in  = d.get("tokens_in", 0)
+            t_out = d.get("tokens_out", 0)
+            fs = self._fstate.get(tid)
+            if fs and fs.cur_round:
+                rnd = fs.cur_round
+                rnd.j_in   = t_in
+                rnd.j_out  = t_out
+                rnd.j_secs = time.time() - (rnd.j_t0 or time.time())
 
         elif t in ("judge_result", "judge_eval"):
             passed = d.get("passed", False)
@@ -236,12 +308,14 @@ class CliRenderer:
                 return
             rnd.j_passed = passed
             rnd.j_score  = score
+            if not rnd.j_secs:
+                rnd.j_secs = time.time() - (rnd.j_t0 or time.time())
             if passed:
-                fs.final = " \u2705"
-                self._refresh(tid)
+                fs.final = " ✅"
+                self._refresh(tid, force=not self._tty)
                 self._commit(tid)
             else:
-                self._refresh(tid)
+                self._refresh(tid, force=not self._tty)
 
         elif t == "round_end":
             passed = d.get("passed", False)
@@ -250,17 +324,17 @@ class CliRenderer:
                 return
             if passed:
                 if not fs.final:
-                    fs.final = " \u2705"
+                    fs.final = " ✅"
                 self._commit(tid)
 
         elif t == "trace_callees":
             funcs = d.get("callees", [])
             if funcs:
                 depth   = self._task_depth.get(tid, 0)
-                prefix  = "  " + "\u2502  " * depth
+                prefix  = "  " + "│  " * depth
                 preview = ", ".join(funcs[:5])
                 more    = f" +{len(funcs)-5}" if len(funcs) > 5 else ""
-                self._print(prefix + "  \u2192 " + str(len(funcs)) + " callees: " + preview + more)
+                self._print(prefix + "  → " + str(len(funcs)) + " callees: " + preview + more)
 
         elif t == "trace_skip":
             func   = d.get("function", "?")
@@ -272,24 +346,25 @@ class CliRenderer:
 
         elif t == "merge_start":
             n = d.get("file_count", 0)
-            self._print(f"\n  \U0001f500 Merging {n} documents...")
+            self._print(f"\n  🔀 Merging {n} documents...")
 
         elif t == "merge_done":
             size = d.get("size", 0)
             unit = "KB" if size > 1024 else "B"
             val  = size / 1024 if size > 1024 else size
-            self._print(f"  \u2705 Merged ({val:.1f}{unit})")
+            self._print(f"  ✅ Merged ({val:.1f}{unit})")
 
         elif t == "merge_failed":
             err = d.get("error", "")[:80]
-            self._print(f"  \u274c Merge failed: {err}")
+            self._print(f"  ❌ Merge failed: {err}")
 
         elif t == "task_end":
             if tid == self._root_id:
                 self._print_summary(d)
 
         elif t == "error":
-            self._print("  \u2757 " + d.get("error", "")[:200])
+            self._print("  ❗ " + d.get("error", "")[:200])
+
 
     def _print_summary(self, d: dict):
         status  = d.get("status", "?").upper()

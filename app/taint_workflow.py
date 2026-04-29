@@ -460,7 +460,9 @@ class PerTaintWorkflow:
                     )
                     self._emit("worker_done",
                                worker_id=f"worker-taint-{_safe_param(param)}",
-                               output=res.output[:200])
+                               output=res.output[:200],
+                               tokens_in=res.token_usage.input,
+                               tokens_out=res.token_usage.output)
                     return (param, res)
 
             taint_results_raw = await asyncio.gather(*[
@@ -493,7 +495,9 @@ class PerTaintWorkflow:
                 **self._agent_kwargs(self.summary_sess)
             )
             self._emit("worker_done", worker_id="worker-summary",
-                       output=summary_result.output[:200])
+                       output=summary_result.output[:200],
+                       tokens_in=summary_result.token_usage.input,
+                       tokens_out=summary_result.token_usage.output)
 
             # Archive summary output
             df_file = _find_df_file(str(self.out_dir), self.func_name)
@@ -538,7 +542,9 @@ class PerTaintWorkflow:
                 **self._agent_kwargs(None, is_judge=True)
             )
             self._emit("judge_done", judge_id="judge-0",
-                       output=judge_result.output[:200])
+                       output=judge_result.output[:200],
+                       tokens_in=judge_result.token_usage.input,
+                       tokens_out=judge_result.token_usage.output)
 
             # Parse judge output
             from .orchestrator import _parse_eval_md as _pem
