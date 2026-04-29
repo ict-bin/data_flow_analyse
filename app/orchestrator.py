@@ -517,6 +517,10 @@ class Orchestrator(JudgeMixin):
         async def process_item(item: tuple) -> None:
             func_name, src_file, line_hint, task_cfg, tid, dep, taint_ctx = item
 
+            # 通知 CLI: 新函数开始
+            self._emit("trace_start", tid,
+                       function=func_name, depth=dep, max_depth=max_depth)
+
             # 注入 tainted_context
             if taint_ctx and dep > 0:
                 ctx_base = task_cfg.context or ""
@@ -562,7 +566,10 @@ class Orchestrator(JudgeMixin):
             )
             result = await workflow.run()
 
-            # 读取 dataflow 文件更新 final_output
+            # 通知 CLI: 函数分析完成
+            self._emit("round_end", tid,
+                       passed=(result.status.value == "passed"),
+                       function=func_name, depth=dep)
             # out_dir already defined above
             df_path = _find_dataflow_file(out_dir, func_name)
             if df_path:
