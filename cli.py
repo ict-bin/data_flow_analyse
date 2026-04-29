@@ -22,214 +22,290 @@ from app.config import build_task_config, load_service_config
 from app.models import SwarmEvent
 from app.orchestrator import Orchestrator
 
+import dataclasses
+from typing import Optional
+
+
+# ─── 进度状态数据类 ──────────────────────────────────────────────────────────
+
+@dataclasses.dataclass
+class _RndState:
+    """单轮次进度：污点 session + summary + judge 结果。"""
+    num: int
+    # safe_param → "·"(运行中) | "✓"(完成)
+    taints: dict[str, str] = dataclasses.field(default_factory=dict)
+    summary: str = ""      # "" | "·" | "✓"
+    j_passed: Optional[bool] = None
+    j_score: Optional[int] = None
+
+    def fmt(self) -> str:
+        items = [f"{p}({s})" for p, s in self.taints.items()]
+        if self.summary:
+            items.append(f"Σ({self.summary})")
+        inner = ",".join(items) if items else "·"
+        r = f"R{self.num}({inner})"
+        if self.j_passed is not None:
+            j = "✓" if self.j_passed else f"✗{self.j_score or ''}"
+            r += f"-J{j}"
+        return r
+
+
+@dataclasses.dataclass
+class _FuncState:
+    """一个函数的全部进度。"""
+    task_id: str
+    name: str           # 完整函数名
+    short: str          # 显示用短名 (≤16 chars)
+    depth: int
+    rounds: list[_RndState] = dataclasses.field(default_factory=list)
+    final: str = ""     # "" | "✅" | "❌"
+    t0: float = dataclasses.field(default_factory=time.time)
+
+    @property
+    def cur_round(self) -> Optional[_RndState]:
+        return self.rounds[-1] if self.rounds else None
+
+    def line(self) -> str:
+        hist = "→".join(r.fmt() for r in self.rounds)
+        elapsed = f" {time.time()-self.t0:.0f}s"
+        return f"  {self.short:<16} {hist}{self.final}{elapsed}"
+
 
 # ─── 美化 CLI 渲染器 ─────────────────────────────────────────────────────────
 
 class CliRenderer:
-    """有状态的 CLI 事件渲染器，产出紧凑、层次清晰的输出。"""
+    """有状态的 CLI 事件渲染器（含底部实时进度条）。"""
 
     def __init__(self, quiet: bool = False):
         self.quiet = quiet
-        self._depth = 0
+        self._t0 = time.time()
         self._root_id = ""
         self._func_count = 0
         self._skipped: list[str] = []
-        self._round_t0: float = 0
-        self._round_evals: list[dict] = []
-        self._t0 = time.time()
-        self._in_round = False
-        # 流式输出状态
-        self._stream_chars = 0
-        self._stream_dots = 0
-        self._worker_active = False
-        # 并行任务跟踪： task_id → (depth, func_name)
+
+        # 函数进度状态
+        self._fstate: dict[str, _FuncState] = {}   # task_id → _FuncState
         self._task_depth: dict[str, int] = {}
         self._task_func: dict[str, str] = {}
+
+        # Status block（底部实时行）
+        self._tty: bool = sys.stdout.isatty()
+        self._slots: list[str] = []                # 有序 task_id 列表
+        self._slot_text: dict[str, str] = {}       # task_id → 当前行文本
+        self._n_rendered: int = 0                  # 当前渲染的行数
 
     def __call__(self, event: SwarmEvent):
         if self.quiet:
             return
         self._render(event)
 
-    # ── 缩进工具 ──────────────────────────────────────────────
+    # -- status block --
 
-    def _prefix(self, depth: int | None = None) -> str:
-        """基于深度生成树状缩进前缀。"""
-        d = depth if depth is not None else self._depth
-        if d <= 0:
+    def _clr(self):
+        n = self._n_rendered
+        if n > 0 and self._tty:
+            sys.stdout.write(f'\033[{n}A')
+            for _ in range(n):
+                sys.stdout.write('\033[2K\r\n')
+            sys.stdout.write(f'\033[{n}A')
+        self._n_rendered = 0
+
+    def _draw(self):
+        if not self._tty or not self._slots:
+            return
+        for tid in self._slots:
+            sys.stdout.write(self._slot_text.get(tid, '') + '\n')
+        sys.stdout.flush()
+        self._n_rendered = len(self._slots)
+
+    def _print(self, msg: str):
+        self._clr()
+        print(msg)
+        self._draw()
+
+    def _push(self, task_id: str):
+        if task_id not in self._slots:
+            self._slots.append(task_id)
+        self._refresh(task_id)
+
+    def _refresh(self, task_id: str):
+        fs = self._fstate.get(task_id)
+        if fs:
+            self._slot_text[task_id] = fs.line()
+        self._clr()
+        self._draw()
+
+    def _commit(self, task_id: str):
+        fs = self._fstate.get(task_id)
+        self._clr()
+        self._slots = [t for t in self._slots if t != task_id]
+        self._slot_text.pop(task_id, None)
+        if fs:
+            print(fs.line())
+        self._draw()
+
+    @staticmethod
+    def _short(name: str, maxlen: int = 16) -> str:
+        parts = name.split('::')
+        s = parts[-1] if len(parts) >= 2 else name
+        return s[:maxlen]
+
+    @staticmethod
+    def _prefix_tree(depth: int) -> str:
+        if depth <= 0:
             return "  "
-        return "  " + "│  " * (d - 1) + "├─ "
-
-    def _cont(self, depth: int | None = None) -> str:
-        """续行前缀（不带 ├─）。"""
-        d = depth if depth is not None else self._depth
-        if d <= 0:
-            return "  "
-        return "  " + "│  " * d
-
-    # ── 事件分发 ──────────────────────────────────────────────
+        return "  " + "\u2502  " * (depth - 1) + "\u251c\u2500 "
 
     def _render(self, event: SwarmEvent):
-        t = event.type
-        d = event.data
+        t   = event.type
+        d   = event.data
+        tid = event.task_id
 
         if t == "trace_start":
             depth = d.get("depth", 0)
-            func = d.get("function", "?")
-            self._depth = depth
-            self._task_depth[event.task_id] = depth
-            self._task_func[event.task_id] = func
+            func  = d.get("function", "?")
+            self._task_depth[tid] = depth
+            self._task_func[tid]  = func
             self._func_count += 1
+            if not self._root_id:
+                self._root_id = tid
+            fs = _FuncState(task_id=tid, name=func,
+                            short=self._short(func), depth=depth)
+            self._fstate[tid] = fs
             if depth == 0:
-                self._root_id = event.task_id
-                print(f"\n{'━' * 60}")
-                print(f"  ▶ {func}")
-                print(f"{'━' * 60}")
+                self._print("\n" + "\u2501" * 60)
+                self._print("  \u25b6 " + func)
+                self._print("\u2501" * 60)
             else:
-                print(f"\n{self._prefix(depth)}[d{depth}] {func}")
+                self._print(self._prefix_tree(depth) + f"[d{depth}] " + func)
+            self._push(tid)
 
         elif t == "task_start":
             if not self._root_id:
-                self._root_id = event.task_id
+                self._root_id = tid
 
         elif t == "round_start":
-            rnd = d.get("round", 1)
-            self._round_t0 = time.time()
-            self._round_evals = []
-            self._in_round = True
-            self._stream_chars = 0
-            self._stream_dots = 0
-            _depth = self._task_depth.get(event.task_id, self._depth)
-            _func  = d.get("function", self._task_func.get(event.task_id, "?"))
-            prefix = self._cont(_depth)
+            fs = self._fstate.get(tid)
+            if fs:
+                fs.rounds.append(_RndState(num=d.get("round", len(fs.rounds) + 1)))
+                self._refresh(tid)
 
         elif t == "worker_start":
-            self._worker_active = True
-            self._stream_chars = 0
-            self._stream_dots = 0
-            _depth = self._task_depth.get(event.task_id, self._depth)
-            _func  = d.get("function", self._task_func.get(event.task_id, "?"))
-            prefix = self._cont(_depth)
-            elapsed = f"{time.time() - self._round_t0:.0f}s"
-            print(f"{prefix}  [{_func}] W ", end="", flush=True)
+            wid = d.get("worker_id", "")
+            fs  = self._fstate.get(tid)
+            if not fs:
+                return
+            rnd = fs.cur_round
+            if not rnd:
+                rnd = _RndState(num=1)
+                fs.rounds.append(rnd)
+            if wid.startswith("worker-taint-"):
+                rnd.taints[wid[len("worker-taint-"):]] = "\u00b7"
+            elif wid == "worker-summary":
+                rnd.summary = "\u00b7"
+            self._refresh(tid)
 
         elif t == "worker_stream":
-            # 每 300 字符打一个点，表示进度
-            delta = d.get("delta", "")
-            if delta:
-                self._stream_chars += len(delta)
-                dots = self._stream_chars // 300
-                if dots > self._stream_dots:
-                    print("." * (dots - self._stream_dots), end="", flush=True)
-                    self._stream_dots = dots
+            pass
 
         elif t == "worker_done":
-            self._worker_active = False
-            elapsed = f"{time.time() - self._round_t0:.0f}s"
-            df_issues = d.get("df_issues", [])
-            df = "✓" if d.get("dataflow_found") else "∅"
-            print(f" W[{df}] ({elapsed})", flush=True)
-            # 显示具体的结构性问题
-            if df_issues:
-                prefix = self._cont(self._task_depth.get(event.task_id, self._depth))
-                for issue in df_issues:
-                    first_line = issue.split('\n')[0]
-                    print(f"{prefix}  ⚠️  {first_line}", flush=True)
+            wid = d.get("worker_id", "")
+            fs  = self._fstate.get(tid)
+            if not fs:
+                return
+            rnd = fs.cur_round
+            if not rnd:
+                return
+            if wid.startswith("worker-taint-"):
+                rnd.taints[wid[len("worker-taint-"):]] = "\u2713"
+            elif wid == "worker-summary":
+                rnd.summary = "\u2713"
+            self._refresh(tid)
 
-        elif t == "judge_start":
-            _depth = self._task_depth.get(event.task_id, self._depth)
-            _func  = d.get("function", self._task_func.get(event.task_id, "?"))
-            prefix = self._cont(_depth)
-            elapsed = f"{time.time() - self._round_t0:.0f}s"
-            print(f"{prefix}  [{_func}] J ", end="", flush=True)
-            self._stream_chars = 0
-            self._stream_dots = 0
+        elif t in ("judge_start", "judge_done"):
+            pass
 
-        elif t == "judge_eval":
-            score = d.get("score", 0)
+        elif t in ("judge_result", "judge_eval"):
             passed = d.get("passed", False)
-            self._round_evals.append({"score": score, "passed": passed})
+            score  = d.get("score",  0)
+            fs = self._fstate.get(tid)
+            if not fs:
+                return
+            rnd = fs.cur_round
+            if not rnd:
+                return
+            rnd.j_passed = passed
+            rnd.j_score  = score
+            if passed:
+                fs.final = " \u2705"
+                self._refresh(tid)
+                self._commit(tid)
+            else:
+                self._refresh(tid)
 
         elif t == "round_end":
-            elapsed = time.time() - self._round_t0
             passed = d.get("passed", False)
-            pc = d.get("pass_count", 0)
-            tc = d.get("total_judges", 1)
-            scores = "/".join(str(e["score"]) for e in self._round_evals)
-            icon = "✅" if passed else "❌"
-            _depth = self._task_depth.get(event.task_id, self._depth)
-            _func  = d.get("function", self._task_func.get(event.task_id, "?"))
-            prefix = self._cont(_depth)
-            print(f"{prefix}  → {icon} {pc}/{tc} ({elapsed:.0f}s)")
-            self._in_round = False
-
-        elif t == "round_reflection":
-            prefix = self._cont()
-            print(f"{prefix}   ↻ 强制反思轮")
+            fs = self._fstate.get(tid)
+            if not fs:
+                return
+            if passed:
+                if not fs.final:
+                    fs.final = " \u2705"
+                self._commit(tid)
 
         elif t == "trace_callees":
             funcs = d.get("callees", [])
-            prefix = self._cont()
             if funcs:
+                depth   = self._task_depth.get(tid, 0)
+                prefix  = "  " + "\u2502  " * depth
                 preview = ", ".join(funcs[:5])
-                more = f" +{len(funcs)-5}" if len(funcs) > 5 else ""
-                print(f"{prefix}→ {len(funcs)} callees: {preview}{more}")
+                more    = f" +{len(funcs)-5}" if len(funcs) > 5 else ""
+                self._print(prefix + "  \u2192 " + str(len(funcs)) + " callees: " + preview + more)
 
         elif t == "trace_skip":
-            func = d.get("function", "?")
+            func   = d.get("function", "?")
             reason = d.get("reason", "")
-            if "no definition" in reason:
-                tag = "extern"
-            elif "already" in reason:
-                tag = "dup"
-            else:
-                tag = reason[:15]
+            tag = ("extern" if "no definition" in reason
+                   else "dup" if "already" in reason
+                   else reason[:12])
             self._skipped.append(f"{func}({tag})")
-
-        elif t == "trace_depth_limit":
-            pass  # depth limit 在 round_end 后已清晰，不需额外输出
 
         elif t == "merge_start":
             n = d.get("file_count", 0)
-            print(f"\n  🔀 Merging {n} documents... ", end="", flush=True)
+            self._print(f"\n  \U0001f500 Merging {n} documents...")
 
         elif t == "merge_done":
             size = d.get("size", 0)
             unit = "KB" if size > 1024 else "B"
-            val = size / 1024 if size > 1024 else size
-            print(f"✅ ({val:.1f}{unit})")
+            val  = size / 1024 if size > 1024 else size
+            self._print(f"  \u2705 Merged ({val:.1f}{unit})")
 
         elif t == "merge_failed":
             err = d.get("error", "")[:80]
-            print(f"❌ {err}")
+            self._print(f"  \u274c Merge failed: {err}")
 
         elif t == "task_end":
-            # 只有根任务打印最终汇总
-            if event.task_id == self._root_id:
+            if tid == self._root_id:
                 self._print_summary(d)
 
         elif t == "error":
-            prefix = self._cont()
-            print(f"\n{prefix}❗ {d.get('error', '')[:200]}", file=sys.stderr)
-
-    # ── 最终汇总 ──────────────────────────────────────────────
+            self._print("  \u2757 " + d.get("error", "")[:200])
 
     def _print_summary(self, d: dict):
-        status = d.get("status", "?").upper()
+        status  = d.get("status", "?").upper()
         elapsed = time.time() - self._t0
-        icon = "✅" if status == "PASSED" else "❌" if status == "FAILED" else "⚠️"
-
-        print(f"\n{'═' * 60}")
-        print(f"  {icon} {status}  │  {self._func_count} functions  │  {elapsed:.0f}s")
+        icon = "\u2705" if status == "PASSED" else "\u274c" if status == "FAILED" else "\u26a0\ufe0f"
+        self._print("\n" + "\u2550" * 60)
+        self._print(f"  {icon} {status}  \u2502  {self._func_count} functions  \u2502  {elapsed:.0f}s")
         if d.get("result_file"):
-            print(f"  📄 {d['result_file']}")
+            self._print("  \U0001f4c4 " + d["result_file"])
         if d.get("archive"):
-            print(f"  📦 {d['archive']}")
+            self._print("  \U0001f4e6 " + d["archive"])
         if self._skipped:
             preview = ", ".join(self._skipped[:8])
-            more = f" +{len(self._skipped)-8}" if len(self._skipped) > 8 else ""
-            print(f"  ⏭  Skipped: {preview}{more}")
-        print(f"{'═' * 60}")
+            more    = f" +{len(self._skipped)-8}" if len(self._skipped) > 8 else ""
+            self._print("  \u23ed  Skipped: " + preview + more)
+        self._print("\u2550" * 60)
 
 
 # ─── 查找服务配置文件 ─────────────────────────────────────────────────────────
