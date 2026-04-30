@@ -624,7 +624,10 @@ class Orchestrator(JudgeMixin):
                 for callee in callees:
                     # 标准化 c_key:只用函数名(不含文件),避免路径差异导致误 dup
                     c_key = callee.function_name
+                    # 跳过自引用（完整名或短名匹配）
                     if callee.function_name == func_name:
+                        continue
+                    if callee.function_name.split("::")[-1] == func_name.split("::")[-1]:
                         continue
                     if c_key in analyzed:
                         self._emit("trace_skip", tid, function=callee.function_name,

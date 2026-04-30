@@ -208,7 +208,10 @@ def _build_summary_prompt(func_name: str, taint_params: list[str],
         + "Do NOT read any other .md or source files." + chr(10)*2
         + "Output steps (must follow order):" + chr(10)
         + "1. write tool -> `dataflow-" + func_name + ".md`" + chr(10)
-        + "2. write tool -> `tainted.list` (format: `file###Class::Func###L_line###params`)"
+        + "2. write tool -> `tainted.list` (format: `file###Class::Func###L_line###params`)" + chr(10)
+        + "**tainted.list rules**: list CALLEE functions receiving tainted data; "
+            + "**NEVER** list `" + func_name + "` (the current function) as a callee;"
+            + " NEVER list a function as a callee of itself." + chr(10)
         + fb_block
     )
 
@@ -611,6 +614,13 @@ class PerTaintWorkflow:
         target_dir = str(self.cfg.cwd)
         out_lines = []
         for c in callees:
+            # 跳过与当前函数同名的条目（自引用）
+            if c.function_name == self.func_name:
+                continue
+            short_c = c.function_name.split("::")[-1]
+            short_f = self.func_name.split("::")[-1]
+            if short_c == short_f:
+                continue
             qname, rfile = _resolve_cpp_name(target_dir, c.function_name, c.file or "")
             if not rfile:
                 rfile = c.file or "-"
