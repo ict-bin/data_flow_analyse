@@ -1,6 +1,21 @@
-FROM dfa-base:layer5
+FROM ubuntu:24.04
 
+ENV DEBIAN_FRONTEND=noninteractive
 ENV PYTHONUNBUFFERED=1
+
+# ═══ 系统工具 ═════════════════════════════════════════════════════════════════
+RUN apt-get update && apt-get install -y \
+    curl wget gnupg ca-certificates git zip \
+    python3 python3-pip python3-venv \
+    && rm -rf /var/lib/apt/lists/*
+
+# ═══ Node.js 22 ═══════════════════════════════════════════════════════════════
+RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
+    && apt-get install -y nodejs \
+    && rm -rf /var/lib/apt/lists/*
+
+# ═══ pi-coding-agent ══════════════════════════════════════════════════════════
+RUN npm install -g @mariozechner/pi-coding-agent
 
 # ═══ 项目代码 ═════════════════════════════════════════════════════════════════
 WORKDIR /opt/data_flow_analyse
@@ -13,9 +28,7 @@ COPY skills/            ./skills/
 COPY config.example.json .env.example ./
 COPY requirements.txt ./
 RUN pip install --no-cache-dir --break-system-packages -r requirements.txt -q
-RUN chmod +x scripts/*.sh 2>/dev/null || true
-# 修复 Windows CRLF
-RUN find . -name '*.sh' -exec sed -i 's/\r$//' {} +
+RUN find . -name '*.sh' -exec sed -i 's/\r$//' {} + && chmod +x scripts/*.sh 2>/dev/null || true
 # 安装工具：extract_func / gen_dataflow / gen_tainted_list 供 Worker 直接调用
 RUN cp tools/extract_func.py /usr/local/bin/extract_func \
     && chmod +x /usr/local/bin/extract_func \
