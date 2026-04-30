@@ -11,7 +11,11 @@ COPY scripts/           ./scripts/
 COPY tools/             ./tools/
 COPY skills/            ./skills/
 COPY config.example.json .env.example ./
+COPY requirements.txt ./
+RUN pip install --no-cache-dir --break-system-packages -r requirements.txt -q
 RUN chmod +x scripts/*.sh 2>/dev/null || true
+# 修复 Windows CRLF
+RUN find . -name '*.sh' -exec sed -i 's/\r$//' {} +
 # 安装工具：extract_func / gen_dataflow / gen_tainted_list 供 Worker 直接调用
 RUN cp tools/extract_func.py /usr/local/bin/extract_func \
     && chmod +x /usr/local/bin/extract_func \
@@ -63,7 +67,7 @@ HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
 # ═══ 入口脚本 ═════════════════════════════════════════════════════════════════
 # 启动前自动链接 models.json（如果挂载了的话）
 COPY scripts/entrypoint.sh /entrypoint.sh
-RUN chmod +x /entrypoint.sh
+RUN sed -i 's/\r$//' /entrypoint.sh && chmod +x /entrypoint.sh
 ENTRYPOINT ["/entrypoint.sh"]
 
 # 默认 REST API，覆盖: python3 cli.py /data/config/config.json

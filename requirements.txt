@@ -5,3 +5,6 @@ pydantic>=2.0
 pyyaml
 httpx
 python-dotenv
+sqlalchemy
+pymysql
+cryptography

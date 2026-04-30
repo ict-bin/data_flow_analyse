@@ -1,20 +1,31 @@
 """
 data_flow_analyse — REST API 服务器
 
-  POST /analyse           提交分析（body: {"prompt": "对 xxx.c 的 yyy 函数完成数据流分析"}）
-  GET  /task/{id}         查询结果
-  GET  /task/{id}/stream  SSE 实时事件流
-  POST /task/{id}/abort   中止
-  GET  /tasks             列出任务
-  GET  /health            健康检查
+  Management layer (persistent, project-scoped):
+    POST /api/app/dataflow-analyse/tasks          创建任务
+    GET  /api/app/dataflow-analyse/tasks          任务列表（project_id 过滤）
+    GET  /api/app/dataflow-analyse/tasks/{id}     任务详情
+    POST /api/app/dataflow-analyse/tasks/{id}/cancel   取消任务
+    POST /api/app/dataflow-analyse/tasks/{id}/restart  重新运行
+    POST /api/app/dataflow-analyse/generate-prompt    根据路径生成 prompt
+    GET  /api/app/dataflow-analyse/health         健康检查
+
+  Legacy engine routes (in-memory, backward compat):
+    POST /analyse           直接提交分析（CLI 兼容）
+    GET  /task/{id}         查询结果
+    GET  /task/{id}/stream  SSE 实时事件流
+    POST /task/{id}/abort   中止
+    GET  /tasks             列出任务
+    GET  /health            健康检查
 """
 
 from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
-from pathlib import Path
+from contextlib import asynccontextmanager
 
 import httpx
 from dotenv import load_dotenv
@@ -35,6 +46,8 @@ from .config import CONFIG_DIR, TARGET_DIR
 SERVICE_CONFIG_PATH = os.environ.get("SERVICE_CONFIG", f"{CONFIG_DIR}/config.json")
 CLEANUP_DELAY = int(os.environ.get("CLEANUP_DELAY", "300"))
 
+logger = logging.getLogger("dfa.server")
+
 
 class TaskEntry:
     def __init__(self, orch: Orchestrator, task_id: str, prompt: str):
@@ -50,7 +63,44 @@ class TaskEntry:
 
 _tasks: dict[str, TaskEntry] = {}
 
-app = FastAPI(title="data_flow_analyse", version="1.0.0")
+
+# ─── Lifespan ────────────────────────────────────────────────────────────────
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # --- startup ---
+    _db_ready = False
+    _service_yaml_path = os.environ.get("SERVICE_YAML", "/app/service.yaml")
+    try:
+        import yaml
+        if os.path.isfile(_service_yaml_path):
+            with open(_service_yaml_path) as f:
+                _svc_yaml = yaml.safe_load(f) or {}
+            _db_cfg = _svc_yaml.get("database", {})
+            _db_url = (
+                f"mysql+pymysql://{_db_cfg.get('username','secflow')}:{_db_cfg.get('password','')}@"
+                f"{_db_cfg.get('host','127.0.0.1')}:{_db_cfg.get('port',3306)}/{_db_cfg.get('name','secflow')}?charset=utf8mb4"
+            )
+            from .db import init_db
+            init_db(
+                _db_url,
+                pool_size=_db_cfg.get("pool_size", 5),
+                max_overflow=_db_cfg.get("max_overflow", 10),
+            )
+            _db_ready = True
+            logger.info("DB initialized from service.yaml")
+    except Exception as exc:
+        logger.warning("DB init failed (management APIs unavailable): %s", exc)
+
+    if _db_ready:
+        from .api import router as mgmt_router
+        app.include_router(mgmt_router)
+
+    yield
+    # --- shutdown ---
+
+
+app = FastAPI(title="data_flow_analyse", version="2.0.0", lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 # 启动时加载一次服务配置
@@ -80,6 +130,7 @@ class AnalyseRequest(BaseModel):
 # ─── 路由 ─────────────────────────────────────────────────────────────────────
 
 @app.get("/health")
+@app.get("/api/app/dataflow-analyse/health")
 async def health():
     return {
         "status": "ok",

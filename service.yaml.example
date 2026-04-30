@@ -1,0 +1,40 @@
+service_id: secflow-app-dataflow-analyse
+service_name: DataFlow Analyse
+api_prefix: /api/app/dataflow-analyse
+host: secflow-app-dataflow-analyse
+port: 80
+maturity: alpha
+description: "数据流安全分析服务 — 追踪污点传播路径，识别数据流漏洞"
+
+database:
+  host: "172.31.30.100"
+  port: 3306
+  username: "secflow_dfa"
+  password: "Huawei12#$"
+  name: "secflow_dfa"
+  pool_size: 5
+  max_overflow: 10
+
+registry:
+  menu_service_url: "http://secflow-platform-menu:80"
+  service_id: secflow-app-dataflow-analyse
+  service_name: "数据流分析"
+  api_prefix: /api/app/dataflow-analyse
+  host: secflow-app-dataflow-analyse
+  port: 80
+  maturity: alpha
+  description: "数据流安全分析服务"
+  menu:
+    id: dataflow-analyse
+    path: /api/app/dataflow-analyse
+    icon: GitBranch
+    order: 20
+    level1:
+      name: "执行"
+      name_en: "Execution"
+    level2:
+      name: "数据流分析"
+      name_en: "Dataflow Analysis"
+    level3:
+      name: ""
+      name_en: ""
