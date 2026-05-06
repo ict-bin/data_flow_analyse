@@ -361,6 +361,11 @@ class PerTaintWorkflow:
         target_dir = os.path.abspath(cfg.cwd)
         self.ws = out_dir / "workspace-worker-0"
         self.ws.mkdir(exist_ok=True)
+        # tmp 子目录隔离临时文件
+        wtmp = self.ws / "tmp"
+        wtmp.mkdir(exist_ok=True)
+        # chroot 式环境隔离
+        self.env = {**os.environ, "HOME": str(self.ws), "TMPDIR": str(wtmp)}
         if os.path.isdir(target_dir):
             for item in os.listdir(target_dir):
                 src = os.path.join(target_dir, item)
@@ -400,6 +405,7 @@ class PerTaintWorkflow:
             tools=tools,
             system_prompt=sys_prompt,
             cwd=str(self.ws),
+            env=self.env,
             thinking_level=(self.cfg.workers.agents[0].thinking_level
                             or self.cfg.workers.default_thinking_level),
             session_file=session_file,

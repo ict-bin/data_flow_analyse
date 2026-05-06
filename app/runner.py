@@ -284,6 +284,7 @@ async def run_agent(
     tools: list[str],
     system_prompt: str = "",
     cwd: str = ".",
+    env: dict[str, str] | None = None,
     thinking_level: str = "off",
     session_file: str | None = None,
     on_stream: Callable[[str], None] | None = None,
@@ -338,6 +339,7 @@ async def run_agent(
         return await _run_with_pi_retry(
             args=args,
             cwd=os.path.abspath(cwd),
+            env=env,
             prompt=prompt,
             post_skill_prompt=post_skill_prompt,
             cancel_event=cancel_event,
@@ -358,6 +360,7 @@ async def _run_with_pi_retry(
     *,
     args: list[str],
     cwd: str,
+    env: dict[str, str] | None = None,
     prompt: str,
     post_skill_prompt: str | None = None,
     cancel_event: asyncio.Event | None,
@@ -389,6 +392,7 @@ async def _run_with_pi_retry(
             result = await _run_with_api_retry(
                 args=args,
                 cwd=cwd,
+                env=env,
                 prompt=prompt,
                 post_skill_prompt=post_skill_prompt,
                 cancel_event=cancel_event,
@@ -461,6 +465,7 @@ async def _run_with_api_retry(
     *,
     args: list[str],
     cwd: str,
+    env: dict[str, str] | None = None,
     prompt: str,
     post_skill_prompt: str | None = None,
     cancel_event: asyncio.Event | None,
@@ -478,6 +483,7 @@ async def _run_with_api_retry(
         proc = await asyncio.create_subprocess_exec(
             *args,
             cwd=cwd,
+            env=env,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             stdin=asyncio.subprocess.PIPE,  # RPC: 通过 stdin 发送 prompt

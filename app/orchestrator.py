@@ -86,22 +86,29 @@ class Orchestrator(JudgeMixin):
         threshold = cfg.pass_threshold or math.ceil(cfg.judge_count / 2)
         self._cancel_event = asyncio.Event()
 
-        # 归档模式且非子任务:立即写 flag=0
-        if archive:
-            flag_dir = Path(os.path.abspath(cfg.result_dir))
-            flag_dir.mkdir(parents=True, exist_ok=True)
-            (flag_dir / "flag").write_text("0", encoding="utf-8")
-
-        out_dir = Path(os.path.abspath(cfg.output_dir)) / task_id
+        # 任务目录结构: output_dir/task_id/run/ (中间件) + output_dir/task_id/output/ (最终输出)
+        task_base = Path(os.path.abspath(cfg.output_dir)) / task_id
+        out_dir = task_base / "run"
         out_dir.mkdir(parents=True, exist_ok=True)
+
+        # 归档模式且非子任务:立即写 flag=0 到 output/ 目录
+        if archive:
+            output_path = task_base / "output"
+            output_path.mkdir(parents=True, exist_ok=True)
+            (output_path / "flag").write_text("0", encoding="utf-8")
+
         sess_dir = out_dir / "sessions"
         sess_dir.mkdir(exist_ok=True)
 
-        # 每个 Worker 独立可写工作目录(包含 target 文件的符号链接)
+        # 每个 Worker 独立可写工作目录(包含 target 文件的符号链接 + chroot 式环境隔离)
         worker_cwds: list[str] = []
+        worker_envs: list[dict] = []
         for i in range(cfg.worker_count):
             wdir = out_dir / f"workspace-worker-{i}"
             wdir.mkdir(exist_ok=True)
+            # tmp 子目录隔离临时文件
+            wtmp = wdir / "tmp"
+            wtmp.mkdir(exist_ok=True)
             # 将 target 目录下的文件链接到 worker 工作目录
             if os.path.isdir(target_dir):
                 for item in os.listdir(target_dir):
@@ -113,6 +120,7 @@ class Orchestrator(JudgeMixin):
                         except OSError:
                             pass
             worker_cwds.append(str(wdir))
+            worker_envs.append({**os.environ, "HOME": str(wdir), "TMPDIR": str(wtmp)})
 
 
         worker_dir_prompts = load_system_prompts(cfg.workers.system_prompt_dir, cfg.worker_count)
@@ -175,6 +183,7 @@ class Orchestrator(JudgeMixin):
                         "tools": acfg.tools or cfg.workers.default_tools,
                         "system_prompt": resolve_system_prompt(i, acfg, worker_dir_prompts),
                         "cwd": worker_cwds[i],
+                        "env": worker_envs[i],
                         "thinking_level": acfg.thinking_level or cfg.workers.default_thinking_level,
                         "session_file": worker_sessions[i],
                         # RPC 第二轮：分析完成后强制写入 tainted.list
@@ -379,17 +388,13 @@ class Orchestrator(JudgeMixin):
         # 最终处理:归档 + 格式化输出 + 压缩 + 清理
         # ═══════════════════════════════════════════════════════════════
 
-        # 1) 写入报告到工作目录
+        # 1) 写入报告到工作目录 (run/)
         (out_dir / "report.md").write_text(_report(result, cfg), encoding="utf-8")
         (out_dir / "result.json").write_text(result.model_dump_json(indent=2), encoding="utf-8")
 
         if not archive:
-            # 子任务模式:不压缩/不清理/不写 result_dir,由根任务统一处理
-            # 不发 task_end(避免 callee 分析前过早触发 CLI banner)
-            #
+            # 子任务模式:不写 output/，由根任务统一处理
             # ★ 关键:将 dataflow 文件内容写入 final_output 供 callee 解析
-            # Worker 的 <result> 摘要只是简短总结,不含完整 callee 表格
-            # 真正的数据流分析和 callee 表格在 workspace 的 dataflow-*.md 里
             _df_path = _find_dataflow_file(out_dir, cfg.function_name)
             if _df_path:
                 try:
@@ -401,37 +406,22 @@ class Orchestrator(JudgeMixin):
             self._cancel_event = None
             return result
 
-        # 2) 格式化最终输出 → 写到 result_dir(挂载的输出目录)
-        result_dir = Path(os.path.abspath(cfg.result_dir))
-        result_dir.mkdir(parents=True, exist_ok=True)
+        # 2) 格式化最终输出 → 写到 task_id/output/ 目录
+        output_path = task_base / "output"
+        output_path.mkdir(parents=True, exist_ok=True)
         cleaned_output = _format_final_output(result)
         result_filename = _make_result_filename(cfg, "md")
-        (result_dir / result_filename).write_text(cleaned_output, encoding="utf-8")
+        (output_path / result_filename).write_text(cleaned_output, encoding="utf-8")
         result.final_output = cleaned_output
 
-        # 3) 压缩全部工作过程 → archive_dir/<source_file>_<function_name>_log.zip
-        archive_dir = Path(os.path.abspath(cfg.archive_dir))
-        archive_dir.mkdir(parents=True, exist_ok=True)
-        zip_name = _make_result_filename(cfg, "zip", suffix="_log")
-        zip_path = archive_dir / zip_name
-        shutil.make_archive(
-            str(zip_path).removesuffix(".zip"),  # base name without .zip
-            "zip",
-            root_dir=str(out_dir.parent),
-            base_dir=out_dir.name,
-        )
-
-        # 4) 清理工作目录(压缩包已归档)
-        shutil.rmtree(out_dir, ignore_errors=True)
-
-        # 5) 写 flag 文件(仅 PASSED 覆盖为 1,其他保持入口处写的 0)
+        # 3) 写 flag 文件(仅 PASSED 覆盖为 1,其他保持入口处写的 0)
         if result.status == TaskStatus.PASSED:
-            (result_dir / "flag").write_text("1", encoding="utf-8")
+            (output_path / "flag").write_text("1", encoding="utf-8")
 
         self._emit("task_end", task_id,
                     status=result.status.value,
-                    archive=str(zip_path),
-                    result_file=str(result_dir / result_filename))
+                    run_dir=str(out_dir),
+                    result_file=str(output_path / result_filename))
         self._cancel_event = None
         return result
 
@@ -465,7 +455,7 @@ class Orchestrator(JudgeMixin):
         # ── 非根任务:直接执行 W+J 并返回,由根任务的工作池调度 ──────────────
         if not is_root:
             result = await self.execute(task_id, archive=False, depth=depth, max_depth=cfg.max_trace_depth)
-            out_dir = Path(os.path.abspath(cfg.output_dir)) / (task_id or result.task_id)
+            out_dir = Path(os.path.abspath(cfg.output_dir)) / (task_id or result.task_id) / "run"
             df_path = _find_dataflow_file(out_dir, cfg.function_name)
             if df_path:
                 try:
@@ -487,15 +477,17 @@ class Orchestrator(JudgeMixin):
 
         # 初始化根目录
         root_task_id = task_id or make_id()
-        root_out_dir = _root_out_dir
-        if root_out_dir is None:
-            root_out_dir = Path(os.path.abspath(cfg.output_dir)) / root_task_id
+        if _root_out_dir is not None:
+            # 已经是 run/ 子目录
+            root_out_dir = _root_out_dir
+        else:
+            root_out_dir = Path(os.path.abspath(cfg.output_dir)) / root_task_id / "run"
         root_out_dir.mkdir(parents=True, exist_ok=True)
 
-        # flag=0
-        flag_dir = Path(os.path.abspath(cfg.result_dir))
-        flag_dir.mkdir(parents=True, exist_ok=True)
-        (flag_dir / "flag").write_text("0", encoding="utf-8")
+        # flag=0 写入 output/ 目录
+        root_output_path = root_out_dir.parent / "output"
+        root_output_path.mkdir(parents=True, exist_ok=True)
+        (root_output_path / "flag").write_text("0", encoding="utf-8")
 
         queue: asyncio.Queue = asyncio.Queue()
         all_results: dict[str, TaskResult] = {}   # func_key -> TaskResult
@@ -532,7 +524,7 @@ class Orchestrator(JudgeMixin):
             df_dir = root_out_dir / "dataflow"
             df_dir.mkdir(exist_ok=True)
             safe_func = re.sub(r'[^A-Za-z0-9_:.-]', '_', func_name)
-            out_dir = Path(os.path.abspath(task_cfg.output_dir)) / tid
+            out_dir = Path(os.path.abspath(task_cfg.output_dir)) / tid / "run"
             out_dir.mkdir(parents=True, exist_ok=True)
 
             # 执行：使用 PerTaintWorkflow 实现多 session 并行污点分析
@@ -615,7 +607,7 @@ class Orchestrator(JudgeMixin):
             # ── 解析 callee 并加入队列 ─────────────────────────────────────
             if dep < max_depth and result.final_output:
                 # 优先读取 tainted.list，无则 fallback 到解析 dataflow 文件
-                worker_cwd = str(Path(os.path.abspath(task_cfg.output_dir)) / tid)
+                worker_cwd = str(Path(os.path.abspath(task_cfg.output_dir)) / tid / "run")
                 callees = _read_tainted_list(worker_cwd)
                 if not callees:
                     callees = _parse_callees(result.final_output)
@@ -723,50 +715,29 @@ class Orchestrator(JudgeMixin):
         return root_result
 
     def _do_final_archive(self, result: TaskResult, root_out_dir: Path | None):
-        """统一归档:写报告 + 压缩 + 输出结果文件 + 清理。"""
+        """统一归档:写报告 + 输出结果文件到 output/ 目录 + 写 flag。不创建压缩包,不清理工作目录。"""
         cfg = self.cfg
         if not root_out_dir or not root_out_dir.exists():
             return
 
-        # 写报告
+        # 写报告到 run/ 目录
         (root_out_dir / "report.md").write_text(_report(result, cfg), encoding="utf-8")
         (root_out_dir / "result.json").write_text(result.model_dump_json(indent=2), encoding="utf-8")
 
-        # 格式化最终输出
-        result_dir = Path(os.path.abspath(cfg.result_dir))
-        result_dir.mkdir(parents=True, exist_ok=True)
+        # output/ 目录存放最终输出
+        output_path = root_out_dir.parent / "output"
+        output_path.mkdir(parents=True, exist_ok=True)
+
+        # 格式化最终输出 → output/
         cleaned_output = _format_final_output(result)
         result_filename = _make_result_filename(cfg, "md")
-        (result_dir / result_filename).write_text(cleaned_output, encoding="utf-8")
+        (output_path / result_filename).write_text(cleaned_output, encoding="utf-8")
         result.final_output = cleaned_output
 
-        # 压缩全部(包含所有子任务工作目录)
-        # 将属于根任务的子任务目录移入 subtasks/ 子目录
-        subtasks_dir = root_out_dir / "subtasks"
-        output_parent = root_out_dir.parent
-        root_prefix = root_out_dir.name + "-"
-        for sibling in sorted(output_parent.iterdir()):
-            if sibling.is_dir() and sibling.name.startswith(root_prefix):
-                try:
-                    subtasks_dir.mkdir(exist_ok=True)
-                    shutil.move(str(sibling), str(subtasks_dir / sibling.name))
-                except OSError:
-                    pass
-        archive_dir = Path(os.path.abspath(cfg.archive_dir))
-        archive_dir.mkdir(parents=True, exist_ok=True)
-        zip_name = _make_result_filename(cfg, "zip", suffix="_log")
-        zip_path = archive_dir / zip_name
-        shutil.make_archive(
-            str(zip_path).removesuffix(".zip"),
-            "zip",
-            root_dir=str(root_out_dir.parent),
-            base_dir=root_out_dir.name,
-        )
-
-        # 将 dataflow/ 文件夹复制到 result_dir(小切文件 + 已归档到 zip)
+        # 将 dataflow/ 文件夹复制到 output/dataflow/
         df_folder = root_out_dir / "dataflow"
         if df_folder.exists():
-            dest_df = result_dir / "dataflow"
+            dest_df = output_path / "dataflow"
             if dest_df.exists():
                 shutil.rmtree(dest_df, ignore_errors=True)
             try:
@@ -774,15 +745,13 @@ class Orchestrator(JudgeMixin):
             except OSError:
                 pass
 
-        # 清理
-        shutil.rmtree(root_out_dir, ignore_errors=True)
-
-        # 写 flag 文件(仅 PASSED 覆盖为 1,其他保持入口处写的 0)
+        # 写 flag 文件(仅 PASSED 为 1,其他保持 0)
         if result.status == TaskStatus.PASSED:
-            (result_dir / "flag").write_text("1", encoding="utf-8")
+            (output_path / "flag").write_text("1", encoding="utf-8")
 
         self._emit("task_end", result.task_id,
                     status=result.status.value,
-                    archive=str(zip_path),
-                    result_file=str(result_dir / result_filename))
+                    run_dir=str(root_out_dir),
+                    result_file=str(output_path / result_filename))
+
 
