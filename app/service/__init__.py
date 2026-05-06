@@ -162,6 +162,35 @@ class TaskService:
         logger.info("task restarted: %s <- %s", new_task_id, task_id)
         return self._row_to_dict(new_row)
 
+    def resume_task(self, db: Session, task_id: str) -> dict:
+        """从断点续跑：保留同一任务 ID，跳过已完成函数直接从断点继续分析。"""
+        row = self._get_or_404(db, task_id)
+        if row.status in ("pending", "running"):
+            from fastapi import HTTPException
+            raise HTTPException(400, "任务仍在运行中，请先取消后再续跑")
+
+        from sqlalchemy.orm.attributes import flag_modified
+        tcfg = dict(row.task_config_json or {})
+        tcfg["resume"] = True
+        row.task_config_json = tcfg
+        row.status = "pending"
+        row.started_at = None
+        row.finished_at = None
+        row.result_json = None
+        row.error = None
+        flag_modified(row, "task_config_json")
+        db.commit()
+        db.refresh(row)
+
+        asyncio_task = asyncio.create_task(
+            self._execute_task(task_id),
+            name=f"dfa_task_{task_id}",
+        )
+        _running_tasks[task_id] = asyncio_task
+
+        logger.info("task resumed: %s", task_id)
+        return self._row_to_dict(row)
+
     def cancel_task(self, db: Session, task_id: str) -> dict:
         row = self._get_or_404(db, task_id)
         if row.status in ("passed", "failed", "error", "cancelled"):
@@ -194,8 +223,11 @@ class TaskService:
             svc = _load_svc_config()
             cfg = build_task_config(svc, row.prompt_content, cwd=row.input_path)
 
+            tcfg = row.task_config_json or {}
+            resume = bool(tcfg.get("resume", False))
+
             orch = Orchestrator(config=cfg)
-            result = await orch.execute_recursive(task_id)
+            result = await orch.execute_recursive(task_id, resume=resume)
 
             db.expire(row)
             db.refresh(row)
@@ -257,6 +289,7 @@ class TaskService:
             "status": row.status,
             "error": row.error,
             "result_json": row.result_json,
+            "task_config_json": row.task_config_json,
             "created_by": row.created_by,
             "created_at": fmt(row.created_at),
             "updated_at": fmt(row.updated_at),

@@ -28,6 +28,18 @@ def init_db(db_url: str, pool_size: int = 5, max_overflow: int = 10) -> None:
     )
     _SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=_engine)
     Base.metadata.create_all(bind=_engine)
+    # Migrate: add task_config_json column if missing (idempotent)
+    try:
+        with _engine.connect() as conn:
+            conn.execute(
+                __import__("sqlalchemy").text(
+                    "ALTER TABLE secflow_app_dfa_tasks "
+                    "ADD COLUMN task_config_json JSON NULL"
+                )
+            )
+            conn.commit()
+    except Exception:
+        pass  # Column already exists or other harmless error
     logger.info("Database initialized")
 
 

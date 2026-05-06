@@ -444,6 +444,7 @@ class Orchestrator(JudgeMixin):
         tainted_context: str = "",
         _analyzed: set[str] | None = None,
         _root_out_dir: Path | None = None,
+        resume: bool = False,
     ) -> TaskResult:
         """BFS 队列 + 工作池架构:
         A 进入队列 → Worker 执行 W+J 分析 → 解析 callee B,C,D → 加入队列 → Worker 执行 B,C,D...
@@ -527,42 +528,64 @@ class Orchestrator(JudgeMixin):
             out_dir = Path(os.path.abspath(task_cfg.output_dir)) / tid / "run"
             out_dir.mkdir(parents=True, exist_ok=True)
 
-            # 执行：使用 PerTaintWorkflow 实现多 session 并行污点分析
-            _taint_match = re.search(r'外部输入参数.*?为[:：]\s*([^\n]+)',
-                                    task_cfg.task or "")
-            _taint_list: list[str] = []
-            if _taint_match:
-                raw_taints = _taint_match.group(1)
-                _taint_list = [re.sub(r'[。，,（(].*', '', t).strip().strip('`')
-                               for t in raw_taints.split(',') if t.strip()]
-                _taint_list = [t for t in _taint_list if t and re.match(r'^[A-Za-z_]', t)]
-            if not _taint_list:
-                _tc_m = re.search(r'污染参数[:\uff1a]\s*([^\n]+)', taint_ctx or "")
-                if _tc_m:
-                    _taint_list = [t.strip().strip('`') for t in _tc_m.group(1).split(',') if t.strip()]
-            if not _taint_list:
-                _taint_list = ["all"]
+            # ── 断点续跑：检查是否已有缓存分析结果 ─────────────────────────
+            result: TaskResult | None = None
+            if resume:
+                _cached_df = _find_dataflow_file(out_dir, func_name)
+                if not _cached_df:
+                    _cached_df_path = df_dir / f"{safe_func}.md"
+                    if _cached_df_path.exists():
+                        _cached_df = str(_cached_df_path)
+                if _cached_df:
+                    try:
+                        cached_output = Path(_cached_df).read_text(encoding="utf-8")
+                        result = TaskResult(
+                            task_id=tid,
+                            status=TaskStatus.PASSED,
+                            task=task_cfg.task,
+                            final_output=cached_output,
+                        )
+                        self._emit("trace_skip", tid, function=func_name,
+                                   reason="resume: cached result reused", depth=dep)
+                    except OSError:
+                        result = None
 
-            workflow = PerTaintWorkflow(
-                cfg=task_cfg,
-                func_name=func_name,
-                src_file=src_file,
-                line_hint=line_hint,
-                taint_params=_taint_list,
-                taint_ctx=taint_ctx or "",
-                task_id=tid,
-                out_dir=out_dir,
-                dep=dep,
-                max_depth=max_depth,
-                on_event=self.on_event,
-            )
-            result = await workflow.run()
+            if result is None:
+                # 执行：使用 PerTaintWorkflow 实现多 session 并行污点分析
+                _taint_match = re.search(r'外部输入参数.*?为[:：]\s*([^\n]+)',
+                                        task_cfg.task or "")
+                _taint_list: list[str] = []
+                if _taint_match:
+                    raw_taints = _taint_match.group(1)
+                    _taint_list = [re.sub(r'[。，,（(].*', '', t).strip().strip('`')
+                                   for t in raw_taints.split(',') if t.strip()]
+                    _taint_list = [t for t in _taint_list if t and re.match(r'^[A-Za-z_]', t)]
+                if not _taint_list:
+                    _tc_m = re.search(r'污染参数[:\uff1a]\s*([^\n]+)', taint_ctx or "")
+                    if _tc_m:
+                        _taint_list = [t.strip().strip('`') for t in _tc_m.group(1).split(',') if t.strip()]
+                if not _taint_list:
+                    _taint_list = ["all"]
+
+                workflow = PerTaintWorkflow(
+                    cfg=task_cfg,
+                    func_name=func_name,
+                    src_file=src_file,
+                    line_hint=line_hint,
+                    taint_params=_taint_list,
+                    taint_ctx=taint_ctx or "",
+                    task_id=tid,
+                    out_dir=out_dir,
+                    dep=dep,
+                    max_depth=max_depth,
+                    on_event=self.on_event,
+                )
+                result = await workflow.run()
 
             # 通知 CLI: 函数分析完成
             self._emit("round_end", tid,
                        passed=(result.status.value == "passed"),
                        function=func_name, depth=dep)
-            # out_dir already defined above
             df_path = _find_dataflow_file(out_dir, func_name)
             if df_path:
                 try:

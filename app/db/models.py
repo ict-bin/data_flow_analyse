@@ -34,6 +34,9 @@ class AppDfaTask(Base):
     error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     result_json: Mapped[Optional[Dict[str, Any]]] = mapped_column(JSON, nullable=True)
 
+    # Per-task overrides / resume flags (e.g. {"resume": true})
+    task_config_json: Mapped[Optional[Dict[str, Any]]] = mapped_column(JSON, nullable=True)
+
     created_by: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, server_default=func.now(), index=True)
     updated_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, server_default=func.now(), onupdate=func.now())

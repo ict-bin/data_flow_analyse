@@ -72,6 +72,12 @@ async def restart_task(task_id: str, db: Session = Depends(get_db)):
     return get_task_service().restart_task(db, task_id)
 
 
+@router.post("/tasks/{task_id}/resume", status_code=201)
+async def resume_task(task_id: str, db: Session = Depends(get_db)):
+    """从断点续跑：跳过已完成的函数，继续分析未完成部分。"""
+    return get_task_service().resume_task(db, task_id)
+
+
 @router.post("/generate-prompt")
 async def generate_prompt(body: GeneratePromptRequest):
     """Auto-generate a data flow analysis prompt from an input path."""
