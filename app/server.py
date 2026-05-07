@@ -1,12 +1,20 @@
-"""
-data_flow_analyse — REST API 服务器
+"""data_flow_analyse — REST API 服务器
 
   Management layer (persistent, project-scoped):
     POST /api/app/dataflow-analyse/tasks          创建任务
     GET  /api/app/dataflow-analyse/tasks          任务列表（project_id 过滤）
     GET  /api/app/dataflow-analyse/tasks/{id}     任务详情
+    GET  /api/app/dataflow-analyse/tasks/{id}/logs  实时阶段事件
     POST /api/app/dataflow-analyse/tasks/{id}/cancel   取消任务
     POST /api/app/dataflow-analyse/tasks/{id}/restart  重新运行
+    POST /api/app/dataflow-analyse/tasks/{id}/resume   断点续跑
+    DELETE /api/app/dataflow-analyse/tasks/{id}        删除任务
+    GET  /api/app/dataflow-analyse/prompts        Prompt 模板列表
+    POST /api/app/dataflow-analyse/prompts        创建 Prompt 模板
+    GET  /api/app/dataflow-analyse/prompts/{id}   Prompt 模板详情
+    PUT  /api/app/dataflow-analyse/prompts/{id}   更新 Prompt 模板
+    DELETE /api/app/dataflow-analyse/prompts/{id} 删除 Prompt 模板
+    POST /api/app/dataflow-analyse/prompts/{id}/clone  克隆 Prompt 模板
     POST /api/app/dataflow-analyse/generate-prompt    根据路径生成 prompt
     GET  /api/app/dataflow-analyse/health         健康检查
 
@@ -34,11 +42,13 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from sse_starlette.sse import EventSourceResponse
 
-from .config import build_task_config, load_service_config
+from .config import build_task_config, get_service_yaml, load_service_config
+from .logging_utils import configure_container_logging
 from .models import SwarmEvent, TaskResult, TaskStatus, make_id
 from .orchestrator import Orchestrator
 
 load_dotenv()
+configure_container_logging("01-dataflow_analyse")
 
 # 使用统一的路径配置（优先读取环境变量）
 from .config import CONFIG_DIR, TARGET_DIR
@@ -69,35 +79,53 @@ _tasks: dict[str, TaskEntry] = {}
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # --- startup ---
-    _db_ready = False
-    _service_yaml_path = os.environ.get("SERVICE_YAML", "/app/service.yaml")
-    try:
-        import yaml
-        if os.path.isfile(_service_yaml_path):
-            with open(_service_yaml_path) as f:
-                _svc_yaml = yaml.safe_load(f) or {}
-            _db_cfg = _svc_yaml.get("database", {})
-            _db_url = (
-                f"mysql+pymysql://{_db_cfg.get('username','secflow')}:{_db_cfg.get('password','')}@"
-                f"{_db_cfg.get('host','127.0.0.1')}:{_db_cfg.get('port',3306)}/{_db_cfg.get('name','secflow')}?charset=utf8mb4"
-            )
-            from .db import init_db
-            init_db(
-                _db_url,
-                pool_size=_db_cfg.get("pool_size", 5),
-                max_overflow=_db_cfg.get("max_overflow", 10),
-            )
-            _db_ready = True
-            logger.info("DB initialized from service.yaml")
-    except Exception as exc:
-        logger.warning("DB init failed (management APIs unavailable): %s", exc)
+    svc_yaml = get_service_yaml()
+    db_url = svc_yaml.database.url
 
-    if _db_ready:
+    try:
+        from .db import init_db
+        init_db(
+            db_url,
+            pool_size=svc_yaml.database.pool_size,
+            max_overflow=svc_yaml.database.max_overflow,
+        )
+        logger.info("DB initialized: %s:%s/%s", svc_yaml.database.host, svc_yaml.database.port, svc_yaml.database.name)
+
         from .api import router as mgmt_router
         app.include_router(mgmt_router)
 
+        # Recover orphaned tasks from a previous crash
+        from datetime import datetime, timezone
+        from .db import get_db
+        from .db.models import AppDfaTask
+        _db = next(get_db())
+        orphaned = _db.query(AppDfaTask).filter(
+            AppDfaTask.status.in_(["running", "pending"]),
+            AppDfaTask.is_deleted.is_(False),
+        ).all()
+        if orphaned:
+            for _t in orphaned:
+                _t.status = "error"
+                _t.error = "服务重启，任务被中断"
+                _t.finished_at = datetime.now(timezone.utc).replace(tzinfo=None)
+            _db.commit()
+            logger.warning("Recovered %d orphaned task(s)", len(orphaned))
+
+        # Start menu registry heartbeat
+        from .service.registry_service import get_registry_service
+        _registry = get_registry_service()
+        await _registry.register()
+        _registry.start()
+    except Exception as exc:
+        logger.warning("DB init failed (management APIs unavailable): %s", exc)
+
     yield
     # --- shutdown ---
+    try:
+        from .service.registry_service import get_registry_service
+        get_registry_service().stop()
+    except Exception:
+        pass
 
 
 app = FastAPI(title="data_flow_analyse", version="2.0.0", lifespan=lifespan)

@@ -9,7 +9,7 @@ from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from app.db import get_db
-from app.service import generate_prompt_from_path, get_task_service
+from app.service.task_service import generate_prompt_from_path, get_task_service
 
 from . import router
 
@@ -20,6 +20,7 @@ class TaskCreateRequest(BaseModel):
     input_path: str
     output_path: Optional[str] = None
     task_description: Optional[str] = None
+    prompt_template_id: Optional[str] = None
     prompt_content: Optional[str] = None  # If omitted, auto-generated from input_path
 
 
@@ -41,6 +42,7 @@ async def create_task(body: TaskCreateRequest, db: Session = Depends(get_db)):
         input_path=body.input_path,
         output_path=body.output_path,
         task_description=body.task_description,
+        prompt_template_id=body.prompt_template_id,
         prompt_content=prompt,
     )
 
@@ -81,6 +83,31 @@ async def restart_task(task_id: str, db: Session = Depends(get_db)):
 async def resume_task(task_id: str, db: Session = Depends(get_db)):
     """从断点续跑：跳过已完成的函数，继续分析未完成部分。"""
     return get_task_service().resume_task(db, task_id)
+
+
+@router.delete("/tasks/{task_id}", status_code=204)
+async def delete_task(
+    task_id: str,
+    delete_files: bool = True,
+    db: Session = Depends(get_db),
+):
+    """软删除任务记录，可选删除输出目录文件。"""
+    get_task_service().delete_task(db, task_id, delete_files=delete_files)
+
+
+@router.get("/tasks/{task_id}/logs")
+async def get_task_logs(task_id: str, db: Session = Depends(get_db)):
+    """获取任务的实时阶段事件（stages_json）。"""
+    from app.db.models import AppDfaTask
+    row = db.query(AppDfaTask).filter(
+        AppDfaTask.task_id == task_id,
+        AppDfaTask.is_deleted.is_(False),
+    ).first()
+    if not row:
+        from fastapi import HTTPException
+        raise HTTPException(404, f"任务不存在: {task_id}")
+    return {"task_id": task_id, "status": row.status,
+            "stages_json": row.stages_json or {"events": []}}
 
 
 @router.post("/generate-prompt")
