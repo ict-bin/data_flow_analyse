@@ -46,6 +46,7 @@ from .config import build_task_config, get_service_yaml, load_service_config
 from .logging_utils import configure_container_logging
 from .models import SwarmEvent, TaskResult, TaskStatus, make_id
 from .orchestrator import Orchestrator
+from .time_utils import now_local
 
 load_dotenv()
 configure_container_logging("01-dataflow_analyse")
@@ -95,7 +96,6 @@ async def lifespan(app: FastAPI):
         app.include_router(mgmt_router)
 
         # Recover orphaned tasks from a previous crash
-        from datetime import datetime, timezone
         from .db import get_db
         from .db.models import AppDfaTask
         _db = next(get_db())
@@ -107,7 +107,7 @@ async def lifespan(app: FastAPI):
             for _t in orphaned:
                 _t.status = "error"
                 _t.error = "服务重启，任务被中断"
-                _t.finished_at = datetime.now(timezone.utc).replace(tzinfo=None)
+                _t.finished_at = now_local()
             _db.commit()
             logger.warning("Recovered %d orphaned task(s)", len(orphaned))
 
