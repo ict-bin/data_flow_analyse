@@ -22,6 +22,13 @@ _MIGRATIONS = [
     "ALTER TABLE secflow_app_dfa_tasks ADD COLUMN stages_json JSON NULL",
     # Add prompt_template_id for template linkage (added 2026-05)
     "ALTER TABLE secflow_app_dfa_tasks ADD COLUMN prompt_template_id VARCHAR(64) NULL",
+    "ALTER TABLE secflow_app_dfa_tasks ADD COLUMN task_origin_type VARCHAR(32) NULL",
+    "ALTER TABLE secflow_app_dfa_tasks ADD COLUMN parent_project_id VARCHAR(100) NULL",
+    "ALTER TABLE secflow_app_dfa_tasks ADD COLUMN parent_task_id VARCHAR(64) NULL",
+    "ALTER TABLE secflow_app_dfa_tasks ADD COLUMN parent_task_type VARCHAR(32) NULL",
+    "ALTER TABLE secflow_app_dfa_tasks ADD COLUMN parent_stage_name VARCHAR(64) NULL",
+    "ALTER TABLE secflow_app_dfa_tasks ADD COLUMN parent_stage_item_id VARCHAR(64) NULL",
+    "ALTER TABLE secflow_app_dfa_tasks ADD COLUMN parent_stage_item_key VARCHAR(255) NULL",
 ]
 
 

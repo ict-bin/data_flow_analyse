@@ -30,6 +30,29 @@ SERVICE_CONFIG_PATH = os.environ.get("SERVICE_CONFIG", "/app/config.json")
 _running_tasks: dict[str, asyncio.Task] = {}
 
 
+def _origin_payload(row: AppDfaTask) -> dict:
+    task_origin_type = str(row.task_origin_type or "").strip() or "manual"
+    parent_task_type = str(row.parent_task_type or "").strip() or None
+    origin_label = (
+        "二进制安全-源码扫描"
+        if task_origin_type == "binary_security" and parent_task_type == "source"
+        else "二进制安全-二进制类扫描"
+        if task_origin_type == "binary_security"
+        else "手动任务"
+    )
+    return {
+        "task_origin_type": task_origin_type,
+        "parent_project_id": row.parent_project_id,
+        "parent_task_id": row.parent_task_id,
+        "parent_task_type": parent_task_type,
+        "parent_stage_name": row.parent_stage_name,
+        "parent_stage_item_id": row.parent_stage_item_id,
+        "parent_stage_item_key": row.parent_stage_item_key,
+        "origin_label": origin_label,
+        "parent_task_display": row.parent_task_id,
+    }
+
+
 def _load_svc_config():
     for p in [SERVICE_CONFIG_PATH, "/opt/data_flow_analyse/config.example.json"]:
         if os.path.isfile(p):
@@ -137,7 +160,14 @@ class TaskService:
                     task_description: Optional[str] = None,
                     prompt_template_id: Optional[str] = None,
                     prompt_content: str, created_by: Optional[str] = None,
-                    task_config_json: Optional[dict] = None) -> dict:
+                    task_config_json: Optional[dict] = None,
+                    task_origin_type: Optional[str] = None,
+                    parent_project_id: Optional[str] = None,
+                    parent_task_id: Optional[str] = None,
+                    parent_task_type: Optional[str] = None,
+                    parent_stage_name: Optional[str] = None,
+                    parent_stage_item_id: Optional[str] = None,
+                    parent_stage_item_key: Optional[str] = None) -> dict:
         task_id = f"dfa_{uuid.uuid4().hex[:16]}"
         _fs_base = os.environ.get("FILESERVER_ROOT", "/data/files")
         effective_output = output_path or f"{_fs_base}/{project_id}/app/secflow-app-dataflow-analyse"
@@ -147,6 +177,13 @@ class TaskService:
             output_path=effective_output, prompt_template_id=prompt_template_id,
             prompt_content=prompt_content, status="pending", created_by=created_by,
             task_config_json=task_config_json,
+            task_origin_type=str(task_origin_type or "").strip() or "manual",
+            parent_project_id=parent_project_id,
+            parent_task_id=parent_task_id,
+            parent_task_type=parent_task_type,
+            parent_stage_name=parent_stage_name,
+            parent_stage_item_id=parent_stage_item_id,
+            parent_stage_item_key=parent_stage_item_key,
         )
         db.add(row); db.commit(); db.refresh(row)
         asyncio_task = asyncio.create_task(self._execute_task(task_id),
@@ -358,6 +395,7 @@ class TaskService:
         def fmt(dt: datetime | None) -> str | None:
             return dt.isoformat() + "Z" if dt else None
         return {
+            **_origin_payload(row),
             "task_id": row.task_id, "project_id": row.project_id,
             "task_name": row.task_name, "task_description": row.task_description,
             "input_path": row.input_path, "output_path": row.output_path,
