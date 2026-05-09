@@ -136,6 +136,18 @@ class JudgeMixin:
         j_dir = rnd_judges_dir / jid
         j_dir.mkdir(parents=True, exist_ok=True)
 
+        # 将源码目录文件链接到 Judge 工作目录，使 Judge 能够读取源文件验证分析
+        target_dir = os.path.abspath(cwd)
+        if os.path.isdir(target_dir):
+            for item in os.listdir(target_dir):
+                src = os.path.join(target_dir, item)
+                dst = str(j_dir / item)
+                if not os.path.exists(dst):
+                    try:
+                        os.symlink(src, dst)
+                    except OSError:
+                        pass
+
         j_result = JudgeRoundResult(
             judge_id=jid,
             model=judge_cfg.model,
@@ -145,7 +157,7 @@ class JudgeMixin:
             "model": judge_cfg.model,
             "tools": judge_cfg.tools or cfg.judges.default_tools,
             "system_prompt": judge_sys_prompt,
-            "cwd": str(j_dir),   # Judge 的 cwd 指向自己的输出目录
+            "cwd": str(j_dir),   # Judge 的 cwd 指向自己的输出目录（含源码符号链接）
             "thinking_level": judge_cfg.thinking_level or cfg.judges.default_thinking_level,
             "cancel_event": self._cancel_event,
             "max_retries": cfg.agent_max_retries,
