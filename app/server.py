@@ -111,6 +111,43 @@ async def lifespan(app: FastAPI):
             _db.commit()
             logger.warning("Recovered %d orphaned task(s)", len(orphaned))
 
+        # Sync models.json: DB is the single source of truth for LLM providers.
+        # On first boot the old file-based models.json is imported into DB then
+        # the file is overwritten so subsequent boots ignore it entirely.
+        try:
+            from .service.config_service import get_model_config_service
+            import json as _json, os as _os
+            _pi_dir = _os.environ.get("PI_CODING_AGENT_DIR", "/root/.pi/agent")
+            _models_path = _os.path.join(_pi_dir, "models.json")
+            _model_svc = get_model_config_service()
+            _db2 = next(get_db())
+            _existing = _model_svc.get_models_config(_db2)
+            _has_providers = bool((_existing.get("providers") or {}))
+            if not _has_providers:
+                # DB empty: try to import from file (one-time migration)
+                _file_data = None
+                if _os.path.isfile(_models_path) and not _os.path.islink(_models_path):
+                    try:
+                        _file_data = _json.loads(open(_models_path, encoding="utf-8").read())
+                    except Exception:
+                        pass
+                if _file_data and isinstance(_file_data.get("providers"), dict) and _file_data["providers"]:
+                    _model_svc.save_models_config(_db2, _file_data)
+                    logger.info("One-time migration: imported %d providers from models.json into DB",
+                                len(_file_data["providers"]))
+                    _existing = _file_data
+            # Overwrite models.json with DB content (discard any stale file data)
+            _blob = {k: v for k, v in _existing.items() if k != "updated_at"}
+            _os.makedirs(_pi_dir, exist_ok=True)
+            if _os.path.islink(_models_path):
+                _os.unlink(_models_path)
+            with open(_models_path, "w", encoding="utf-8") as _mf:
+                _json.dump(_blob, _mf, ensure_ascii=False, indent=2)
+            logger.info("models.json synced from DB (%d providers)",
+                        len((_blob.get("providers") or {})))
+        except Exception as _me:
+            logger.warning("Failed to sync models.json from DB on startup: %s", _me)
+
         # Start menu registry heartbeat
         from .service.registry_service import get_registry_service
         _registry = get_registry_service()
