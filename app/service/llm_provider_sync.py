@@ -46,7 +46,7 @@ def build_models_json(providers: list[dict[str, Any]]) -> dict:
         )
         result["providers"][key] = {
             "baseUrl": p.get("api_base", ""),
-            "api": p.get("provider_type", "openai-completions"),
+            "api": "openai-completions",
             "apiKey": p.get("api_key", ""),
             "models": models_list,
         }

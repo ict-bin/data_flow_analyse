@@ -29,6 +29,15 @@ _MIGRATIONS = [
     "ALTER TABLE secflow_app_dfa_tasks ADD COLUMN parent_stage_name VARCHAR(64) NULL",
     "ALTER TABLE secflow_app_dfa_tasks ADD COLUMN parent_stage_item_id VARCHAR(64) NULL",
     "ALTER TABLE secflow_app_dfa_tasks ADD COLUMN parent_stage_item_key VARCHAR(255) NULL",
+    # Add global models config table (added 2026-05)
+    (
+        "CREATE TABLE IF NOT EXISTS secflow_app_dfa_models_config ("
+        "id INT AUTO_INCREMENT PRIMARY KEY, "
+        "config_key VARCHAR(64) NOT NULL UNIQUE, "
+        "config_json JSON NULL, "
+        "updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP"
+        ")"
+    ),
 ]
 
 

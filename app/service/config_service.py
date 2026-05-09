@@ -7,7 +7,7 @@ from typing import Any, Dict
 
 from sqlalchemy.orm import Session
 
-from app.db.models import AppDfaProjectConfig
+from app.db.models import AppDfaModelsConfig, AppDfaProjectConfig
 
 logger = logging.getLogger("dfa.config_service")
 
@@ -97,3 +97,56 @@ def get_config_service() -> ConfigService:
     if _config_service is None:
         _config_service = ConfigService()
     return _config_service
+
+
+_DEFAULT_MODELS_CONFIG: Dict[str, Any] = {
+    "providers": {}
+}
+
+
+class ModelConfigService:
+    """Global models.json configuration stored in the database."""
+
+    def get_models_config(self, db: Session) -> dict:
+        from sqlalchemy.exc import SQLAlchemyError
+        try:
+            row = db.query(AppDfaModelsConfig).filter_by(config_key="global").first()
+        except SQLAlchemyError as exc:
+            logger.error("Failed to query models config: %s", exc)
+            return dict(_DEFAULT_MODELS_CONFIG)
+        if row and row.config_json:
+            data = dict(row.config_json)
+        else:
+            data = dict(_DEFAULT_MODELS_CONFIG)
+        data["updated_at"] = row.updated_at.isoformat() if (row and row.updated_at) else None
+        return data
+
+    def save_models_config(self, db: Session, config_data: dict) -> dict:
+        from sqlalchemy.exc import SQLAlchemyError
+        blob = {k: v for k, v in config_data.items() if k != "updated_at"}
+        try:
+            row = db.query(AppDfaModelsConfig).filter_by(config_key="global").first()
+            if row:
+                row.config_json = blob
+            else:
+                row = AppDfaModelsConfig(config_key="global", config_json=blob)
+                db.add(row)
+            db.commit()
+            db.refresh(row)
+        except SQLAlchemyError as exc:
+            logger.error("Failed to save models config: %s", exc)
+            db.rollback()
+            raise
+        result = dict(blob)
+        result["updated_at"] = row.updated_at.isoformat() if row.updated_at else None
+        return result
+
+
+_model_config_service: ModelConfigService | None = None
+
+
+def get_model_config_service() -> ModelConfigService:
+    global _model_config_service
+    if _model_config_service is None:
+        _model_config_service = ModelConfigService()
+    return _model_config_service
