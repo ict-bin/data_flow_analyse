@@ -38,7 +38,7 @@ _DEFAULT_CONFIG: Dict[str, Any] = {
     "pi_max_retries": -1,
     "pi_retry_delay": 10,
     "max_trace_depth": 5,
-    "callee_concurrency": -1,
+    "callee_concurrency": 4,
     "workers": {
         "default_tools": ["read", "bash", "edit", "write", "find"],
         "system_prompt_dir": "/opt/data_flow_analyse/prompts/workers",

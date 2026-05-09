@@ -469,10 +469,9 @@ class Orchestrator(JudgeMixin):
 
         # ── 根任务:BFS 队列 + 工作池 ────────────────────────────────────────
         max_depth = cfg.max_trace_depth
-        # BFS 并发度: callee_concurrency 显式设置时优先；否则用 worker_count
-        # 这限制了 同时进行 W+J 分析的并行度（不包含同一 workflow 内的 taint 并行）
-        n_workers = (max(1, cfg.callee_concurrency) if cfg.callee_concurrency > 0
-                    else max(1, cfg.worker_count))
+        # BFS 并发度：直接使用 callee_concurrency（1-64，1=串行）
+        # 控制同时进行 W+J 分析的 BFS 工作池大小，与 taint 内部并行正交
+        n_workers = max(1, cfg.callee_concurrency)
         analyzed: set[str] = _analyzed if _analyzed is not None else set()
         MAX_CALLEES_PER_LEVEL = 10
 
