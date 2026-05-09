@@ -214,14 +214,16 @@ class TaskService:
         flag_modified(row, "task_config_json")
         db.commit(); db.refresh(row)
         # 删除上次执行目录，保证从零开始
-        if row.output_path:
-            import shutil as _shutil
-            task_root = os.path.join(row.output_path, task_id)
-            if os.path.isdir(task_root):
-                try:
-                    _shutil.rmtree(task_root)
-                except Exception as _e:
-                    logger.warning("Failed to clean task dir %s: %s", task_root, _e)
+        # 路径逻辑与 _execute_task 一致：优先用 row.output_path，否则从 svc config 取默认值
+        import shutil as _shutil
+        _svc_cleanup = _load_svc_config_from_db(db, row.project_id)
+        _effective_output = row.output_path or _svc_cleanup.output_dir
+        task_root = os.path.join(_effective_output, task_id)
+        if os.path.isdir(task_root):
+            try:
+                _shutil.rmtree(task_root)
+            except Exception as _e:
+                logger.warning("Failed to clean task dir %s: %s", task_root, _e)
         asyncio_task = asyncio.create_task(self._execute_task(task_id),
                                             name=f"dfa_task_{task_id}")
         _running_tasks[task_id] = asyncio_task
