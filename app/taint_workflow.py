@@ -69,9 +69,18 @@ def _extract_function_body(ws, src_file: str, func_name: str,
         except ValueError:
             pass
     filename = src_file.split("/")[-1]
-    # Candidate list: direct path, filename-only, then recursive rglob search
+    # Candidate list: direct path, filename-only, then recursive walk search.
+    # Use os.walk(followlinks=True) instead of Path.rglob() because Python 3.12
+    # pathlib does NOT follow symbolic links to directories during rglob traversal,
+    # which causes the worker workspace symlinks to be skipped.
+    import os as _os_walk
     direct_candidates = [_Path(str(ws)) / src_file, _Path(str(ws)) / filename]
-    rglob_candidates = [p for p in _Path(str(ws)).rglob(filename) if p.is_file()]
+    rglob_candidates = [
+        _Path(root) / f
+        for root, dirs, files in _os_walk.walk(str(ws), followlinks=True)
+        for f in files
+        if f == filename
+    ]
     all_candidates = direct_candidates + rglob_candidates
     seen: set[str] = set()
     for cand in all_candidates:
