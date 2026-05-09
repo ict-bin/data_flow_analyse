@@ -68,7 +68,20 @@ def _extract_function_body(ws, src_file: str, func_name: str,
             hint_num = int(line_hint.lstrip('Ll'))
         except ValueError:
             pass
-    for cand in [_Path(str(ws)) / src_file, _Path(str(ws)) / src_file.split("/")[-1]]:
+    filename = src_file.split("/")[-1]
+    # Candidate list: direct path, filename-only, then recursive rglob search
+    direct_candidates = [_Path(str(ws)) / src_file, _Path(str(ws)) / filename]
+    rglob_candidates = [p for p in _Path(str(ws)).rglob(filename) if p.is_file()]
+    all_candidates = direct_candidates + rglob_candidates
+    seen: set[str] = set()
+    for cand in all_candidates:
+        try:
+            key = str(cand.resolve())
+        except OSError:
+            key = str(cand)
+        if key in seen:
+            continue
+        seen.add(key)
         if not cand.exists():
             continue
         try:
