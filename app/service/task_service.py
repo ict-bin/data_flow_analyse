@@ -171,7 +171,16 @@ class TaskService:
                     parent_stage_item_key: Optional[str] = None) -> dict:
         task_id = f"dfa_{uuid.uuid4().hex[:16]}"
         _fs_base = os.environ.get("FILESERVER_ROOT", "/data/files")
+        # Validate paths are under FILESERVER_ROOT to prevent path traversal
+        from fastapi import HTTPException as _HTTPException
+        _abs_input = os.path.realpath(os.path.abspath(input_path))
+        _abs_fs = os.path.realpath(os.path.abspath(_fs_base))
+        if not _abs_input.startswith(_abs_fs + os.sep) and _abs_input != _abs_fs:
+            raise _HTTPException(400, f"input_path 必须位于 {_fs_base} 下")
         effective_output = output_path or f"{_fs_base}/{project_id}/app/secflow-app-dataflow-analyse"
+        _abs_output = os.path.realpath(os.path.abspath(effective_output))
+        if not _abs_output.startswith(_abs_fs + os.sep) and _abs_output != _abs_fs:
+            raise _HTTPException(400, f"output_path 必须位于 {_fs_base} 下")
         row = AppDfaTask(
             task_id=task_id, project_id=project_id, task_name=task_name,
             task_description=task_description, input_path=input_path,

@@ -41,14 +41,14 @@ _DEFAULT_CONFIG: Dict[str, Any] = {
     "callee_concurrency": -1,
     "workers": {
         "default_tools": ["read", "bash", "edit", "write", "find"],
-        "system_prompt_dir": "/app/prompts/workers",
+        "system_prompt_dir": "/opt/data_flow_analyse/prompts/workers",
         "default_thinking_level": "off",
         "agents": [],
         "stage_models": {},
     },
     "judges": {
         "default_tools": ["read", "bash", "find"],
-        "system_prompt_dir": "/app/prompts/judges",
+        "system_prompt_dir": "/opt/data_flow_analyse/prompts/judges",
         "default_thinking_level": "off",
         "agents": [],
         "stage_models": {},
