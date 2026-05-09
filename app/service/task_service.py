@@ -7,11 +7,13 @@ Each task is persisted in MySQL and executed asynchronously.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import time as _time
 import uuid
 from datetime import datetime
+from pathlib import Path
 from typing import Optional
 
 from sqlalchemy.orm import Session
@@ -29,6 +31,71 @@ SERVICE_CONFIG_PATH = os.environ.get("SERVICE_CONFIG", "/app/config.json")
 
 # Running asyncio tasks keyed by task_id so we can cancel them
 _running_tasks: dict[str, asyncio.Task] = {}
+
+
+def _task_root(row: AppDfaTask) -> Path | None:
+    if not row.output_path:
+        return None
+    return Path(row.output_path) / row.task_id
+
+
+def _task_run_root(row: AppDfaTask) -> Path | None:
+    root = _task_root(row)
+    return root / "run" if root else None
+
+
+def _task_result_path(row: AppDfaTask) -> Path | None:
+    run_root = _task_run_root(row)
+    return run_root / "result.json" if run_root else None
+
+
+def _write_json_atomic(path: Path, payload: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.replace(path)
+
+
+def _load_task_result_json(row: AppDfaTask) -> dict | None:
+    path = _task_result_path(row)
+    if path and path.is_file():
+        try:
+            loaded = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                return loaded
+        except Exception as exc:
+            logger.warning("failed to load task result file %s: %s", path, exc)
+    return row.result_json if isinstance(row.result_json, dict) else None
+
+
+def _write_task_result_json(row: AppDfaTask, payload: dict) -> str | None:
+    path = _task_result_path(row)
+    if not path:
+        return None
+    _write_json_atomic(path, payload)
+    return str(path)
+
+
+def _lightweight_result_json(row: AppDfaTask, payload: dict | None, result_file: str | None = None) -> dict | None:
+    if not isinstance(payload, dict):
+        return None
+    if payload.get("result_externalized"):
+        return {
+            **payload,
+            "result_file": payload.get("result_file") or result_file or (str(_task_result_path(row)) if _task_result_path(row) else None),
+            "result_externalized": True,
+        }
+    total_tokens = payload.get("total_tokens") if isinstance(payload.get("total_tokens"), dict) else None
+    rounds = payload.get("rounds") if isinstance(payload.get("rounds"), list) else []
+    return {
+        "result_file": result_file or (str(_task_result_path(row)) if _task_result_path(row) else None),
+        "result_externalized": True,
+        "status": payload.get("status") or row.status,
+        "error": payload.get("error"),
+        "round_count": len(rounds),
+        "total_duration_ms": payload.get("total_duration_ms"),
+        "total_tokens": total_tokens,
+    }
 
 
 def _origin_payload(row: AppDfaTask) -> dict:
@@ -361,7 +428,9 @@ class TaskService:
                             and isinstance(_prev.get("events"), list) else [])
             row.stages_json = {"events": _prev_events + event_buffer, "final": True}
             if result:
-                row.result_json = result.model_dump(mode="json")
+                result_payload = result.model_dump(mode="json")
+                result_file = _write_task_result_json(row, result_payload)
+                row.result_json = _lightweight_result_json(row, result_payload, result_file)
                 if result.error:
                     row.error = result.error
             db.commit()
@@ -413,7 +482,7 @@ class TaskService:
             "input_path": row.input_path, "output_path": row.output_path,
             "prompt_template_id": row.prompt_template_id,
             "prompt_content": row.prompt_content, "status": row.status,
-            "error": row.error, "result_json": row.result_json,
+            "error": row.error, "result_json": _lightweight_result_json(row, row.result_json),
             "stages_json": row.stages_json,
             "task_config_json": row.task_config_json,
             "created_by": row.created_by,
