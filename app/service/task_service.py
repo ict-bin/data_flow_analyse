@@ -76,21 +76,16 @@ def _load_svc_config_from_db(db: Session, project_id: str) -> "object":
 
 
 def _write_models_json_from_db(db: Session) -> None:
-    """从数据库读取 models 配置并写入 pi 的配置目录，使 pi 能识别模型。"""
+    """从配置中心拉取 LLM Provider 并写入 pi 的 models.json。"""
     try:
-        from app.service.config_service import get_model_config_service
-        import json as _json
-        pi_dir = os.environ.get("PI_CODING_AGENT_DIR", "/root/.pi/agent")
-        os.makedirs(pi_dir, exist_ok=True)
-        models_cfg = get_model_config_service().get_models_config(db)
-        blob = {k: v for k, v in models_cfg.items() if k != "updated_at"}
-        dest = os.path.join(pi_dir, "models.json")
-        # 若原来是符号链接先移除，避免覆盖 ConfigMap 挂载文件
-        if os.path.islink(dest):
-            os.unlink(dest)
-        with open(dest, "w", encoding="utf-8") as _f:
-            _json.dump(blob, _f, ensure_ascii=False, indent=2)
-        logger.info("models.json written from DB → %s", dest)
+        from app.config import get_service_yaml
+        from app.service.llm_provider_sync import sync_providers_to_pi
+        svc_yaml = get_service_yaml()
+        sync_providers_to_pi(
+            base_url=svc_yaml.configcenter.base_url,
+            token=svc_yaml.auth_service.service_machine_token,
+            timeout=svc_yaml.configcenter.timeout,
+        )
     except Exception as _exc:
         logger.warning("_write_models_json_from_db failed: %s", _exc, exc_info=True)
 

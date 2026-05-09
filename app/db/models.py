@@ -89,12 +89,3 @@ class AppDfaProjectConfig(Base):
     config_json: Mapped[Optional[Dict[str, Any]]] = mapped_column(JSON, nullable=True)
     updated_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=now_local, onupdate=now_local)
 
-
-class AppDfaModelsConfig(Base):
-    """Global models.json configuration (LLM provider/model registry)."""
-    __tablename__ = "secflow_app_dfa_models_config"
-
-    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    config_key: Mapped[str] = mapped_column(String(64), nullable=False, unique=True, index=True, default="global")
-    config_json: Mapped[Optional[Dict[str, Any]]] = mapped_column(JSON, nullable=True)
-    updated_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=now_local, onupdate=now_local)
