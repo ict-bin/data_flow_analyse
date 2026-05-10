@@ -17,6 +17,7 @@ data_flow_analyse — Agent 子进程执行器（RPC 模式）
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import os
@@ -335,8 +336,9 @@ async def run_agent(
             )
         args.extend(["--system-prompt", sys_tmp_file])
 
+    timeout_seconds = float(os.environ.get("DFA_AGENT_TIMEOUT_SECONDS", "900") or "0")
     try:
-        return await _run_with_pi_retry(
+        coro = _run_with_pi_retry(
             args=args,
             cwd=os.path.abspath(cwd),
             env=env,
@@ -349,6 +351,15 @@ async def run_agent(
             pi_max_retries=pi_max_retries,
             pi_retry_delay=pi_retry_delay,
         )
+        if timeout_seconds > 0:
+            return await asyncio.wait_for(coro, timeout=timeout_seconds)
+        return await coro
+    except asyncio.TimeoutError:
+        _log_error(f"agent step timed out after {timeout_seconds:.0f}s")
+        r = AgentResult()
+        r.error = f"agent step timed out after {timeout_seconds:.0f}s"
+        r.exit_code = -1
+        return r
     finally:
         pass  # .system_prompt.md is in workspace cwd, cleaned with it
 
@@ -602,6 +613,19 @@ async def _run_with_api_retry(
                 proc.kill()
                 await proc.wait()
                 result.exit_code = -1
+
+        except asyncio.CancelledError:
+            _log_warn("agent run cancelled, terminating pi process")
+            with contextlib.suppress(Exception):
+                proc.terminate()
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=5)
+            except Exception:
+                with contextlib.suppress(Exception):
+                    proc.kill()
+                with contextlib.suppress(Exception):
+                    await proc.wait()
+            raise
 
         except Exception as e:
             # 管道断裂、进程被杀等

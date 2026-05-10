@@ -16,7 +16,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, load_only
 
 from app.config import build_task_config, load_service_config
 from app.db.models import AppDfaTask
@@ -207,7 +207,7 @@ def _flush_stages(task_id: str, events: list[dict]) -> None:
 class TaskService:
 
     def list_tasks(self, db: Session, *, project_id: str, page: int = 1,
-                   per_page: int = 20, status: Optional[str] = None) -> dict:
+                   per_page: int = 100, status: Optional[str] = None) -> dict:
         query = db.query(AppDfaTask).filter(
             AppDfaTask.project_id == project_id,
             AppDfaTask.is_deleted.is_(False),
@@ -215,9 +215,10 @@ class TaskService:
         if status:
             query = query.filter(AppDfaTask.status == status)
         total = query.count()
-        rows = (query.order_by(AppDfaTask.created_at.desc())
+        rows = (query.options(*self._list_load_options())
+                .order_by(AppDfaTask.created_at.desc())
                 .offset((page - 1) * per_page).limit(per_page).all())
-        return {"items": [self._row_to_dict(r) for r in rows],
+        return {"items": [self._row_to_dict(r, include_heavy=False) for r in rows],
                 "total": total, "page": page, "per_page": per_page}
 
     def get_task(self, db: Session, task_id: str) -> dict:
@@ -472,7 +473,36 @@ class TaskService:
         return row
 
     @staticmethod
-    def _row_to_dict(row: AppDfaTask) -> dict:
+    def _list_load_options():
+        return (
+            load_only(
+                AppDfaTask.id,
+                AppDfaTask.task_id,
+                AppDfaTask.project_id,
+                AppDfaTask.task_origin_type,
+                AppDfaTask.parent_project_id,
+                AppDfaTask.parent_task_id,
+                AppDfaTask.parent_task_type,
+                AppDfaTask.parent_stage_name,
+                AppDfaTask.parent_stage_item_id,
+                AppDfaTask.parent_stage_item_key,
+                AppDfaTask.task_name,
+                AppDfaTask.task_description,
+                AppDfaTask.input_path,
+                AppDfaTask.output_path,
+                AppDfaTask.prompt_template_id,
+                AppDfaTask.status,
+                AppDfaTask.error,
+                AppDfaTask.created_by,
+                AppDfaTask.created_at,
+                AppDfaTask.updated_at,
+                AppDfaTask.started_at,
+                AppDfaTask.finished_at,
+            ),
+        )
+
+    @staticmethod
+    def _row_to_dict(row: AppDfaTask, *, include_heavy: bool = True) -> dict:
         def fmt(dt: datetime | None) -> str | None:
             return isoformat_local(dt)
         return {
@@ -481,10 +511,11 @@ class TaskService:
             "task_name": row.task_name, "task_description": row.task_description,
             "input_path": row.input_path, "output_path": row.output_path,
             "prompt_template_id": row.prompt_template_id,
-            "prompt_content": row.prompt_content, "status": row.status,
-            "error": row.error, "result_json": _lightweight_result_json(row, row.result_json),
-            "stages_json": row.stages_json,
-            "task_config_json": row.task_config_json,
+            "prompt_content": row.prompt_content if include_heavy else None, "status": row.status,
+            "error": row.error,
+            "result_json": _lightweight_result_json(row, row.result_json) if include_heavy else None,
+            "stages_json": row.stages_json if include_heavy else None,
+            "task_config_json": row.task_config_json if include_heavy else None,
             "created_by": row.created_by,
             "created_at": fmt(row.created_at), "updated_at": fmt(row.updated_at),
             "started_at": fmt(row.started_at), "finished_at": fmt(row.finished_at),

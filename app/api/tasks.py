@@ -65,7 +65,7 @@ async def create_task(body: TaskCreateRequest, db: Session = Depends(get_db)):
 async def list_tasks(
     project_id: str = Query(...),
     page: int = Query(1, ge=1),
-    per_page: int = Query(20, ge=1, le=100),
+    per_page: int = Query(100, ge=1, le=1000),
     status: Optional[str] = Query(None),
     db: Session = Depends(get_db),
 ):
