@@ -285,7 +285,7 @@ def _build_summary_eval_prompt(func_name: str, rnd: int, taint_params: list[str]
         f"## 任务要求\n\n{task}\n\n"
         f"## 需要读取的文件\n\n"
         f"1. 汇总报告: `worker-0-dataflow.md`\n"
-        f"2. tainted.list: 通过工作目录或 round-{rnd}/workers 查找\n"
+        f"2. tainted.list: 通过工作目录或 round_{rnd:03d}/workers 查找\n"
         f"3. 各污点分析: {taint_files}（可选，用于验证）\n\n"
         f"**评审标准：**\n\n"
         f"| 维度 | 分值 |\n"
@@ -460,7 +460,7 @@ class PerTaintWorkflow:
         _taint_sem = asyncio.Semaphore(_taint_concurrency)
 
         for rnd in range(1, max_rounds + 1):
-            rnd_dir = self.out_dir / f"round-{rnd}"
+            rnd_dir = self.out_dir / f"round_{rnd:03d}"
             rnd_dir.mkdir(exist_ok=True)
             rnd_workers_dir = rnd_dir / "workers"
             rnd_workers_dir.mkdir(exist_ok=True)

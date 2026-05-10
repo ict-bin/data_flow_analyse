@@ -102,13 +102,14 @@ def _find_dataflow_file(worker_cwd: str, function_name: str = "") -> str:
 def _read_tainted_list(worker_cwd: str) -> list[CalleeRef]:
     """读取 tainted.list 文件，返回 CalleeRef 列表。
 
-    搜索顺序: workspace-worker-*/ → round-*/workers/ → 任意子目录
+    搜索顺序: workspace-worker-*/ → round_*/workers/ → round-*/workers/ → 任意子目录
     """
     callees: list[CalleeRef] = []
     task_dir = Path(worker_cwd)
     # 搜索所有可能位置
     candidates: list[Path] = []
     candidates.extend(task_dir.glob("workspace-worker-*/tainted.list"))
+    candidates.extend(task_dir.glob("round_*/workers/*/tainted.list"))
     candidates.extend(task_dir.glob("round-*/workers/*/tainted.list"))
     candidates.extend(task_dir.rglob("tainted.list"))
     # 去重并按修改时间排序
@@ -527,4 +528,3 @@ def _parse_summary_md(output: str) -> dict:
 
 
 # ─── 编排器 ───────────────────────────────────────────────────────────────────
-

@@ -7,6 +7,7 @@ Each task is persisted in MySQL and executed asynchronously.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -72,6 +73,68 @@ def _write_task_result_json(row: AppDfaTask, payload: dict) -> str | None:
     path = _task_result_path(row)
     if not path:
         return None
+    _write_json_atomic(path, payload)
+    return str(path)
+
+
+def _input_manifest_path(row: AppDfaTask) -> Path | None:
+    root = _task_root(row)
+    return root / "input" / "input_manifest.json" if root else None
+
+
+def _path_metadata(path_value: str | None) -> dict:
+    if not path_value:
+        return {"path": None, "exists": False}
+    path = Path(path_value)
+    try:
+        stat = path.stat()
+        kind = "directory" if path.is_dir() else "file" if path.is_file() else "other"
+        return {
+            "path": str(path),
+            "real_path": str(path.resolve()),
+            "exists": True,
+            "kind": kind,
+            "size_bytes": stat.st_size if path.is_file() else None,
+            "mtime": datetime.fromtimestamp(stat.st_mtime).isoformat(),
+        }
+    except OSError:
+        return {
+            "path": str(path),
+            "real_path": os.path.realpath(os.path.abspath(str(path))),
+            "exists": False,
+        }
+
+
+def _write_input_manifest(row: AppDfaTask) -> str | None:
+    """Write task input metadata only; never copy original input contents."""
+    path = _input_manifest_path(row)
+    if not path:
+        return None
+    prompt = row.prompt_content or ""
+    payload = {
+        "schema_version": 1,
+        "generated_at": isoformat_local(now_local()),
+        "task": {
+            "task_id": row.task_id,
+            "project_id": row.project_id,
+            "task_name": row.task_name,
+            "task_description": row.task_description,
+            "created_by": row.created_by,
+            "created_at": isoformat_local(row.created_at),
+            "started_at": isoformat_local(row.started_at),
+        },
+        "input": _path_metadata(row.input_path),
+        "prompt": {
+            "template_id": row.prompt_template_id,
+            "content_length": len(prompt),
+            "content_sha256": hashlib.sha256(prompt.encode("utf-8")).hexdigest() if prompt else None,
+        },
+        "origin": _origin_payload(row),
+        "config": {
+            "has_task_overrides": bool(row.task_config_json),
+            "override_keys": sorted((row.task_config_json or {}).keys()),
+        },
+    }
     _write_json_atomic(path, payload)
     return str(path)
 
@@ -392,6 +455,7 @@ class TaskService:
             if row.started_at is None:
                 row.started_at = now_local()
             db.commit()
+            _write_input_manifest(row)
 
             _write_models_json_from_db(db)
             svc = _load_svc_config_from_db(db, row.project_id)

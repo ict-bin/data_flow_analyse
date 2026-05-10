@@ -13,6 +13,7 @@ import os
 import re
 import shutil
 import time
+import hashlib
 from collections import Counter
 from pathlib import Path
 from typing import Callable
@@ -59,6 +60,27 @@ from .prompt_builder import (
 
 WORKER_CONCURRENCY = 4
 
+
+def _round_dir_name(round_num: int) -> str:
+    return f"round_{round_num:03d}"
+
+
+def _safe_dir_name(value: str, *, max_len: int = 120) -> str:
+    safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", value).strip("._-")
+    if not safe:
+        safe = "item"
+    if len(safe) <= max_len:
+        return safe
+    digest = hashlib.sha1(value.encode("utf-8", errors="replace")).hexdigest()[:10]
+    return f"{safe[:max_len - 11]}-{digest}"
+
+
+def _nested_function_run_dir(root_out_dir: Path, tid: str, dep: int, func_name: str) -> Path:
+    if dep <= 0:
+        return root_out_dir
+    logical = f"{tid}-{func_name}"
+    return root_out_dir / "subtasks" / f"depth_{dep:02d}" / _safe_dir_name(logical)
+
 class Orchestrator(JudgeMixin):
 
     def __init__(
@@ -78,7 +100,15 @@ class Orchestrator(JudgeMixin):
         except Exception:
             pass
 
-    async def execute(self, task_id: str | None = None, *, archive: bool = True, depth: int = 0, max_depth: int = 0) -> TaskResult:
+    async def execute(
+        self,
+        task_id: str | None = None,
+        *,
+        archive: bool = True,
+        depth: int = 0,
+        max_depth: int = 0,
+        run_dir: Path | None = None,
+    ) -> TaskResult:
         cfg = self.cfg
         task_id = task_id or make_id()
         start = time.time()
@@ -86,9 +116,13 @@ class Orchestrator(JudgeMixin):
         threshold = cfg.pass_threshold or math.ceil(cfg.judge_count / 2)
         self._cancel_event = asyncio.Event()
 
-        # 任务目录结构: output_dir/task_id/run/ (中间件) + output_dir/task_id/output/ (最终输出)
-        task_base = Path(os.path.abspath(cfg.output_dir)) / task_id
-        out_dir = task_base / "run"
+        # 任务目录结构: output_dir/task_id/input|run|output。递归函数子任务只在根 run/subtasks 下建中间目录。
+        if run_dir is not None:
+            out_dir = run_dir
+            task_base = out_dir.parent
+        else:
+            task_base = Path(os.path.abspath(cfg.output_dir)) / task_id
+            out_dir = task_base / "run"
         out_dir.mkdir(parents=True, exist_ok=True)
 
         # 归档模式且非子任务:立即写 flag=0 到 output/ 目录
@@ -155,7 +189,7 @@ class Orchestrator(JudgeMixin):
 
                 self._emit("round_start", task_id, round=rnd_num,
                            function=cfg.function_name, depth=depth)
-                rnd_dir = out_dir / f"round-{rnd_num}"
+                rnd_dir = out_dir / _round_dir_name(rnd_num)
                 rnd_workers_dir = rnd_dir / "workers"
                 rnd_judges_dir = rnd_dir / "judges"
                 rnd_workers_dir.mkdir(parents=True, exist_ok=True)
@@ -455,8 +489,19 @@ class Orchestrator(JudgeMixin):
 
         # ── 非根任务:直接执行 W+J 并返回,由根任务的工作池调度 ──────────────
         if not is_root:
-            result = await self.execute(task_id, archive=False, depth=depth, max_depth=cfg.max_trace_depth)
-            out_dir = Path(os.path.abspath(cfg.output_dir)) / (task_id or result.task_id) / "run"
+            logical_task_id = task_id or make_id()
+            out_dir = (
+                _nested_function_run_dir(_root_out_dir, logical_task_id, depth, cfg.function_name)
+                if _root_out_dir is not None
+                else Path(os.path.abspath(cfg.output_dir)) / logical_task_id / "run"
+            )
+            result = await self.execute(
+                logical_task_id,
+                archive=False,
+                depth=depth,
+                max_depth=cfg.max_trace_depth,
+                run_dir=out_dir,
+            )
             df_path = _find_dataflow_file(out_dir, cfg.function_name)
             if df_path:
                 try:
@@ -524,7 +569,7 @@ class Orchestrator(JudgeMixin):
             df_dir = root_out_dir / "dataflow"
             df_dir.mkdir(exist_ok=True)
             safe_func = re.sub(r'[^A-Za-z0-9_:.-]', '_', func_name)
-            out_dir = Path(os.path.abspath(task_cfg.output_dir)) / tid / "run"
+            out_dir = _nested_function_run_dir(root_out_dir, tid, dep, func_name)
             out_dir.mkdir(parents=True, exist_ok=True)
 
             # ── 断点续跑：检查是否已有缓存分析结果 ─────────────────────────
@@ -629,7 +674,7 @@ class Orchestrator(JudgeMixin):
             # ── 解析 callee 并加入队列 ─────────────────────────────────────
             if dep < max_depth and result.final_output:
                 # 优先读取 tainted.list，无则 fallback 到解析 dataflow 文件
-                worker_cwd = str(Path(os.path.abspath(task_cfg.output_dir)) / tid / "run")
+                worker_cwd = str(out_dir)
                 callees = _read_tainted_list(worker_cwd)
                 if not callees:
                     callees = _parse_callees(result.final_output)
@@ -775,5 +820,3 @@ class Orchestrator(JudgeMixin):
                     status=result.status.value,
                     run_dir=str(root_out_dir),
                     result_file=str(output_path / result_filename))
-
-
