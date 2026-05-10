@@ -14,6 +14,62 @@ import httpx
 logger = logging.getLogger("dfa.llm_sync")
 
 _PI_DIR = os.environ.get("PI_CODING_AGENT_DIR", "/root/.pi/agent")
+_DEFAULT_CONTEXT_WINDOW = 128000
+_DEFAULT_MAX_TOKENS = 8192
+
+
+def _provider_api(provider_type: str) -> str:
+    normalized = str(provider_type or "").strip().lower()
+    if normalized == "anthropic":
+        return "anthropic-messages"
+    return "openai-completions"
+
+
+def _as_positive_int(value: Any, default: int) -> int:
+    try:
+        parsed = int(value)
+        return parsed if parsed > 0 else default
+    except (TypeError, ValueError):
+        return default
+
+
+def _model_entries(provider: dict[str, Any]) -> list[dict[str, Any]]:
+    model_id = str(provider.get("model") or "").strip()
+    extra_config = provider.get("extra_config") if isinstance(provider.get("extra_config"), dict) else {}
+    context_window = _as_positive_int(
+        provider.get("model_context_window")
+        or provider.get("context_window")
+        or provider.get("contextWindow")
+        or provider.get("context_length")
+        or provider.get("contextLength")
+        or extra_config.get("model_context_window")
+        or extra_config.get("contextWindow")
+        or extra_config.get("context_length")
+        or extra_config.get("contextLength"),
+        _DEFAULT_CONTEXT_WINDOW,
+    )
+    max_tokens = _as_positive_int(
+        provider.get("max_tokens") or provider.get("maxTokens") or extra_config.get("max_tokens") or extra_config.get("maxTokens"),
+        _DEFAULT_MAX_TOKENS,
+    )
+    pi_models = extra_config.get("pi_models")
+    raw_models = pi_models if isinstance(pi_models, list) else (
+        [{"id": model_id, "reasoning": False}] if model_id else []
+    )
+    models: list[dict[str, Any]] = []
+    for raw in raw_models:
+        if not isinstance(raw, dict):
+            continue
+        entry = dict(raw)
+        entry.setdefault("id", model_id)
+        entry.setdefault("name", entry.get("id") or model_id)
+        entry.setdefault("reasoning", False)
+        entry.setdefault("input", ["text"])
+        entry.setdefault("contextWindow", context_window)
+        entry.setdefault("maxTokens", max_tokens)
+        entry.setdefault("cost", {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0})
+        models.append(entry)
+    return models
 
 
 def build_models_json(providers: list[dict[str, Any]]) -> dict:
@@ -27,7 +83,7 @@ def build_models_json(providers: list[dict[str, Any]]) -> dict:
                 "baseUrl": "...",
                 "api": "openai-completions",
                 "apiKey": "<raw_key>",
-                "models": [{"id": "<model_id>", "reasoning": false}]
+                "models": [{"id": "<model_id>", "contextWindow": 128000, "maxTokens": 8192}]
             }
         }
     }
@@ -39,16 +95,11 @@ def build_models_json(providers: list[dict[str, Any]]) -> dict:
         key = p.get("provider_key", "").strip()
         if not key:
             continue
-        model_id = p.get("model", "").strip()
-        pi_models = (p.get("extra_config") or {}).get("pi_models")
-        models_list = pi_models if pi_models else (
-            [{"id": model_id, "reasoning": False}] if model_id else []
-        )
         result["providers"][key] = {
             "baseUrl": p.get("api_base", ""),
-            "api": "openai-completions",
+            "api": _provider_api(str(p.get("provider_type") or "")),
             "apiKey": p.get("api_key", ""),
-            "models": models_list,
+            "models": _model_entries(p),
         }
     return result
 
@@ -99,6 +150,15 @@ def sync_providers_to_pi(
         logger.info(
             "已从配置中心同步 %d 个 Provider 到 %s", enabled_count, models_path
         )
+        for provider_key, provider_cfg in models_json["providers"].items():
+            for model in provider_cfg.get("models", []):
+                logger.info(
+                    "LLM Provider %s/%s contextWindow=%s maxTokens=%s",
+                    provider_key,
+                    model.get("id"),
+                    model.get("contextWindow"),
+                    model.get("maxTokens"),
+                )
         return True
 
     except httpx.RequestError as e:
