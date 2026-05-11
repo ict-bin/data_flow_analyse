@@ -794,6 +794,17 @@ class Orchestrator(JudgeMixin):
             root_result = TaskResult(task_id=root_task_id, task=cfg.task,
                                      status=TaskStatus.ERROR,
                                      error="root function analysis failed")
+        combined_rounds = []
+        combined_tokens = TokenUsage()
+        total_duration_ms = 0.0
+        for item in all_results.values():
+            combined_rounds.extend(item.rounds or [])
+            combined_tokens += item.total_tokens
+            total_duration_ms += float(item.total_duration_ms or 0.0)
+        root_result.rounds = combined_rounds
+        root_result.total_tokens = combined_tokens
+        if total_duration_ms > 0:
+            root_result.total_duration_ms = total_duration_ms
 
         # ── merge agent ───────────────────────────────────────────────────────
         if sub_dataflow_files:

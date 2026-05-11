@@ -16,7 +16,7 @@ from app.service.task_service import generate_prompt_from_path, get_task_service
 from . import router
 
 
-TERMINAL_STATUSES = {"passed", "failed", "error", "cancelled"}
+TERMINAL_STATUSES = {"passed", "failed", "error", "cancelled", "invalid_input", "completed_limited"}
 
 
 class TaskCreateRequest(BaseModel):
@@ -27,6 +27,10 @@ class TaskCreateRequest(BaseModel):
     task_description: Optional[str] = None
     prompt_template_id: Optional[str] = None
     prompt_content: Optional[str] = None  # If omitted, auto-generated from input_path
+    source_file: Optional[str] = None
+    function_name: Optional[str] = None
+    line_hint: Optional[str] = None
+    taint_params: list[str] = []
     task_origin_type: Optional[str] = None
     parent_project_id: Optional[str] = None
     parent_task_id: Optional[str] = None
@@ -180,6 +184,16 @@ async def create_task(body: TaskCreateRequest, db: Session = Depends(get_db)):
     if not prompt or not prompt.strip():
         prompt = generate_prompt_from_path(body.input_path)
 
+    task_config_json: Dict[str, Any] = {}
+    if body.source_file:
+        task_config_json["source_file"] = body.source_file
+    if body.function_name:
+        task_config_json["function_name"] = body.function_name
+    if body.line_hint:
+        task_config_json["line_hint"] = body.line_hint
+    if body.taint_params:
+        task_config_json["taint_params"] = [str(value).strip() for value in body.taint_params if str(value).strip()]
+
     svc = get_task_service()
     return svc.create_task(
         db,
@@ -190,6 +204,7 @@ async def create_task(body: TaskCreateRequest, db: Session = Depends(get_db)):
         task_description=body.task_description,
         prompt_template_id=body.prompt_template_id,
         prompt_content=prompt,
+        task_config_json=task_config_json or None,
         task_origin_type=body.task_origin_type,
         parent_project_id=body.parent_project_id,
         parent_task_id=body.parent_task_id,
@@ -351,19 +366,7 @@ async def get_task_session_file(task_id: str, path: str = Query(...), db: Sessio
 
 @router.get("/tasks/{task_id}/evaluation")
 async def get_task_evaluation(task_id: str, db: Session = Depends(get_db)):
-    row = _get_task_row(db, task_id)
-    root = _task_root(row)
-    warnings: List[str] = []
-    result_json = _load_result_json(row, root, warnings) if str(root) else (row.result_json or {})
-    rounds = _collect_rounds(result_json)
-    return {
-        "task_id": task_id,
-        "available": bool(rounds or result_json),
-        "status": row.status,
-        "summary": _summarize_rounds(rounds, result_json),
-        "rounds": rounds,
-        "warnings": warnings,
-    }
+    return get_task_service().get_task_evaluation(db, task_id)
 
 
 @router.post("/tasks/{task_id}/cancel")

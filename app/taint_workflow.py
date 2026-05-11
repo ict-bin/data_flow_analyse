@@ -27,12 +27,16 @@ import os
 import re
 import shutil
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
 
 from .models import (
     AgentInstanceConfig,
     CalleeRef,
+    JudgeRoundResult,
+    JudgeSummary,
+    RoundResult,
     TaskConfig,
     TaskResult,
     TaskStatus,
@@ -42,6 +46,10 @@ from .models import (
     make_id,
 )
 from .runner import run_agent
+
+
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
 
 
@@ -483,16 +491,59 @@ class PerTaintWorkflow:
         """主执行循环。"""
         cfg = self.cfg
         max_rounds = cfg.max_rounds if cfg.max_rounds > 0 else 20
+        total_tokens = TokenUsage()
+        round_results: list[RoundResult] = []
 
         # 跟踪各 session 已完成的轮次（用于反馈路由）
         taint_feedbacks: dict[str, str] = {p: "" for p in self.taint_params}
         summary_feedback: str = ""
+        # Extract function body ONCE on the orchestrator side.
+        # Inject into taint prompts so model never needs to read files.
+        func_body = _extract_function_body(self.ws, self.src_file, self.func_name,
+                                           self.line_hint)
+        func_body_log = f"({len(func_body)}B)" if func_body else "(empty)"
+        self._emit("debug", function=self.func_name,
+                   message="func_body extracted " + func_body_log)
+        if not self.taint_params:
+            return self._make_result(
+                "",
+                None,
+                False,
+                rounds=[],
+                total_tokens=total_tokens,
+                completion_reason="invalid_input",
+                status_override=TaskStatus.INVALID_INPUT,
+                final_output_override=(
+                    f"# 数据流分析无法启动\n\n"
+                    f"- 函数: `{self.func_name}`\n"
+                    f"- 原因: 未识别到明确污点参数\n"
+                    f"- 建议: 请由上游提供准确的 taint 参数后重试\n"
+                ),
+            )
+        if not func_body.strip():
+            return self._make_result(
+                "",
+                None,
+                False,
+                rounds=[],
+                total_tokens=total_tokens,
+                completion_reason="completed_limited",
+                status_override=TaskStatus.COMPLETED_LIMITED,
+                final_output_override=(
+                    f"# 数据流分析受限\n\n"
+                    f"- 函数: `{self.func_name}`\n"
+                    f"- 文件: `{self.src_file}`\n"
+                    f"- 原因: 未提取到有效函数体，可能只有声明或定义不可见\n"
+                ),
+            )
         # Concurrency limit: taint sessions share the same worker slot.
         # Max parallel taint pi processes = worker_count (from config).
         _taint_concurrency = max(1, self.cfg.worker_count)
         _taint_sem = asyncio.Semaphore(_taint_concurrency)
 
         for rnd in range(1, max_rounds + 1):
+            round_started_at = _utc_now_iso()
+            round_started_ts = time.time()
             rnd_dir = self.out_dir / f"round_{rnd:03d}"
             rnd_dir.mkdir(exist_ok=True)
             rnd_workers_dir = rnd_dir / "workers"
@@ -537,6 +588,8 @@ class PerTaintWorkflow:
                 run_taint(p) for p in self.taint_params
             ])
             taint_results: dict[str, object] = dict(taint_results_raw)
+            for _taint_result in taint_results.values():
+                total_tokens += _taint_result.token_usage
 
             # Archive taint outputs
             for param, res in taint_results.items():
@@ -566,6 +619,7 @@ class PerTaintWorkflow:
                        output=summary_result.output[:200],
                        tokens_in=summary_result.token_usage.input,
                        tokens_out=summary_result.token_usage.output)
+            total_tokens += summary_result.token_usage
 
             # Archive summary output
             df_file = _find_df_file(str(self.out_dir), self.func_name)
@@ -613,6 +667,7 @@ class PerTaintWorkflow:
                        output=judge_result.output[:200],
                        tokens_in=judge_result.token_usage.input,
                        tokens_out=judge_result.token_usage.output)
+            total_tokens += judge_result.token_usage
 
             # Parse judge output
             from .orchestrator import _parse_eval_md as _pem
@@ -620,6 +675,8 @@ class PerTaintWorkflow:
             passed = parsed.get("pass", False)
             score = parsed.get("score", 0)
             feedback_text = parsed.get("feedback", "") + "\n" + parsed.get("refinement", "")
+            round_ended_at = _utc_now_iso()
+            round_duration_ms = max(0.0, (time.time() - round_started_ts) * 1000.0)
 
             # Archive judge eval
             (j_dir / "eval-worker-0.md").write_text(
@@ -636,10 +693,69 @@ class PerTaintWorkflow:
                        passed=passed, score=score, round=rnd,
                        function=self.func_name)
 
+            worker_output = df_content or summary_result.output
+            round_results.append(RoundResult(
+                round=rnd,
+                function_name=self.func_name,
+                source_path=self.src_file,
+                stage="analyse",
+                stage_round=rnd,
+                started_at=round_started_at,
+                ended_at=round_ended_at,
+                duration_ms=round_duration_ms,
+                status="passed" if passed else "failed",
+                worker_results=[
+                    WorkerResult(
+                        worker_id="worker-summary",
+                        model=self.worker_model,
+                        output=worker_output,
+                        dataflow_file=df_file or "",
+                        session_file=self.summary_sess,
+                        token_usage=summary_result.token_usage,
+                    )
+                ],
+                judge_results=[
+                    JudgeRoundResult(
+                        judge_id="judge-0",
+                        model=self.judge_model,
+                        session_file="",
+                        evaluations=[
+                            WorkerEvaluation(
+                                worker_id="worker-summary",
+                                passed=bool(passed),
+                                score=int(score or 0),
+                                feedback=str(parsed.get("feedback") or ""),
+                                refinement=str(parsed.get("refinement") or ""),
+                            )
+                        ],
+                        summary=JudgeSummary(
+                            best_worker_id="worker-summary",
+                            reasoning=str(parsed.get("feedback") or "")[:1000],
+                            overall_passed=bool(passed),
+                        ),
+                        token_usage=judge_result.token_usage,
+                    )
+                ],
+                pass_count=1 if passed else 0,
+                total_judges=1,
+                passed=bool(passed),
+                best_worker_id="worker-summary",
+                feedback_to_workers=feedback_text,
+                module_completed=bool(passed),
+                completion_reason="passed" if passed else "",
+            ))
+
             if passed:
                 # 生成 tainted.list fallback（如 LLM 未写）
                 self._ensure_tainted_list(df_content)
-                return self._make_result(df_content, summary_result, passed=True)
+                return self._make_result(
+                    df_content,
+                    summary_result,
+                    passed=True,
+                    rounds=round_results,
+                    total_tokens=total_tokens,
+                    completion_reason="passed",
+                )
 
             # ── Phase 5: 路由反馈 ──────────────────────────────────────────────
             routing = _parse_feedback_routing(feedback_text, self.taint_params)
@@ -658,10 +774,27 @@ class PerTaintWorkflow:
             # 最大轮次
             if rnd >= max_rounds:
                 self._ensure_tainted_list(df_content)
-                return self._make_result(df_content, summary_result, passed=False)
+                if round_results:
+                    round_results[-1].completion_reason = "max_rounds_exceeded"
+                return self._make_result(
+                    df_content,
+                    summary_result,
+                    passed=False,
+                    rounds=round_results,
+                    total_tokens=total_tokens,
+                    completion_reason="max_rounds_exceeded",
+                )
 
-        return self._make_result("", summary_result if 'summary_result' in dir() else None,
-                                 passed=False)
+        if round_results:
+            round_results[-1].completion_reason = "failed"
+        return self._make_result(
+            "",
+            summary_result if 'summary_result' in dir() else None,
+            passed=False,
+            rounds=round_results,
+            total_tokens=total_tokens,
+            completion_reason="failed",
+        )
 
     def _ensure_tainted_list(self, df_content: str):
         """fallback: parse callees from dataflow doc, resolve file + defline."""
@@ -699,13 +832,29 @@ class PerTaintWorkflow:
         except OSError:
             pass
 
-    def _make_result(self, df_content: str, summary_result, passed: bool) -> TaskResult:
+    def _make_result(
+        self,
+        df_content: str,
+        summary_result,
+        passed: bool,
+        *,
+        rounds: list[RoundResult] | None = None,
+        total_tokens: TokenUsage | None = None,
+        completion_reason: str = "",
+        status_override: TaskStatus | None = None,
+        final_output_override: str | None = None,
+    ) -> TaskResult:
         from .models import TaskStatus
-        status = TaskStatus.PASSED if passed else TaskStatus.FAILED
-        final_output = df_content or (summary_result.output if summary_result else "")
+        status = status_override or (TaskStatus.PASSED if passed else TaskStatus.FAILED)
+        final_output = final_output_override if final_output_override is not None else (df_content or (summary_result.output if summary_result else ""))
         return TaskResult(
             task_id=self.task_id,
             task=self.cfg.task,
             status=status,
+            analysis_status=status.value,
+            completion_reason=completion_reason,
             final_output=final_output,
+            rounds=rounds or [],
+            total_tokens=total_tokens or TokenUsage(),
+            error=(completion_reason or None) if status in {TaskStatus.FAILED, TaskStatus.ERROR} else None,
         )

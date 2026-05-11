@@ -63,6 +63,7 @@ class TaskConfig(BaseModel):
     source_file: str = Field(default="", description="从 prompt 解析出的文件名")
     function_name: str = Field(default="", description="从 prompt 解析出的函数名")
     line_hint: str = Field(default="", description="函数起始行号提示，如 'L228'，用于区分同名重载")
+    taint_params: list[str] = Field(default_factory=list, description="显式指定的污点参数列表")
     cwd: str = Field(default="/data/target", description="待分析文件所在目录")
 
     # 服务配置部分（从 ServiceConfig 合并）
@@ -119,6 +120,8 @@ class TaskStatus(str, Enum):
     PENDING = "pending"
     RUNNING = "running"
     PASSED = "passed"
+    COMPLETED_LIMITED = "completed_limited"
+    INVALID_INPUT = "invalid_input"
     FAILED = "failed"
     ERROR = "error"
 
@@ -128,6 +131,7 @@ class WorkerResult(BaseModel):
     model: str = ""
     output: str = ""
     dataflow_file: str = ""  # Worker 写入的 dataflow-*.md 路径
+    session_file: str = ""
     token_usage: TokenUsage = Field(default_factory=TokenUsage)
     error: Optional[str] = None
     df_issues: list[str] = Field(default_factory=list)  # 结构校验问题列表
@@ -168,6 +172,7 @@ class JudgeSummary(BaseModel):
 class JudgeRoundResult(BaseModel):
     judge_id: str
     model: str = ""
+    session_file: str = ""
     evaluations: list[WorkerEvaluation] = Field(default_factory=list)
     summary: Optional[JudgeSummary] = None
     token_usage: TokenUsage = Field(default_factory=TokenUsage)
@@ -175,6 +180,14 @@ class JudgeRoundResult(BaseModel):
 
 class RoundResult(BaseModel):
     round: int
+    function_name: str = ""
+    source_path: str = ""
+    stage: str = "analyse"
+    stage_round: int = 0
+    started_at: str = ""
+    ended_at: str = ""
+    duration_ms: float = 0.0
+    status: str = ""
     worker_results: list[WorkerResult] = Field(default_factory=list)
     judge_results: list[JudgeRoundResult] = Field(default_factory=list)
     pass_count: int = 0
@@ -182,12 +195,16 @@ class RoundResult(BaseModel):
     passed: bool = False
     best_worker_id: str = ""
     feedback_to_workers: str = ""
+    module_completed: bool = False
+    completion_reason: str = ""
 
 
 class TaskResult(BaseModel):
     task_id: str
     status: TaskStatus = TaskStatus.RUNNING
     task: str
+    analysis_status: str = ""
+    completion_reason: str = ""
     config_snapshot: Optional[dict] = None
     rounds: list[RoundResult] = Field(default_factory=list)
     final_output: str = ""

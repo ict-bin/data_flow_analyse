@@ -154,11 +154,229 @@ def _lightweight_result_json(row: AppDfaTask, payload: dict | None, result_file:
         "result_file": result_file or (str(_task_result_path(row)) if _task_result_path(row) else None),
         "result_externalized": True,
         "status": payload.get("status") or row.status,
+        "analysis_status": payload.get("analysis_status") or payload.get("status") or row.status,
+        "completion_reason": payload.get("completion_reason"),
         "error": payload.get("error"),
         "round_count": len(rounds),
         "total_duration_ms": payload.get("total_duration_ms"),
         "total_tokens": total_tokens,
     }
+
+
+def _token_usage_dict(value: dict | None) -> dict[str, float | int]:
+    usage = value if isinstance(value, dict) else {}
+    return {
+        "input": int(usage.get("input", 0) or 0),
+        "output": int(usage.get("output", 0) or 0),
+        "cache_read": int(usage.get("cache_read", 0) or 0),
+        "cache_write": int(usage.get("cache_write", 0) or 0),
+        "cost": float(usage.get("cost", 0.0) or 0.0),
+    }
+
+
+def _merge_usage(items: list[dict | None]) -> dict[str, float | int]:
+    total = {"input": 0, "output": 0, "cache_read": 0, "cache_write": 0, "cost": 0.0}
+    for item in items:
+        usage = _token_usage_dict(item)
+        total["input"] += int(usage["input"])
+        total["output"] += int(usage["output"])
+        total["cache_read"] += int(usage["cache_read"])
+        total["cache_write"] += int(usage["cache_write"])
+        total["cost"] += float(usage["cost"])
+    return total
+
+
+def _token_total(usage: dict[str, float | int]) -> int:
+    return int(usage.get("input", 0)) + int(usage.get("output", 0)) + int(usage.get("cache_read", 0)) + int(usage.get("cache_write", 0))
+
+
+def _safe_eval_key(value: str | None, fallback: str) -> str:
+    raw = (value or "").strip() or fallback
+    safe = "".join(ch if ch.isalnum() or ch in "._-" else "_" for ch in raw)
+    return safe.strip("._") or fallback
+
+
+def _build_evaluation_payload(task_id: str, task_status: str, result_payload: dict) -> tuple[dict | None, list[dict]]:
+    rounds_payload = result_payload.get("rounds")
+    rounds_payload = rounds_payload if isinstance(rounds_payload, list) else []
+    records: list[dict] = []
+    function_names: set[str] = set()
+    passed_rounds = 0
+    total_duration_ms = 0.0
+    total_usage = {"input": 0, "output": 0, "cache_read": 0, "cache_write": 0, "cost": 0.0}
+    stage_summary: dict[str, dict[str, float | int]] = {}
+
+    for index, item in enumerate(rounds_payload, start=1):
+        if not isinstance(item, dict):
+            continue
+        function_name = str(item.get("function_name") or item.get("function") or item.get("func") or item.get("entry") or "unknown")
+        source_path = str(item.get("source_path") or "")
+        status = str(item.get("status") or ("passed" if item.get("passed") else "failed"))
+        worker_results = item.get("worker_results") if isinstance(item.get("worker_results"), list) else []
+        judge_results = item.get("judge_results") if isinstance(item.get("judge_results"), list) else []
+        pass_count = int(item.get("pass_count") or 0)
+        judge_count = int(item.get("total_judges") or len(judge_results) or 0)
+        scores: list[float] = []
+        normalized_judges: list[dict] = []
+        judge_usages: list[dict] = []
+        for judge_index, judge in enumerate(judge_results, start=1):
+            if not isinstance(judge, dict):
+                continue
+            evaluations = judge.get("evaluations") if isinstance(judge.get("evaluations"), list) else []
+            score = None
+            feedback_excerpt = ""
+            passed_flag = False
+            if evaluations and isinstance(evaluations[0], dict):
+                score = evaluations[0].get("score")
+                feedback_excerpt = str(evaluations[0].get("feedback") or "")
+                passed_flag = bool(evaluations[0].get("passed"))
+            try:
+                if score is not None:
+                    scores.append(float(score))
+            except (TypeError, ValueError):
+                pass
+            usage = _token_usage_dict(judge.get("token_usage"))
+            judge_usages.append(usage)
+            normalized_judges.append({
+                "judge_id": judge.get("judge_id") or f"judge-{judge_index}",
+                "model": judge.get("model") or "",
+                "session_file": judge.get("session_file") or "",
+                "score": score,
+                "passed": passed_flag,
+                "feedback_excerpt": feedback_excerpt[:1000],
+                "token_usage": usage,
+            })
+
+        worker = worker_results[0] if worker_results and isinstance(worker_results[0], dict) else {}
+        worker_usage = _token_usage_dict(worker.get("token_usage") if isinstance(worker, dict) else {})
+        merged_usage = _merge_usage([worker_usage, *judge_usages])
+        review_pass_rate = (pass_count / judge_count) if judge_count else None
+        avg_score = (sum(scores) / len(scores)) if scores else None
+        passed_by_vote = bool(item.get("passed"))
+        record = {
+            "task_id": task_id,
+            "module_name": function_name,
+            "stage": str(item.get("stage") or "analyse"),
+            "round": int(item.get("round") or index),
+            "stage_round": int(item.get("stage_round") or item.get("round") or index),
+            "status": status,
+            "started_at": item.get("started_at"),
+            "ended_at": item.get("ended_at"),
+            "duration_ms": float(item.get("duration_ms") or 0.0),
+            "worker": {
+                "model": worker.get("model") if isinstance(worker, dict) else "",
+                "session_file": worker.get("session_file") if isinstance(worker, dict) else "",
+                "token_usage": worker_usage,
+                "error": worker.get("error") if isinstance(worker, dict) else None,
+                "artifact_paths": [worker.get("dataflow_file")] if isinstance(worker, dict) and worker.get("dataflow_file") else [],
+            },
+            "judges": normalized_judges,
+            "metrics": {
+                "review_pass_rate": review_pass_rate,
+                "avg_judge_score": avg_score,
+                "token_usage": merged_usage,
+                "token_total": _token_total(merged_usage),
+                "cost": float(merged_usage["cost"]),
+                "passed_by_vote": passed_by_vote,
+                "pass_count": pass_count,
+                "total_judges": judge_count,
+            },
+            "module_completed": bool(item.get("module_completed") or passed_by_vote),
+            "completion_reason": item.get("completion_reason") or ("passed" if passed_by_vote else status),
+            "extra": {
+                "function_name": function_name,
+                "source_path": source_path,
+                "feedback_to_workers": item.get("feedback_to_workers"),
+                "best_worker_id": item.get("best_worker_id"),
+                "worker_count": len(worker_results),
+            },
+        }
+        function_names.add(function_name)
+        if passed_by_vote:
+            passed_rounds += 1
+        total_duration_ms += float(record["duration_ms"] or 0.0)
+        total_usage = _merge_usage([total_usage, merged_usage])
+        stage = str(record["stage"])
+        stage_item = stage_summary.setdefault(stage, {
+            "round_count": 0,
+            "passed_round_count": 0,
+            "review_pass_rate_total": 0.0,
+            "review_pass_rate_count": 0,
+        })
+        stage_item["round_count"] += 1
+        stage_item["passed_round_count"] += 1 if passed_by_vote else 0
+        if review_pass_rate is not None:
+            stage_item["review_pass_rate_total"] += float(review_pass_rate)
+            stage_item["review_pass_rate_count"] += 1
+        records.append(record)
+
+    if not records:
+        return None, []
+
+    latest_by_function: dict[str, dict] = {}
+    for record in records:
+        function_name = str(record.get("module_name") or "")
+        current = latest_by_function.get(function_name)
+        if current is None or int(record.get("stage_round") or 0) >= int(current.get("stage_round") or 0):
+            latest_by_function[function_name] = record
+    completed_function_count = sum(1 for record in latest_by_function.values() if record.get("metrics", {}).get("passed_by_vote"))
+    failed_function_count = max(0, len(latest_by_function) - completed_function_count)
+
+    summary = {
+        "task_id": task_id,
+        "task_status": result_payload.get("status") or task_status,
+        "module_count": len(function_names),
+        "completed_module_count": completed_function_count,
+        "failed_module_count": failed_function_count,
+        "round_count": len(records),
+        "passed_round_count": passed_rounds,
+        "function_count": len(function_names),
+        "total_duration_ms": total_duration_ms,
+        "avg_duration_ms": (total_duration_ms / len(records)) if records else 0.0,
+        "total_token_usage": total_usage,
+        "total_tokens": _token_total(total_usage),
+        "total_cost": float(total_usage["cost"]),
+        "generated_at": isoformat_local(now_local()),
+        "stage_summary": {
+            stage: {
+                "round_count": int(item["round_count"]),
+                "passed_round_count": int(item["passed_round_count"]),
+                "avg_review_pass_rate": (
+                    float(item["review_pass_rate_total"]) / int(item["review_pass_rate_count"])
+                ) if int(item["review_pass_rate_count"]) > 0 else None,
+            }
+            for stage, item in stage_summary.items()
+        },
+        "effectiveness": {
+            "final_round_pass_rate": (completed_function_count / len(latest_by_function)) if latest_by_function else 0.0,
+        },
+    }
+    return summary, records
+
+
+def _write_task_evaluation_files(row: AppDfaTask, result_payload: dict) -> None:
+    run_root = _task_run_root(row)
+    if not run_root:
+        return
+    summary, rounds = _build_evaluation_payload(row.task_id, row.status, result_payload)
+    if summary is None:
+        return
+    for round_dir in run_root.glob("round_*"):
+        if round_dir.is_dir():
+            for path in round_dir.glob("*.json"):
+                if path.name.endswith(".tmp"):
+                    continue
+                try:
+                    path.unlink()
+                except OSError:
+                    pass
+    for record in rounds:
+        round_no = int(record.get("round") or 0)
+        round_dir = run_root / f"round_{round_no:03d}"
+        module_key = _safe_eval_key(str(record.get("module_name") or ""), "function")
+        stage_key = _safe_eval_key(str(record.get("stage") or ""), "stage")
+        _write_json_atomic(round_dir / f"{module_key}.{stage_key}.json", record)
+    _write_json_atomic(run_root / "evaluation_summary.json", summary)
 
 
 def _origin_payload(row: AppDfaTask) -> dict:
@@ -268,6 +486,69 @@ def _flush_stages(task_id: str, events: list[dict]) -> None:
 
 
 class TaskService:
+
+    def get_task_evaluation(self, db: Session, task_id: str) -> dict:
+        row = self._get_or_404(db, task_id)
+        run_root = _task_run_root(row)
+        warnings: list[str] = []
+        if not run_root or not run_root.is_dir():
+            return {
+                "task_id": row.task_id,
+                "status": row.status,
+                "available": False,
+                "summary": None,
+                "rounds": [],
+                "warnings": warnings,
+            }
+
+        summary: dict | None = None
+        summary_path = run_root / "evaluation_summary.json"
+        if summary_path.exists():
+            try:
+                loaded = json.loads(summary_path.read_text(encoding="utf-8"))
+                if isinstance(loaded, dict):
+                    summary = loaded
+                else:
+                    warnings.append("evaluation_summary.json 格式不是对象")
+            except Exception as exc:
+                warnings.append(f"evaluation_summary.json 读取失败: {exc}")
+
+        rounds: list[dict] = []
+        for round_dir in sorted(run_root.glob("round_*")):
+            if not round_dir.is_dir():
+                continue
+            for path in sorted(round_dir.glob("*.json")):
+                if path.name.endswith(".tmp"):
+                    continue
+                try:
+                    payload = json.loads(path.read_text(encoding="utf-8"))
+                except Exception as exc:
+                    warnings.append(f"{path.relative_to(run_root)} 读取失败: {exc}")
+                    continue
+                if not isinstance(payload, dict):
+                    warnings.append(f"{path.relative_to(run_root)} 格式不是对象")
+                    continue
+                payload.setdefault("source_path", str(path))
+                rounds.append(payload)
+
+        if summary is None and not rounds:
+            result_json = _load_task_result_json(row)
+            if result_json:
+                summary, rounds = _build_evaluation_payload(row.task_id, row.status, result_json)
+
+        rounds.sort(key=lambda item: (
+            int(item.get("round") or 0),
+            str(item.get("module_name") or ""),
+            str(item.get("stage") or ""),
+        ))
+        return {
+            "task_id": row.task_id,
+            "status": row.status,
+            "available": bool(summary or rounds),
+            "summary": summary,
+            "rounds": rounds,
+            "warnings": warnings,
+        }
 
     def list_tasks(self, db: Session, *, project_id: str, page: int = 1,
                    per_page: int = 100, status: Optional[str] = None) -> dict:
@@ -491,6 +772,14 @@ class TaskService:
                 svc.result_dir = row.output_path
 
             cfg = build_task_config(svc, row.prompt_content, cwd=row.input_path)
+            if tcfg.get("source_file"):
+                cfg.source_file = str(tcfg["source_file"])
+            if tcfg.get("function_name"):
+                cfg.function_name = str(tcfg["function_name"])
+            if tcfg.get("line_hint"):
+                cfg.line_hint = str(tcfg["line_hint"])
+            if isinstance(tcfg.get("taint_params"), list):
+                cfg.taint_params = [str(value).strip() for value in tcfg["taint_params"] if str(value).strip()]
             orch = Orchestrator(config=cfg, on_event=on_event)
             result = await orch.execute_recursive(task_id, resume=bool(tcfg.get("resume", False)))
 
@@ -509,6 +798,7 @@ class TaskService:
             if result:
                 result_payload = result.model_dump(mode="json")
                 result_file = _write_task_result_json(row, result_payload)
+                _write_task_evaluation_files(row, result_payload)
                 row.result_json = _lightweight_result_json(row, result_payload, result_file)
                 if result.error:
                     row.error = result.error
