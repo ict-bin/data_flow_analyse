@@ -180,12 +180,12 @@ def _parse_callees(dataflow_content: str) -> list[CalleeRef]:
         stripped = line.strip()
         # markdown 标题行(# 开头)才触发 callee 表,防止嵌入文本起头的错误匹配
         if stripped.startswith("#") and any(kw in stripped for kw in [
-                "函数调用", "跟入", "跟进", "callee", "Callee"]):
+                "函数调用", "跟入", "跟进", "callee", "Callee", "接收此污点", "传播目标", "子函数"]):
             in_table = True
             func_col = -1
             continue
         if in_table and stripped.startswith("##") and not stripped.startswith("###"):
-            if not any(kw in stripped for kw in ["函数调用", "跟入", "跟进", "callee"]):
+            if not any(kw in stripped for kw in ["函数调用", "跟入", "跟进", "callee", "接收此污点", "子函数"]):
                 in_table = False
         if not in_table:
             continue

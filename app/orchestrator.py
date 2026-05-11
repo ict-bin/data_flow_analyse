@@ -706,6 +706,33 @@ class Orchestrator(JudgeMixin):
                     analyzed.add(c_key)
                     valid.append(callee)
 
+                # Fallback: 若 tainted.list 全被过滤（如自引用），尝试解析 taint-flow-*.md
+                if not valid:
+                    _taint_flow_callees: list[CalleeRef] = []
+                    for _tf in out_dir.glob("workspace-worker-*/taint-flow-*.md"):
+                        try:
+                            _taint_flow_callees.extend(
+                                _parse_callees(_tf.read_text(encoding="utf-8")))
+                        except OSError:
+                            pass
+                    for callee in _taint_flow_callees:
+                        c_key = callee.function_name
+                        if callee.function_name == func_name:
+                            continue
+                        if callee.function_name.split("::")[-1] == func_name.split("::")[-1]:
+                            continue
+                        if c_key in analyzed:
+                            continue
+                        if callee.function_name in _STDLIB_SKIP:
+                            continue
+                        if not _function_has_definition(target_dir, callee.function_name):
+                            continue
+                        analyzed.add(c_key)
+                        valid.append(callee)
+                    if valid:
+                        self._emit("debug", tid,
+                                   message=f"taint-flow fallback: found {len(valid)} callees for {func_name}")
+
                 if valid:
                     self._emit("trace_callees", tid, function=func_name,
                                callees=[c.function_name for c in valid], depth=dep)
