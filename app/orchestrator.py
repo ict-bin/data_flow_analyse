@@ -447,7 +447,7 @@ class Orchestrator(JudgeMixin):
         output_path = task_base / "output"
         output_path.mkdir(parents=True, exist_ok=True)
         cleaned_output = _format_final_output(result)
-        result_filename = _make_result_filename(cfg, "md")
+        result_filename = "final_report.md"
         (output_path / result_filename).write_text(cleaned_output, encoding="utf-8")
         result.final_output = cleaned_output
 
@@ -800,7 +800,7 @@ class Orchestrator(JudgeMixin):
 
         # 格式化最终输出 → output/
         cleaned_output = _format_final_output(result)
-        result_filename = _make_result_filename(cfg, "md")
+        result_filename = "final_report.md"
         (output_path / result_filename).write_text(cleaned_output, encoding="utf-8")
         result.final_output = cleaned_output
 
