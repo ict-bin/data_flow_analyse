@@ -35,7 +35,7 @@ class ServiceConfig(BaseModel):
     """config.json — 服务提供者配置，不含任务信息"""
     max_rounds: int = Field(default=3, ge=-1, description="每个函数最大 Worker+Judge 迭ge轮数，-1=无限")
     min_rounds: int = Field(default=2, ge=1, le=10, description="最少执行轮数（第1轮后强制自我反思）")
-    pass_threshold: Optional[int] = Field(default=None)
+    pass_threshold: Optional[str] = Field(default=None, description="裁判通过策略：'all'=全部通过, 'majority'=半数以上(ceil(J/2))，默认 'majority'")
     agent_max_retries: int = Field(default=100, description="API 错误时最大重试次数")
     agent_retry_delay: float = Field(default=30.0, description="首次重试等待秒数，指数退避")
     agent_run_timeout_seconds: int = Field(default=3600, description="单次智能体输入最大运行时长（秒），-1=不限制")

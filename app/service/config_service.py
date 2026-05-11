@@ -32,7 +32,7 @@ def _deep_merge(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any
 _DEFAULT_CONFIG: Dict[str, Any] = {
     "max_rounds": 3,
     "min_rounds": 2,
-    "pass_threshold": 1,
+    "pass_threshold": "majority",
     "agent_max_retries": 100,
     "agent_retry_delay": 30,
     "agent_run_timeout_seconds": 3600,

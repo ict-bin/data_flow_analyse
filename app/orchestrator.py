@@ -59,7 +59,6 @@ from .prompt_builder import (
     _make_result_filename,
 )
 
-WORKER_CONCURRENCY = 4
 
 
 def _round_dir_name(round_num: int) -> str:
@@ -114,7 +113,7 @@ class Orchestrator(JudgeMixin):
         task_id = task_id or make_id()
         start = time.time()
         target_dir = os.path.abspath(cfg.cwd)  # /data/target(只读,源文件在这里)
-        threshold = cfg.pass_threshold or math.ceil(cfg.judge_count / 2)
+        threshold = cfg.pass_threshold if cfg.pass_threshold is not None else math.ceil(cfg.judge_count / 2)
         self._cancel_event = asyncio.Event()
 
         # 任务目录结构: output_dir/task_id/input|run|output。递归函数子任务只在根 run/subtasks 下建中间目录。
@@ -252,7 +251,7 @@ class Orchestrator(JudgeMixin):
                             "worker_stream", task_id, worker_id=wid, delta=d),
                     })
 
-                w_raw = await run_agents_parallel(w_tasks, concurrency=WORKER_CONCURRENCY)
+                w_raw = await run_agents_parallel(w_tasks, concurrency=cfg.worker_count)
 
                 round_workers: list[WorkerResult] = []
                 for i, wr in enumerate(w_raw):

@@ -238,7 +238,6 @@ def build_task_config(svc: ServiceConfig, prompt: str, cwd: str = None) -> TaskC
         cwd=cwd,
         max_rounds=svc.max_rounds,
         min_rounds=svc.min_rounds,
-        pass_threshold=svc.pass_threshold,
         agent_max_retries=svc.agent_max_retries,
         agent_retry_delay=svc.agent_retry_delay,
         agent_run_timeout_seconds=svc.agent_run_timeout_seconds,
@@ -258,7 +257,10 @@ def build_task_config(svc: ServiceConfig, prompt: str, cwd: str = None) -> TaskC
     _backfill_role(cfg.workers)
     _backfill_role(cfg.judges)
 
-    if cfg.pass_threshold is None:
+    mode = svc.pass_threshold or "majority"
+    if mode == "all":
+        cfg.pass_threshold = cfg.judge_count
+    else:  # "majority" or unknown
         cfg.pass_threshold = math.ceil(cfg.judge_count / 2)
 
     return cfg
