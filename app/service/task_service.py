@@ -441,12 +441,23 @@ class TaskService:
         db: Session = next(db_gen)
         event_buffer: list[dict] = []
 
+        # Snapshot any previously-saved events BEFORE execution begins.
+        # On resume, row.stages_json already has correct historical events
+        # (e.g. root trace_callees from the prior run). Without this baseline,
+        # the very first _flush_stages call would overwrite the DB with just
+        # [first_new_event], wiping the history and causing the frontend tree
+        # to briefly (or permanently, if root is cached) show wrong callees.
+        _prev_row_for_baseline = db.query(AppDfaTask).filter_by(task_id=task_id).first()
+        _baseline_events: list[dict] = []
+        if _prev_row_for_baseline and isinstance(_prev_row_for_baseline.stages_json, dict):
+            _baseline_events = list(_prev_row_for_baseline.stages_json.get("events") or [])
+
         def on_event(event: SwarmEvent) -> None:
             event_buffer.append({"ts": _time.time(), "type": event.type,
                                   "data": dict(event.data)})
             n = len(event_buffer)
             if n == 1 or n % 3 == 0:
-                _flush_stages(task_id, event_buffer)
+                _flush_stages(task_id, _baseline_events + event_buffer)
 
         try:
             row = db.query(AppDfaTask).filter_by(task_id=task_id).first()
@@ -483,18 +494,18 @@ class TaskService:
             orch = Orchestrator(config=cfg, on_event=on_event)
             result = await orch.execute_recursive(task_id, resume=bool(tcfg.get("resume", False)))
 
-            _flush_stages(task_id, event_buffer)
+            _flush_stages(task_id, _baseline_events + event_buffer)
             db.expire(row); db.refresh(row)
             if row.status == "cancelled":
                 return
 
             row.status = result.status.value if result else "error"
             row.finished_at = now_local()
-            # 合并历史事件（续跑场景保留前序阶段记录）
-            _prev = row.stages_json
-            _prev_events = (_prev["events"] if isinstance(_prev, dict)
-                            and isinstance(_prev.get("events"), list) else [])
-            row.stages_json = {"events": _prev_events + event_buffer, "final": True}
+            # _baseline_events already contains all prior history; just append
+            # the new event_buffer.  Do NOT re-read row.stages_json here because
+            # _flush_stages already wrote (_baseline + buffer) to DB, so re-reading
+            # would produce duplicates.
+            row.stages_json = {"events": _baseline_events + event_buffer, "final": True}
             if result:
                 result_payload = result.model_dump(mode="json")
                 result_file = _write_task_result_json(row, result_payload)
@@ -515,10 +526,7 @@ class TaskService:
                     r.status = "error"
                     r.error = str(exc)
                     r.finished_at = now_local()
-                    _prev2 = r.stages_json
-                    _prev_events2 = (_prev2["events"] if isinstance(_prev2, dict)
-                                     and isinstance(_prev2.get("events"), list) else [])
-                    r.stages_json = {"events": _prev_events2 + event_buffer, "final": True}
+                    r.stages_json = {"events": _baseline_events + event_buffer, "final": True}
                     db.commit()
             except Exception:
                 pass
