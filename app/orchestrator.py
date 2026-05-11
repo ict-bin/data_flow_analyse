@@ -46,6 +46,7 @@ from .parsers import (
     _parse_eval_md,
     _parse_summary_md,
     _STDLIB_SKIP,
+    _get_best_output,
 )
 from .cpp_resolver import _function_has_definition, _resolve_cpp_name, _get_definition_line
 from .prompt_builder import (

@@ -284,7 +284,7 @@ def _build_summary_eval_prompt(func_name: str, rnd: int, taint_params: list[str]
         f"# 评审汇总报告 (Round {rnd})\n\n"
         f"## 任务要求\n\n{task}\n\n"
         f"## 需要读取的文件\n\n"
-        f"1. 汇总报告: `worker-0-dataflow.md`\n"
+        f"1. 汇总报告: `dataflow-{func_name}.md`\n"
         f"2. tainted.list: 通过工作目录或 round_{rnd:03d}/workers 查找\n"
         f"3. 各污点分析: {taint_files}（可选，用于验证）\n\n"
         f"**评审标准：**\n\n"

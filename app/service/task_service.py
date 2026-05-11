@@ -383,7 +383,7 @@ class TaskService:
         from sqlalchemy.orm.attributes import flag_modified
         svc = _load_svc_config_from_db(db, row.project_id)
         effective_output = row.output_path or svc.output_dir
-        resume_workspace = os.path.join(effective_output, task_id, "run", "workspace")
+        resume_workspace = os.path.join(effective_output, task_id, "run", "workspace-worker-0")
         tcfg = dict(row.task_config_json or {})
         tcfg["start_stage"] = 3
         tcfg["resume_workspace"] = resume_workspace

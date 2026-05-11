@@ -151,7 +151,7 @@ def _read_tainted_list(worker_cwd: str) -> list[CalleeRef]:
     return callees
 
 
-
+def _get_best_output(worker: WorkerResult) -> str:
     """获取最佳 Worker 的输出:优先用 dataflow 文件,回退用 result 摘要。"""
     if worker.dataflow_file:
         try:
