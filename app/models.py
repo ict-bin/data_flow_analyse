@@ -44,7 +44,7 @@ class ServiceConfig(BaseModel):
     pi_max_retries: int = Field(default=3, ge=-1, description="pi 进程拉起失败时最大重试次数，-1 为无限重试")
     pi_retry_delay: float = Field(default=10.0, description="pi 进程重试首次等待秒数，指数退避")
     max_trace_depth: int = Field(default=3, ge=1, le=10, description="函数调用递归追踪最大深度")
-    callee_concurrency: int = Field(default=4, ge=1, le=64, description="callee 并行分析数：1=串行, N=最多 N 个并发 BFS 工作池")
+    callee_concurrency: int = Field(default=4, ge=-1, description="callee 并行分析数：-1=自动/不限, 1=串行, N=最多 N 个并发 BFS 工作池")
 
     workers: RoleConfig = Field(default_factory=RoleConfig)
     judges: RoleConfig = Field(default_factory=RoleConfig)
