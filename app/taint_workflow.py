@@ -511,8 +511,8 @@ class PerTaintWorkflow:
                 False,
                 rounds=[],
                 total_tokens=total_tokens,
-                completion_reason="invalid_input",
-                status_override=TaskStatus.INVALID_INPUT,
+                completion_reason="未识别到明确污点参数，数据流分析失败",
+                status_override=TaskStatus.FAILED,
                 final_output_override=(
                     f"# 数据流分析无法启动\n\n"
                     f"- 函数: `{self.func_name}`\n"
@@ -527,8 +527,8 @@ class PerTaintWorkflow:
                 False,
                 rounds=[],
                 total_tokens=total_tokens,
-                completion_reason="completed_limited",
-                status_override=TaskStatus.COMPLETED_LIMITED,
+                completion_reason="未提取到有效函数体，数据流分析失败",
+                status_override=TaskStatus.FAILED,
                 final_output_override=(
                     f"# 数据流分析受限\n\n"
                     f"- 函数: `{self.func_name}`\n"
