@@ -35,6 +35,9 @@ _DEFAULT_CONFIG: Dict[str, Any] = {
     "pass_threshold": 1,
     "agent_max_retries": 100,
     "agent_retry_delay": 30,
+    "agent_run_timeout_seconds": 3600,
+    "agent_timeout_retry_enabled": True,
+    "agent_timeout_max_retries": 3,
     "pi_max_retries": -1,
     "pi_retry_delay": 10,
     "max_trace_depth": 5,
@@ -97,6 +100,5 @@ def get_config_service() -> ConfigService:
     if _config_service is None:
         _config_service = ConfigService()
     return _config_service
-
 
 

@@ -15,34 +15,13 @@ class RunAgentPromptFileTests(unittest.TestCase):
     def test_run_agent_uses_prompt_file_instead_of_raw_argv(self):
         captured = {}
 
-        async def fake_create_subprocess_exec(*args, **kwargs):
-            captured["args"] = list(args)
-            prompt_arg = args[-1]
-            self.assertTrue(prompt_arg.startswith("@"))
-            prompt_path = prompt_arg[1:]
-            self.assertTrue(os.path.isfile(prompt_path))
-            with open(prompt_path, "r", encoding="utf-8") as fh:
-                captured["prompt_text"] = fh.read()
-
-            class _FakeStream:
-                async def read(self, _n=-1):
-                    return b""
-
-            class _FakeProc:
-                stdout = _FakeStream()
-                stderr = _FakeStream()
-                returncode = 0
-
-                async def wait(self):
-                    return 0
-
-                def terminate(self):
-                    return None
-
-                def kill(self):
-                    return None
-
-            return _FakeProc()
+        async def fake_run_with_pi_retry(**kwargs):
+            captured["args"] = kwargs["args"]
+            captured["prompt_text"] = kwargs["prompt"]
+            result = runner.AgentResult()
+            result.output = "ok"
+            result.exit_code = 0
+            return result
 
         long_prompt = "# Task\n\n" + "\n".join(
             f"{idx}. /very/long/path/to/file_{idx}.c" for idx in range(5000)
@@ -50,7 +29,7 @@ class RunAgentPromptFileTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as cwd:
             with patch.object(runner, "_find_pi_command", return_value=["/usr/bin/pi"]):
-                with patch("app.runner.asyncio.create_subprocess_exec", side_effect=fake_create_subprocess_exec):
+                with patch.object(runner, "_run_with_pi_retry", side_effect=fake_run_with_pi_retry):
                     result = asyncio.run(
                         runner.run_agent(
                             long_prompt,
@@ -65,6 +44,34 @@ class RunAgentPromptFileTests(unittest.TestCase):
         self.assertEqual(result.exit_code, 0)
         self.assertEqual(captured["prompt_text"], long_prompt)
         self.assertNotIn(long_prompt, captured["args"])
+
+    def test_run_agent_retries_after_timeout(self):
+        attempts = {"count": 0}
+
+        async def fake_run_with_pi_retry(**kwargs):
+            attempts["count"] += 1
+            await asyncio.sleep(0.02)
+            result = runner.AgentResult()
+            result.output = "ok"
+            return result
+
+        with patch.object(runner, "_find_pi_command", return_value=["/usr/bin/pi"]):
+            with patch.object(runner, "_run_with_pi_retry", side_effect=fake_run_with_pi_retry):
+                result = asyncio.run(
+                    runner.run_agent(
+                        "hello",
+                        model="test-model",
+                        tools=["read"],
+                        cwd=".",
+                        run_timeout_seconds=0.01,
+                        timeout_retry_enabled=True,
+                        timeout_max_retries=1,
+                        retry_delay=0,
+                    )
+                )
+
+        self.assertEqual(attempts["count"], 2)
+        self.assertIn("timed out", result.error or "")
 
 
 if __name__ == "__main__":

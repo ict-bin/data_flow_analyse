@@ -90,6 +90,16 @@ def _fmt_max(n: int) -> str:
     return "∞" if n < 0 else str(n)
 
 
+def _normalize_timeout_seconds(timeout_seconds: float | int | None) -> float | None:
+    if timeout_seconds is None:
+        return None
+    try:
+        value = float(timeout_seconds)
+    except (TypeError, ValueError):
+        return None
+    return value if value > 0 else None
+
+
 def _should_retry(
     failures: int, max_retries: int, cancel: asyncio.Event | None
 ) -> bool:
@@ -293,6 +303,9 @@ async def run_agent(
     post_skill_prompt: str | None = None,
     max_retries: int = 3,  # API 错误最大重试（-1=无限）
     retry_delay: float = 10.0,  # API 重试首次等待
+    run_timeout_seconds: float | int = 3600,
+    timeout_retry_enabled: bool = True,
+    timeout_max_retries: int = 3,
     pi_max_retries: int = -1,  # pi 进程最大重试（-1=无限）
     pi_retry_delay: float = 10.0,  # pi 进程重试首次等待
 ) -> AgentResult:
@@ -336,30 +349,48 @@ async def run_agent(
             )
         args.extend(["--system-prompt", sys_tmp_file])
 
-    timeout_seconds = float(os.environ.get("DFA_AGENT_TIMEOUT_SECONDS", "900") or "0")
+    timeout_seconds = _normalize_timeout_seconds(
+        run_timeout_seconds if run_timeout_seconds is not None else os.environ.get("DFA_AGENT_TIMEOUT_SECONDS", "3600")
+    )
+    timeout_failures = 0
     try:
-        coro = _run_with_pi_retry(
-            args=args,
-            cwd=os.path.abspath(cwd),
-            env=env,
-            prompt=prompt,
-            post_skill_prompt=post_skill_prompt,
-            cancel_event=cancel_event,
-            on_stream=on_stream,
-            max_retries=max_retries,
-            retry_delay=retry_delay,
-            pi_max_retries=pi_max_retries,
-            pi_retry_delay=pi_retry_delay,
-        )
-        if timeout_seconds > 0:
-            return await asyncio.wait_for(coro, timeout=timeout_seconds)
-        return await coro
-    except asyncio.TimeoutError:
-        _log_error(f"agent step timed out after {timeout_seconds:.0f}s")
-        r = AgentResult()
-        r.error = f"agent step timed out after {timeout_seconds:.0f}s"
-        r.exit_code = -1
-        return r
+        while True:
+            try:
+                coro = _run_with_pi_retry(
+                    args=args,
+                    cwd=os.path.abspath(cwd),
+                    env=env,
+                    prompt=prompt,
+                    post_skill_prompt=post_skill_prompt,
+                    cancel_event=cancel_event,
+                    on_stream=on_stream,
+                    max_retries=max_retries,
+                    retry_delay=retry_delay,
+                    pi_max_retries=pi_max_retries,
+                    pi_retry_delay=pi_retry_delay,
+                )
+                return await asyncio.wait_for(coro, timeout=timeout_seconds) if timeout_seconds else await coro
+            except asyncio.TimeoutError:
+                timeout_failures += 1
+                r = AgentResult()
+                r.error = (
+                    f"agent step timed out after {timeout_seconds:.0f}s"
+                    if timeout_seconds else
+                    "agent step timed out"
+                )
+                r.exit_code = -1
+                can_retry = timeout_retry_enabled and (
+                    timeout_max_retries < 0 or timeout_failures <= timeout_max_retries
+                )
+                if not can_retry or (cancel_event and cancel_event.is_set()):
+                    return r
+                delay = _backoff(retry_delay, timeout_failures)
+                if on_stream:
+                    on_stream(
+                        f"\n⏱️ 智能体执行超时，{delay:.0f}s 后重试 "
+                        f"({timeout_failures}/{_fmt_max(timeout_max_retries)})...\n"
+                    )
+                await asyncio.sleep(delay)
     finally:
         pass  # .system_prompt.md is in workspace cwd, cleaned with it
 
@@ -627,6 +658,16 @@ async def _run_with_api_retry(
                     await proc.wait()
             raise
 
+        except asyncio.CancelledError:
+            try:
+                proc.terminate()
+                await asyncio.wait_for(proc.wait(), timeout=5)
+            except Exception:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+            raise
         except Exception as e:
             # 管道断裂、进程被杀等
             _log_warn(f"pi 进程读取异常: {e}")

@@ -434,6 +434,9 @@ class PerTaintWorkflow:
             cancel_event=None,
             max_retries=self.cfg.agent_max_retries,
             retry_delay=self.cfg.agent_retry_delay,
+            run_timeout_seconds=self.cfg.agent_run_timeout_seconds,
+            timeout_retry_enabled=self.cfg.agent_timeout_retry_enabled,
+            timeout_max_retries=self.cfg.agent_timeout_max_retries,
             pi_max_retries=self.cfg.pi_max_retries,
             pi_retry_delay=self.cfg.pi_retry_delay,
         )
