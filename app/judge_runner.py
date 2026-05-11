@@ -35,13 +35,14 @@ class JudgeMixin:
         # 生成 trace-tree.md 供 merge agent 读取
         tree_lines = ["# 调用树结构\n"]
         for name, path in dataflow_files:
-            tree_lines.append("- `" + name + "` → `" + os.path.basename(path) + "`")
+            rel = "dataflow/" + os.path.basename(path)
+            tree_lines.append("- `" + name + "` → `" + rel + "`")
         tree_path = Path(cwd) / "trace-tree.md"
         tree_path.write_text("\n".join(tree_lines), encoding="utf-8")
 
         # 文件列表
         file_list = "\n".join(
-            "- `" + os.path.basename(path) + "` - " + name
+            "- `dataflow/" + os.path.basename(path) + "` - " + name
             for name, path in dataflow_files
         )
         merge_prompt = (
