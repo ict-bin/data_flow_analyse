@@ -45,19 +45,40 @@ from .runner import run_agent
 
 
 
+def _add_line_numbers(lines: list, start_lineno: int) -> str:
+    """Prefix each line with its 1-based absolute line number: 'L{n}: {code}'."""
+    return chr(10).join(
+        f"L{start_lineno + idx}: {l}" for idx, l in enumerate(lines)
+    )
+
+
 def _extract_function_body(ws, src_file: str, func_name: str,
                            line_hint: str = "") -> str:
-    """Orchestrator extracts function body. Inject into prompt so model skips file reading.
+    """Orchestrator extracts function body with absolute line numbers injected.
+    Returns text where every line is prefixed 'L{n}: ' so LLM uses correct line numbers.
     line_hint: e.g. 'L228' — used to prefer the overload at or after that line.
     """
-    import subprocess
+    import subprocess, re as _re
     cmd = ['extract_func', src_file, func_name]
     if line_hint:
         cmd += ['--line', line_hint.lstrip('Ll')]
     try:
         r = subprocess.run(cmd, cwd=str(ws), capture_output=True, text=True, timeout=15)
         if r.returncode == 0 and r.stdout.strip():
-            return r.stdout.strip()
+            raw = r.stdout.strip()
+            lines = raw.splitlines()
+            # First line from extract_func is: "// filepath  L{start}-L{end}  (N lines)"
+            # Parse it to get start_lineno so we can prefix every code line.
+            m = _re.search(r'L(\d+)', lines[0]) if lines else None
+            if m and lines[0].strip().startswith('//'):
+                start_lineno = int(m.group(1))
+                # Keep the header comment as-is, prefix subsequent code lines
+                header = lines[0]
+                code_lines = lines[1:]
+                numbered = _add_line_numbers(code_lines, start_lineno)
+                return header + chr(10) + numbered
+            # extract_func output has no recognizable header — return as-is
+            return raw
     except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
         pass
     # fallback: grep function range from file, respecting line_hint
@@ -104,8 +125,12 @@ def _extract_function_body(ws, src_file: str, func_name: str,
                 after  = [i for i in matches if i + 1 >  hint_num]
                 matches = list(reversed(before)) + after
             if matches:
-                i = matches[0]
-                return chr(10).join(fl[max(0, i-2):min(len(fl), i+100)])
+                idx = matches[0]
+                slice_start = max(0, idx - 2)
+                # start_lineno: slice_start is 0-based, so 1-based = slice_start + 1
+                start_lineno = slice_start + 1
+                body_lines = fl[slice_start:min(len(fl), idx + 100)]
+                return _add_line_numbers(body_lines, start_lineno)
         except OSError:
             pass
     return ""
@@ -162,8 +187,10 @@ def _build_taint_prompt(param: str, func_name: str,
     src_block = ""
     if func_body:
         src_block = (
-            "## Function Source Code (provided -- DO NOT read files)" + chr(10)*2
+            "## Function Source Code (absolute line numbers shown as L{n}:)" + chr(10)*2
             + "```cpp" + chr(10) + func_body + chr(10) + "```" + chr(10)*2
+            + "**IMPORTANT**: The `L{n}:` prefixes above are the ACTUAL source file line numbers. "
+            + "Use these exact L{n} values in your report. Do NOT re-number." + chr(10)*2
         )
     return (
         "<!-- " + nonce + " -->" + chr(10)
