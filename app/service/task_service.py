@@ -337,9 +337,12 @@ class TaskService:
     def restart_task(self, db: Session, task_id: str) -> dict:
         """在原任务ID上重置并重新执行（SA 模式：in-place restart）。"""
         row = self._get_or_404(db, task_id)
+        # 自动取消正在运行/等待的任务，而不是报错
         if row.status in ("pending", "running"):
-            from fastapi import HTTPException
-            raise HTTPException(400, "任务仍在运行中，请先取消后再重启")
+            at = _running_tasks.get(task_id)
+            if at and not at.done():
+                at.cancel()
+            _running_tasks.pop(task_id, None)
         from sqlalchemy.orm.attributes import flag_modified
         # 清除上次续跑的 start_stage / resume_workspace，保留其他覆盖项
         clean_config = {k: v for k, v in (row.task_config_json or {}).items()
