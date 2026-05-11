@@ -102,16 +102,16 @@ def _find_dataflow_file(worker_cwd: str, function_name: str = "") -> str:
 def _read_tainted_list(worker_cwd: str) -> list[CalleeRef]:
     """读取 tainted.list 文件，返回 CalleeRef 列表。
 
-    搜索顺序: workspace-worker-*/ → round_*/workers/ → round-*/workers/ → 任意子目录
+    搜索顺序: workspace-worker-*/ → round_*/workers/ → round-*/workers/
+    注意: 不使用 rglob，避免把 subtasks/ 子任务的 tainted.list 误认为本函数的 callee 列表。
     """
     callees: list[CalleeRef] = []
     task_dir = Path(worker_cwd)
-    # 搜索所有可能位置
+    # 搜索所有可能位置（仅限当前函数目录的直接子目录，不递归进 subtasks/）
     candidates: list[Path] = []
     candidates.extend(task_dir.glob("workspace-worker-*/tainted.list"))
     candidates.extend(task_dir.glob("round_*/workers/*/tainted.list"))
     candidates.extend(task_dir.glob("round-*/workers/*/tainted.list"))
-    candidates.extend(task_dir.rglob("tainted.list"))
     # 去重并按修改时间排序
     seen: set[str] = set()
     unique: list[Path] = []
