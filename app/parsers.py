@@ -64,16 +64,6 @@ def _find_dataflow_file(worker_cwd: str, function_name: str = "") -> str:
                 if sz > 200:  # 排除空骨架
                     head = c.read_text(encoding='utf-8', errors='replace')[:500]
                     if short in head.lower() or func_lower in head.lower():
-                        # 如果文件不在 cwd 根目录,将内容拷贝到正确路径
-                        correct = cwd / f"dataflow-{function_name}.md"
-                        if c.resolve() != correct.resolve() and not correct.exists():
-                            try:
-                                correct.write_text(
-                                    c.read_text(encoding='utf-8', errors='replace'),
-                                    encoding='utf-8')
-                                return str(correct)
-                            except OSError:
-                                pass
                         return str(c)
             except OSError:
                 pass
@@ -412,6 +402,7 @@ def _extract_json_object(text: str, required_key: str) -> dict | None:
 
 def _parse_eval_md(output: str) -> dict:
     """从 Judge 的输出中解析评审结果。优先解析 markdown,回退到 JSON。"""
+    output = re.sub(r'<think>.*?</think>', '', output, flags=re.DOTALL).strip()
     score = 0
     passed = False
     feedback = ""

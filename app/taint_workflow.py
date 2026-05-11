@@ -174,6 +174,8 @@ def _build_base_prompt(func_name: str, src_file: str, taint_params: list[str],
 
 def _build_taint_prompt(param: str, func_name: str,
                         func_body: str = "",
+                        src_file: str = "",
+                        line_hint: str = "",
                         feedback: str = "", rnd: int = 1) -> str:
     import uuid
     nonce = uuid.uuid4().hex[:8]
@@ -192,6 +194,16 @@ def _build_taint_prompt(param: str, func_name: str,
             + "**IMPORTANT**: The `L{n}:` prefixes above are the ACTUAL source file line numbers. "
             + "Use these exact L{n} values in your report. Do NOT re-number." + chr(10)*2
         )
+        read_instruction = "- Source provided -- **DO NOT use read/bash to open files**"
+    else:
+        _cmd = "bash extract_func " + src_file + " '" + func_name + "'"
+        if line_hint:
+            _cmd += " --line " + line_hint.lstrip("Ll")
+        read_instruction = (
+            "- **First** read the function source: `" + _cmd + "`"
+            + chr(10) + "  (fallback: `read` + grep). "
+            + "Use the exact `L{n}:` numbers from `extract_func` output as line references."
+        )
     return (
         "<!-- " + nonce + " -->" + chr(10)
         + "# Deep taint analysis: `" + param + "` in `" + func_name + "`" + chr(10)*2
@@ -207,7 +219,7 @@ def _build_taint_prompt(param: str, func_name: str,
         + "  Mark these ⚠️ DIRECT_SINK even if not a sub-function call." + chr(10)
         + "- Identify sub-function calls receiving `" + param + "` or derived values" + chr(10)
         + "- Do NOT analyze sub-function internals" + chr(10)
-        + "- Source provided -- **DO NOT use read/bash to open files**" + chr(10)*2
+        + read_instruction + chr(10)*2
         + "After analysis write `taint-flow-" + safe_p + ".md` using the write tool."
         + fb_block
     )
@@ -354,13 +366,12 @@ def _parse_feedback_routing(feedback: str, taint_params: list[str]
     if re.search(r'\[SUMMARY\]', feedback):
         routing['summary'] = feedback
 
-    # 没有显式路由时：如果提到某个污点参数名，路由到对应 session
+    # 没有显式路由时：如果提到某个污点参数名，路由到对应 session，同时也给 summary
     if not routing:
         for tp in taint_params:
             if tp in feedback:
                 routing[tp] = feedback
-        if not routing:
-            routing['summary'] = feedback  # 默认给 summary
+        routing['summary'] = feedback  # 无论是否匹配到 taint，都同步给 summary
 
     return routing
 
@@ -476,14 +487,6 @@ class PerTaintWorkflow:
         # 跟踪各 session 已完成的轮次（用于反馈路由）
         taint_feedbacks: dict[str, str] = {p: "" for p in self.taint_params}
         summary_feedback: str = ""
-        # Extract function body ONCE on the orchestrator side.
-        # Inject into taint prompts so model never needs to read files.
-        func_body = _extract_function_body(self.ws, self.src_file, self.func_name,
-                                           self.line_hint)
-        func_body_log = f"({len(func_body)}B)" if func_body else "(empty)"
-        self._emit("debug", function=self.func_name,
-                   message="func_body extracted " + func_body_log)
-
         # Concurrency limit: taint sessions share the same worker slot.
         # Max parallel taint pi processes = worker_count (from config).
         _taint_concurrency = max(1, self.cfg.worker_count)
@@ -509,7 +512,10 @@ class PerTaintWorkflow:
             async def run_taint(param: str) -> tuple[str, object]:
                 async with _taint_sem:
                     fb = taint_feedbacks.get(param, "")
-                    prompt = _build_taint_prompt(param, self.func_name, func_body, fb, rnd)
+                    prompt = _build_taint_prompt(
+                        param, self.func_name,
+                        src_file=self.src_file, line_hint=self.line_hint,
+                        feedback=fb, rnd=rnd)
                     post_skill = _build_taint_post_skill(param)
                     self._emit("worker_start",
                                worker_id=f"worker-taint-{_safe_param(param)}",
