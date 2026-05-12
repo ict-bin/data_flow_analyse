@@ -244,6 +244,56 @@ def _format_final_output(result: TaskResult) -> str:
     )
     return header + raw
 
+def _build_combined_report(
+    root_function: str,
+    dataflow_files: list[tuple[str, str]],
+) -> str:
+    """从所有子函数 dataflow 文件程序化组装最终综合报告。
+    不依赖 LLM merge agent，始终可靠地生成完整的跨函数分析文档。
+    """
+    total = len(dataflow_files)
+    # root 排第一，其余按 BFS 顺序保持原位
+    ordered: list[tuple[str, str]] = []
+    rest: list[tuple[str, str]] = []
+    for name, path in dataflow_files:
+        if name == root_function:
+            ordered.insert(0, (name, path))
+        else:
+            rest.append((name, path))
+    ordered.extend(rest)
+
+    lines: list[str] = [
+        f"# 完整数据流分析: {root_function}",
+        "",
+        "## 分析概览",
+        "",
+        f"- **根函数**: `{root_function}`",
+        f"- **跟踪函数总数**: {total}",
+        "",
+        "## 调用链函数列表",
+        "",
+    ]
+    for i, (name, _) in enumerate(ordered):
+        marker = "📌 根函数" if name == root_function else "└─ 被跟入"
+        lines.append(f"{i + 1}. `{name}` {marker}")
+    lines += ["", "---", ""]
+
+    for i, (func_name, path) in enumerate(ordered):
+        section_label = "根函数" if func_name == root_function else "被跟入函数"
+        lines.append(f"## [{i + 1}/{total}] {func_name}  ·  {section_label}")
+        lines.append("")
+        try:
+            content = Path(path).read_text(encoding="utf-8").strip()
+            # 去除重复的 H1 标题行（格式：# 数据流追踪: FuncName）
+            content = re.sub(r"^#\s+数据流追踪[：:][^\n]*\n", "", content, count=1)
+            lines.append(content)
+        except OSError:
+            lines.append(f"> ⚠️ 文件读取失败: `{path}`")
+        lines += ["", "---", ""]
+
+    return "\n".join(lines)
+
+
 @staticmethod
 
 

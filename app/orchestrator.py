@@ -57,6 +57,7 @@ from .prompt_builder import (
     _report,
     _format_final_output,
     _make_result_filename,
+    _build_combined_report,
 )
 
 
@@ -806,18 +807,26 @@ class Orchestrator(JudgeMixin):
         if total_duration_ms > 0:
             root_result.total_duration_ms = total_duration_ms
 
-        # ── merge agent ───────────────────────────────────────────────────────
+        # ── 综合报告:程序化构建(主) + LLM 增强(可选) ────────────────────────
         if sub_dataflow_files:
+            # 1. 程序化合并 — 始终成功，产出完整跨函数报告
+            root_result.final_output = _build_combined_report(
+                root_function=cfg.function_name,
+                dataflow_files=sub_dataflow_files,
+            )
+            # 2. 尝试 LLM merge 增强 — 失败时保留程序化报告，不阻断流程
             try:
                 merged = await self._run_merge_agent(
                     root_function=cfg.function_name,
                     dataflow_files=sub_dataflow_files,
                     cwd=str(root_out_dir),
                     result=root_result)
-                if merged:
+                # 只在 LLM 产出明显更丰富时才替换（避免空输出或过短输出覆盖）
+                if merged and len(merged.strip()) > len(root_result.final_output) // 2:
                     root_result.final_output = merged
             except Exception as e:
-                self._emit("error", root_task_id, error=f"merge failed: {e}")
+                self._emit("merge_skipped", root_task_id,
+                           error=f"LLM merge failed, keeping programmatic report: {e}")
 
         # ── 最终归档 ──────────────────────────────────────────────────────────
         self._do_final_archive(root_result, root_out_dir)
