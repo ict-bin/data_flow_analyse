@@ -8,6 +8,7 @@ from typing import Any, Dict
 from sqlalchemy.orm import Session
 
 from app.db.models import AppDfaProjectConfig
+from app.models import normalize_max_rounds_exceeded_review_strategy
 
 logger = logging.getLogger("dfa.config_service")
 
@@ -31,6 +32,7 @@ def _deep_merge(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any
 
 _DEFAULT_CONFIG: Dict[str, Any] = {
     "max_rounds": 3,
+    "max_rounds_exceeded_review_strategy": "treat_as_passed",
     "min_rounds": 2,
     "pass_threshold": "majority",
     "agent_max_retries": 100,
@@ -69,12 +71,18 @@ class ConfigService:
             data = _deep_merge(_DEFAULT_CONFIG, row.config_json)
         else:
             data = dict(_DEFAULT_CONFIG)
+        data["max_rounds_exceeded_review_strategy"] = normalize_max_rounds_exceeded_review_strategy(
+            data.get("max_rounds_exceeded_review_strategy")
+        )
         data["project_id"] = project_id
         data["updated_at"] = row.updated_at.isoformat() if (row and row.updated_at) else None
         return data
 
     def save_config(self, db: Session, project_id: str, config_data: dict) -> dict:
         blob = {k: v for k, v in config_data.items() if k not in ("project_id", "updated_at")}
+        blob["max_rounds_exceeded_review_strategy"] = normalize_max_rounds_exceeded_review_strategy(
+            blob.get("max_rounds_exceeded_review_strategy")
+        )
         for role_key in ("workers", "judges"):
             if isinstance(blob.get(role_key), dict):
                 blob[role_key] = {k: v for k, v in blob[role_key].items() if k not in _ROLE_READONLY_FIELDS}
@@ -100,5 +108,4 @@ def get_config_service() -> ConfigService:
     if _config_service is None:
         _config_service = ConfigService()
     return _config_service
-
 

@@ -15,7 +15,13 @@ from typing import Any, Dict, Optional
 
 import yaml
 
-from .models import AgentInstanceConfig, RoleConfig, ServiceConfig, TaskConfig
+from .models import (
+    AgentInstanceConfig,
+    RoleConfig,
+    ServiceConfig,
+    TaskConfig,
+    normalize_max_rounds_exceeded_review_strategy,
+)
 
 logger = logging.getLogger("dfa.config")
 
@@ -237,6 +243,9 @@ def build_task_config(svc: ServiceConfig, prompt: str, cwd: str = None) -> TaskC
         line_hint=line_hint,
         cwd=cwd,
         max_rounds=svc.max_rounds,
+        max_rounds_exceeded_review_strategy=normalize_max_rounds_exceeded_review_strategy(
+            getattr(svc, "max_rounds_exceeded_review_strategy", None)
+        ),
         min_rounds=svc.min_rounds,
         agent_max_retries=svc.agent_max_retries,
         agent_retry_delay=svc.agent_retry_delay,
