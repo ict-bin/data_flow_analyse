@@ -1,7 +1,7 @@
 {
     "max_rounds": 3,
     "min_rounds": 2,
-    "pass_threshold": 1,
+    "pass_threshold": "majority",
     "agent_max_retries": 100,
     "agent_retry_delay": 30,
     "pi_max_retries": -1,
