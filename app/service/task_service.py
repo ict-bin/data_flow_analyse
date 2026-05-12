@@ -77,6 +77,24 @@ def _write_task_result_json(row: AppDfaTask, payload: dict) -> str | None:
     return str(path)
 
 
+def _persist_terminal_failure(row: AppDfaTask, error: str, *, status: str = "error") -> dict:
+    payload = {
+        "task_id": row.task_id,
+        "status": status,
+        "analysis_status": status,
+        "completion_reason": error,
+        "task": row.prompt_content or row.task_name or "",
+        "error": error,
+        "rounds": [],
+        "total_duration_ms": 0,
+        "total_tokens": _token_usage_dict(None),
+    }
+    result_file = _write_task_result_json(row, payload)
+    row.result_json = _lightweight_result_json(row, payload, result_file)
+    row.error = error
+    return payload
+
+
 def _input_manifest_path(row: AppDfaTask) -> Path | None:
     root = _task_root(row)
     return root / "input" / "input_manifest.json" if root else None
@@ -814,9 +832,9 @@ class TaskService:
                 r = db.query(AppDfaTask).filter_by(task_id=task_id).first()
                 if r and r.status == "running":
                     r.status = "error"
-                    r.error = str(exc)
                     r.finished_at = now_local()
                     r.stages_json = {"events": _baseline_events + event_buffer, "final": True}
+                    _persist_terminal_failure(r, str(exc), status="error")
                     db.commit()
             except Exception:
                 pass

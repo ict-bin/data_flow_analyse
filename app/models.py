@@ -25,6 +25,27 @@ def normalize_max_rounds_exceeded_review_strategy(value: str | None) -> str:
     return "treat_as_passed"
 
 
+def normalize_pass_threshold(value: object) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return "majority"
+    if isinstance(value, int):
+        if value <= 0:
+            return "majority"
+        if value == 1:
+            return "majority"
+        return "all"
+    candidate = str(value).strip().lower()
+    if not candidate:
+        return None
+    if candidate.isdigit():
+        return normalize_pass_threshold(int(candidate))
+    if candidate in {"all", "majority"}:
+        return candidate
+    return "majority"
+
+
 # ─── Agent 实例配置 ───────────────────────────────────────────────────────────
 
 class AgentInstanceConfig(BaseModel):
@@ -52,7 +73,7 @@ class ServiceConfig(BaseModel):
         description="达到最大轮次且评审仍未通过时的处理策略：treat_as_passed/treat_as_failed",
     )
     min_rounds: int = Field(default=2, ge=1, le=10, description="最少执行轮数（第1轮后强制自我反思）")
-    pass_threshold: Optional[str] = Field(default=None, description="裁判通过策略：'all'=全部通过, 'majority'=半数以上(ceil(J/2))，默认 'majority'")
+    pass_threshold: Optional[str | int] = Field(default=None, description="裁判通过策略：'all'=全部通过, 'majority'=半数以上(ceil(J/2))，兼容旧数值配置")
     agent_max_retries: int = Field(default=100, description="API 错误时最大重试次数")
     agent_retry_delay: float = Field(default=30.0, description="首次重试等待秒数，指数退避")
     agent_run_timeout_seconds: int = Field(default=3600, description="单次智能体输入最大运行时长（秒），-1=不限制")

@@ -8,7 +8,7 @@ from typing import Any, Dict
 from sqlalchemy.orm import Session
 
 from app.db.models import AppDfaProjectConfig
-from app.models import normalize_max_rounds_exceeded_review_strategy
+from app.models import normalize_max_rounds_exceeded_review_strategy, normalize_pass_threshold
 
 logger = logging.getLogger("dfa.config_service")
 
@@ -64,6 +64,15 @@ _DEFAULT_CONFIG: Dict[str, Any] = {
 }
 
 
+def _normalize_config_blob(data: Dict[str, Any]) -> Dict[str, Any]:
+    normalized = dict(data)
+    normalized["max_rounds_exceeded_review_strategy"] = normalize_max_rounds_exceeded_review_strategy(
+        normalized.get("max_rounds_exceeded_review_strategy")
+    )
+    normalized["pass_threshold"] = normalize_pass_threshold(normalized.get("pass_threshold"))
+    return normalized
+
+
 class ConfigService:
     def get_config(self, db: Session, project_id: str) -> dict:
         row = db.query(AppDfaProjectConfig).filter_by(project_id=project_id).first()
@@ -71,18 +80,14 @@ class ConfigService:
             data = _deep_merge(_DEFAULT_CONFIG, row.config_json)
         else:
             data = dict(_DEFAULT_CONFIG)
-        data["max_rounds_exceeded_review_strategy"] = normalize_max_rounds_exceeded_review_strategy(
-            data.get("max_rounds_exceeded_review_strategy")
-        )
+        data = _normalize_config_blob(data)
         data["project_id"] = project_id
         data["updated_at"] = row.updated_at.isoformat() if (row and row.updated_at) else None
         return data
 
     def save_config(self, db: Session, project_id: str, config_data: dict) -> dict:
         blob = {k: v for k, v in config_data.items() if k not in ("project_id", "updated_at")}
-        blob["max_rounds_exceeded_review_strategy"] = normalize_max_rounds_exceeded_review_strategy(
-            blob.get("max_rounds_exceeded_review_strategy")
-        )
+        blob = _normalize_config_blob(blob)
         for role_key in ("workers", "judges"):
             if isinstance(blob.get(role_key), dict):
                 blob[role_key] = {k: v for k, v in blob[role_key].items() if k not in _ROLE_READONLY_FIELDS}
@@ -94,7 +99,7 @@ class ConfigService:
             db.add(row)
         db.commit()
         db.refresh(row)
-        result = _deep_merge(_DEFAULT_CONFIG, blob)
+        result = _normalize_config_blob(_deep_merge(_DEFAULT_CONFIG, blob))
         result["project_id"] = project_id
         result["updated_at"] = row.updated_at.isoformat() if row.updated_at else None
         return result
@@ -108,4 +113,3 @@ def get_config_service() -> ConfigService:
     if _config_service is None:
         _config_service = ConfigService()
     return _config_service
-

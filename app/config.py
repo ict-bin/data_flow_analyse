@@ -21,6 +21,7 @@ from .models import (
     ServiceConfig,
     TaskConfig,
     normalize_max_rounds_exceeded_review_strategy,
+    normalize_pass_threshold,
 )
 
 logger = logging.getLogger("dfa.config")
@@ -222,6 +223,7 @@ def load_service_config(config_path: str) -> ServiceConfig:
     if not p.is_file():
         raise FileNotFoundError(f"服务配置文件不存在: {config_path}")
     raw = json.loads(p.read_text(encoding="utf-8"))
+    raw["pass_threshold"] = normalize_pass_threshold(raw.get("pass_threshold"))
     return ServiceConfig(**raw)
 
 
@@ -266,7 +268,7 @@ def build_task_config(svc: ServiceConfig, prompt: str, cwd: str = None) -> TaskC
     _backfill_role(cfg.workers)
     _backfill_role(cfg.judges)
 
-    mode = svc.pass_threshold or "majority"
+    mode = normalize_pass_threshold(getattr(svc, "pass_threshold", None)) or "majority"
     if mode == "all":
         cfg.pass_threshold = cfg.judge_count
     else:  # "majority" or unknown
