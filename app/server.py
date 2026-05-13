@@ -39,6 +39,7 @@ import httpx
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from sse_starlette.sse import EventSourceResponse
 
@@ -78,33 +79,48 @@ class TaskEntry:
 _tasks: dict[str, TaskEntry] = {}
 _dispatcher_task: asyncio.Task | None = None
 _dispatcher_stop = asyncio.Event()
+_startup_task: asyncio.Task | None = None
+_startup_ready = asyncio.Event()
+_startup_phase = "booting"
+_startup_error: str | None = None
 
 
-# ─── Lifespan ────────────────────────────────────────────────────────────────
+async def _bootstrap_management_plane(app: FastAPI) -> None:
+    global _dispatcher_task, _startup_phase, _startup_error
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    # --- startup ---
     svc_yaml = get_service_yaml()
     db_url = svc_yaml.database.url
 
     try:
+        _startup_phase = "db_init"
+        log_event(logger, logging.INFO, "startup phase begin", event="startup_phase_begin", phase=_startup_phase)
+
         from .db import init_db
-        init_db(
-            db_url,
-            pool_size=svc_yaml.database.pool_size,
-            max_overflow=svc_yaml.database.max_overflow,
+        await asyncio.wait_for(
+            asyncio.to_thread(
+                init_db,
+                db_url,
+                svc_yaml.database.pool_size,
+                svc_yaml.database.max_overflow,
+            ),
+            timeout=120,
         )
         logger.info("DB initialized: %s:%s/%s", svc_yaml.database.host, svc_yaml.database.port, svc_yaml.database.name)
 
+        _startup_phase = "router_init"
+        log_event(logger, logging.INFO, "startup phase begin", event="startup_phase_begin", phase=_startup_phase)
         from .api import router as mgmt_router
         app.include_router(mgmt_router)
 
-        # Start menu registry heartbeat
+        _startup_phase = "registry_register"
+        log_event(logger, logging.INFO, "startup phase begin", event="startup_phase_begin", phase=_startup_phase)
         from .service.registry_service import get_registry_service
         _registry = get_registry_service()
-        await _registry.register()
+        await asyncio.wait_for(_registry.register(), timeout=15)
         _registry.start()
+
+        _startup_phase = "dispatcher_start"
+        log_event(logger, logging.INFO, "startup phase begin", event="startup_phase_begin", phase=_startup_phase)
 
         async def _dispatcher_loop() -> None:
             svc = get_task_service()
@@ -125,16 +141,40 @@ async def lifespan(app: FastAPI):
                     logger.warning("dispatcher loop failed on %s: %s", INSTANCE_ID, exc, exc_info=True)
                 await asyncio.sleep(DISPATCH_POLL_INTERVAL_SECONDS)
 
-        global _dispatcher_task
         _dispatcher_stop.clear()
         _dispatcher_task = asyncio.create_task(_dispatcher_loop(), name="dfa_dispatcher")
+        _startup_phase = "ready"
+        _startup_ready.set()
         log_event(logger, logging.INFO, "dispatcher started", event="dispatcher_started", owner_id=INSTANCE_ID)
     except Exception as exc:
-        logger.warning("DB init failed (management APIs unavailable): %s", exc)
+        _startup_phase = "error"
+        _startup_error = str(exc)
+        logger.exception("startup bootstrap failed: %s", exc)
+        log_event(logger, logging.ERROR, "startup bootstrap failed", event="startup_bootstrap_failed",
+                  phase=_startup_phase, error=str(exc))
+
+
+# ─── Lifespan ────────────────────────────────────────────────────────────────
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # --- startup ---
+    global _startup_task, _startup_phase, _startup_error
+    _startup_phase = "booting"
+    _startup_error = None
+    _startup_ready.clear()
+    _dispatcher_stop.clear()
+    _startup_task = asyncio.create_task(_bootstrap_management_plane(app), name="dfa_startup")
 
     yield
     # --- shutdown ---
     _dispatcher_stop.set()
+    if _startup_task is not None and not _startup_task.done():
+        _startup_task.cancel()
+        try:
+            await _startup_task
+        except asyncio.CancelledError:
+            pass
     if _dispatcher_task is not None:
         _dispatcher_task.cancel()
         try:
@@ -181,14 +221,21 @@ class AnalyseRequest(BaseModel):
 @app.get("/health")
 @app.get("/api/app/dataflow-analyse/health")
 async def health():
-    return {
+    payload = {
         "status": "ok",
         "instance_id": INSTANCE_ID,
         "active": sum(1 for t in _tasks.values() if t.result is None),
         "completed": sum(1 for t in _tasks.values() if t.result is not None),
         "dispatcher_running": bool(_dispatcher_task and not _dispatcher_task.done()),
         "leased_tasks": get_task_service().local_running_task_count(),
+        "startup_phase": _startup_phase,
+        "startup_ready": _startup_ready.is_set(),
+        "startup_error": _startup_error,
     }
+    if _startup_ready.is_set():
+        return payload
+    payload["status"] = "starting" if _startup_error is None else "error"
+    return JSONResponse(status_code=503, content=payload)
 
 
 @app.post("/analyse", status_code=202)
