@@ -257,8 +257,10 @@ def build_task_config(svc: ServiceConfig, prompt: str, cwd: str = None) -> TaskC
     _backfill_role(cfg.workers)
     _backfill_role(cfg.judges)
 
-    mode = svc.pass_threshold or "majority"
-    if mode == "all":
+    mode = svc.pass_threshold if svc.pass_threshold is not None else "majority"
+    if isinstance(mode, int):
+        cfg.pass_threshold = max(1, min(mode, cfg.judge_count or 1))
+    elif mode == "all":
         cfg.pass_threshold = cfg.judge_count
     else:  # "majority" or unknown
         cfg.pass_threshold = math.ceil(cfg.judge_count / 2)
