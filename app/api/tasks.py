@@ -63,6 +63,28 @@ def _task_root(row) -> Path:
     return Path(output_path).expanduser().resolve() / row.task_id
 
 
+def _latest_epoch_run_root(root: Path) -> Path:
+    run_root = root / "run"
+    epochs_root = run_root / "epochs"
+    if not epochs_root.exists():
+        return run_root
+    candidates = [path for path in epochs_root.iterdir() if path.is_dir()]
+    if not candidates:
+        return run_root
+    return sorted(candidates, key=lambda path: path.name)[-1]
+
+
+def _epoch_label(path: Path) -> str | None:
+    if not path:
+        return None
+    parts = path.parts
+    if "epochs" in parts:
+        idx = parts.index("epochs")
+        if idx + 1 < len(parts):
+            return parts[idx + 1]
+    return None
+
+
 def _read_text(path: Path, warnings: List[str], label: str, limit: int = 2_000_000) -> str:
     try:
         if not path.exists() or not path.is_file():
@@ -231,6 +253,11 @@ async def get_task(task_id: str, db: Session = Depends(get_db)):
     return get_task_service().get_task(db, task_id)
 
 
+@router.get("/tasks/{task_id}/execution")
+async def get_task_execution(task_id: str, db: Session = Depends(get_db)):
+    return get_task_service().get_task_execution(db, task_id)
+
+
 @router.get("/tasks/{task_id}/result")
 async def get_task_result(task_id: str, db: Session = Depends(get_db)):
     row = _get_task_row(db, task_id)
@@ -240,6 +267,8 @@ async def get_task_result(task_id: str, db: Session = Depends(get_db)):
     run_root = root / "run" if str(root) else Path()
     result_json = _load_result_json(row, root, warnings) if str(root) else (row.result_json or {})
     rounds = _collect_rounds(result_json)
+    latest_run_root = _latest_epoch_run_root(root) if str(root) else Path()
+    current_epoch = _epoch_label(latest_run_root)
 
     output_files: List[Dict[str, Any]] = []
     dataflow_files: List[Dict[str, Any]] = []
@@ -268,7 +297,7 @@ async def get_task_result(task_id: str, db: Session = Depends(get_db)):
                     "mtime": path.stat().st_mtime,
                 })
 
-    run_report = _read_text(run_root / "report.md", warnings, "run/report.md") if run_root.exists() else ""
+    run_report = _read_text(latest_run_root / "report.md", warnings, "run/report.md") if latest_run_root.exists() else ""
     available = bool(result_markdown or run_report or dataflow_files or result_json)
     if row.status not in TERMINAL_STATUSES and not available:
         available = False
@@ -277,6 +306,8 @@ async def get_task_result(task_id: str, db: Session = Depends(get_db)):
         "available": available,
         "status": row.status,
         "output_root": str(output_root) if str(root) else "",
+        "latest_run_root": str(latest_run_root) if latest_run_root.exists() else "",
+        "current_epoch": current_epoch,
         "warnings": warnings,
         "result_markdown": result_markdown,
         "run_report_markdown": run_report,
@@ -296,10 +327,13 @@ async def list_task_sessions(task_id: str, db: Session = Depends(get_db)):
         return {"task_id": task_id, "items": []}
 
     candidates = list((run_root / "sessions").glob("**/*.jsonl")) if (run_root / "sessions").exists() else []
+    if (run_root / "epochs").exists():
+        candidates.extend((run_root / "epochs").glob("**/sessions/**/*.jsonl"))
     candidates.extend(run_root.glob("subtasks/**/sessions/**/*.jsonl"))
     seen = set()
     items: List[Dict[str, Any]] = []
     now_ts = __import__("time").time()
+    latest_run_root = _latest_epoch_run_root(root)
     for path in sorted(candidates):
         resolved = path.resolve()
         if resolved in seen or not path.is_file():
@@ -318,6 +352,12 @@ async def list_task_sessions(task_id: str, db: Session = Depends(get_db)):
         except Exception:
             event_count = 0
         session_name = path.stem
+        is_latest_epoch = False
+        try:
+            path.relative_to(latest_run_root)
+            is_latest_epoch = True
+        except ValueError:
+            is_latest_epoch = False
         items.append({
             "session_id": str(rel),
             "session_name": session_name,
@@ -330,9 +370,11 @@ async def list_task_sessions(task_id: str, db: Session = Depends(get_db)):
             "message_count": event_count,
             "is_active": row.status == "running" and (now_ts - stat.st_mtime) < 120,
             "display_name": session_name,
+            "epoch": _epoch_label(path),
+            "is_latest_epoch": is_latest_epoch,
         })
     items.sort(key=lambda item: (item["stage_group"], -float(item["mtime"]), item["relative_path"]))
-    return {"task_id": task_id, "items": items}
+    return {"task_id": task_id, "items": items, "current_epoch": _epoch_label(latest_run_root)}
 
 
 @router.get("/tasks/{task_id}/sessions/file")
