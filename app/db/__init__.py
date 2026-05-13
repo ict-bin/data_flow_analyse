@@ -46,18 +46,29 @@ _MIGRATIONS = [
 def _run_migrations(engine) -> None:
     """Apply additive schema migrations; silently skips already-applied ones."""
     with engine.connect() as conn:
+        try:
+            conn.execute(text("SET SESSION lock_wait_timeout = 5"))
+        except Exception:
+            conn.rollback()
+        try:
+            conn.execute(text("SET SESSION innodb_lock_wait_timeout = 5"))
+        except Exception:
+            conn.rollback()
         for stmt in _MIGRATIONS:
             try:
+                logger.info("Migration begin: %s", stmt[:120])
                 conn.execute(text(stmt))
                 conn.commit()
-                logger.info("Migration applied: %s", stmt[:60])
-            except Exception:
+                logger.info("Migration applied: %s", stmt[:120])
+            except Exception as exc:
                 conn.rollback()
+                logger.info("Migration skipped: %s (%s)", stmt[:120], exc)
 
 
 def init_db(db_url: str, pool_size: int = 5, max_overflow: int = 10) -> None:
     """Initialize the database engine and create tables."""
     global _engine, _SessionLocal
+    logger.info("Database engine init begin")
     _engine = create_engine(
         db_url,
         pool_size=pool_size,
@@ -66,8 +77,12 @@ def init_db(db_url: str, pool_size: int = 5, max_overflow: int = 10) -> None:
         pool_recycle=3600,
     )
     _SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=_engine)
+    logger.info("Database metadata create_all begin")
     Base.metadata.create_all(bind=_engine)
+    logger.info("Database metadata create_all done")
+    logger.info("Database migrations begin")
     _run_migrations(_engine)
+    logger.info("Database migrations done")
     logger.info("Database initialized")
 
 
