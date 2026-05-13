@@ -47,7 +47,15 @@ from .config import build_task_config, get_service_yaml, load_service_config
 from .logging_utils import configure_container_logging
 from .models import SwarmEvent, TaskResult, TaskStatus, make_id
 from .orchestrator import Orchestrator
-from .runtime_context import DISPATCH_POLL_INTERVAL_SECONDS, INSTANCE_ID
+from .runtime_context import (
+    DISPATCHER_ENABLED,
+    DISPATCH_POLL_INTERVAL_SECONDS,
+    EXECUTOR_ENABLED,
+    INSTANCE_ID,
+    PUBLIC_API_ENABLED,
+    REGISTRY_ENABLED,
+    ROLE,
+)
 from .service.task_service import get_task_service
 from .time_utils import now_local
 from .logging_utils import log_event
@@ -85,6 +93,10 @@ _startup_phase = "booting"
 _startup_error: str | None = None
 
 
+def _forbidden_for_role(feature: str) -> HTTPException:
+    return HTTPException(status_code=503, detail=f"{feature} disabled for role={ROLE}")
+
+
 async def _bootstrap_management_plane(app: FastAPI) -> None:
     global _dispatcher_task, _startup_phase, _startup_error
 
@@ -107,45 +119,61 @@ async def _bootstrap_management_plane(app: FastAPI) -> None:
         )
         logger.info("DB initialized: %s:%s/%s", svc_yaml.database.host, svc_yaml.database.port, svc_yaml.database.name)
 
-        _startup_phase = "router_init"
-        log_event(logger, logging.INFO, "startup phase begin", event="startup_phase_begin", phase=_startup_phase)
-        from .api import router as mgmt_router
-        app.include_router(mgmt_router)
+        if PUBLIC_API_ENABLED:
+            _startup_phase = "router_init"
+            log_event(logger, logging.INFO, "startup phase begin", event="startup_phase_begin", phase=_startup_phase)
+            from .api import router as mgmt_router
+            app.include_router(mgmt_router)
 
-        _startup_phase = "registry_register"
-        log_event(logger, logging.INFO, "startup phase begin", event="startup_phase_begin", phase=_startup_phase)
-        from .service.registry_service import get_registry_service
-        _registry = get_registry_service()
-        await asyncio.wait_for(_registry.register(), timeout=15)
-        _registry.start()
+        if REGISTRY_ENABLED:
+            _startup_phase = "registry_register"
+            log_event(logger, logging.INFO, "startup phase begin", event="startup_phase_begin", phase=_startup_phase)
+            from .service.registry_service import get_registry_service
+            _registry = get_registry_service()
+            await asyncio.wait_for(_registry.register(), timeout=15)
+            _registry.start()
 
-        _startup_phase = "dispatcher_start"
-        log_event(logger, logging.INFO, "startup phase begin", event="startup_phase_begin", phase=_startup_phase)
+        if DISPATCHER_ENABLED:
+            _startup_phase = "dispatcher_start"
+            log_event(logger, logging.INFO, "startup phase begin", event="startup_phase_begin", phase=_startup_phase)
 
-        async def _dispatcher_loop() -> None:
-            svc = get_task_service()
-            while not _dispatcher_stop.is_set():
-                try:
-                    claimed = await svc.dispatch_until_full()
-                    if claimed:
-                        log_event(
-                            logger,
-                            logging.INFO,
-                            "dispatcher claimed tasks",
-                            event="dispatcher_claim_batch",
-                            owner_id=INSTANCE_ID,
-                            claimed_count=claimed,
-                            current_running=svc.local_running_task_count(),
-                        )
-                except Exception as exc:
-                    logger.warning("dispatcher loop failed on %s: %s", INSTANCE_ID, exc, exc_info=True)
-                await asyncio.sleep(DISPATCH_POLL_INTERVAL_SECONDS)
+            async def _dispatcher_loop() -> None:
+                svc = get_task_service()
+                while not _dispatcher_stop.is_set():
+                    try:
+                        claimed = await svc.dispatch_until_full()
+                        if claimed:
+                            log_event(
+                                logger,
+                                logging.INFO,
+                                "dispatcher claimed tasks",
+                                event="dispatcher_claim_batch",
+                                owner_id=INSTANCE_ID,
+                                claimed_count=claimed,
+                                current_running=svc.local_running_task_count(),
+                            )
+                    except Exception as exc:
+                        logger.warning("dispatcher loop failed on %s: %s", INSTANCE_ID, exc, exc_info=True)
+                    await asyncio.sleep(DISPATCH_POLL_INTERVAL_SECONDS)
 
-        _dispatcher_stop.clear()
-        _dispatcher_task = asyncio.create_task(_dispatcher_loop(), name="dfa_dispatcher")
+            _dispatcher_stop.clear()
+            _dispatcher_task = asyncio.create_task(_dispatcher_loop(), name="dfa_dispatcher")
         _startup_phase = "ready"
         _startup_ready.set()
-        log_event(logger, logging.INFO, "dispatcher started", event="dispatcher_started", owner_id=INSTANCE_ID)
+        log_event(
+            logger,
+            logging.INFO,
+            "startup ready",
+            event="startup_ready",
+            owner_id=INSTANCE_ID,
+            role=ROLE,
+            public_api_enabled=PUBLIC_API_ENABLED,
+            dispatcher_enabled=DISPATCHER_ENABLED,
+            executor_enabled=EXECUTOR_ENABLED,
+            registry_enabled=REGISTRY_ENABLED,
+        )
+        if DISPATCHER_ENABLED:
+            log_event(logger, logging.INFO, "dispatcher started", event="dispatcher_started", owner_id=INSTANCE_ID)
     except Exception as exc:
         _startup_phase = "error"
         _startup_error = str(exc)
@@ -224,6 +252,11 @@ async def health():
     payload = {
         "status": "ok",
         "instance_id": INSTANCE_ID,
+        "role": ROLE,
+        "public_api_enabled": PUBLIC_API_ENABLED,
+        "dispatcher_enabled": DISPATCHER_ENABLED,
+        "executor_enabled": EXECUTOR_ENABLED,
+        "registry_enabled": REGISTRY_ENABLED,
         "active": sum(1 for t in _tasks.values() if t.result is None),
         "completed": sum(1 for t in _tasks.values() if t.result is not None),
         "dispatcher_running": bool(_dispatcher_task and not _dispatcher_task.done()),
@@ -241,6 +274,10 @@ async def health():
 @app.post("/analyse", status_code=202)
 async def submit_analyse(body: AnalyseRequest):
     """提交分析任务。只需一句话 prompt。"""
+    if not PUBLIC_API_ENABLED:
+        raise _forbidden_for_role("legacy submit API")
+    if not EXECUTOR_ENABLED:
+        raise _forbidden_for_role("legacy in-process executor")
     svc = _get_svc_config()
     cwd = body.cwd or TARGET_DIR
     cfg = build_task_config(svc, body.prompt, cwd=cwd)
@@ -314,6 +351,8 @@ async def _notify(entry: TaskEntry):
 
 @app.get("/task/{task_id}")
 async def get_task(task_id: str):
+    if not PUBLIC_API_ENABLED:
+        raise _forbidden_for_role("legacy task API")
     entry = _tasks.get(task_id)
     if not entry:
         raise HTTPException(404, "Task not found")
@@ -324,6 +363,8 @@ async def get_task(task_id: str):
 
 @app.get("/task/{task_id}/stream")
 async def stream_task(task_id: str):
+    if not PUBLIC_API_ENABLED:
+        raise _forbidden_for_role("legacy task stream API")
     entry = _tasks.get(task_id)
     if not entry:
         raise HTTPException(404, "Task not found")
@@ -354,6 +395,8 @@ async def stream_task(task_id: str):
 
 @app.post("/task/{task_id}/abort")
 async def abort_task(task_id: str):
+    if not PUBLIC_API_ENABLED:
+        raise _forbidden_for_role("legacy task abort API")
     entry = _tasks.get(task_id)
     if not entry:
         raise HTTPException(404)
@@ -365,6 +408,8 @@ async def abort_task(task_id: str):
 
 @app.get("/tasks")
 async def list_tasks():
+    if not PUBLIC_API_ENABLED:
+        raise _forbidden_for_role("legacy task list API")
     return {"tasks": [
         {"task_id": tid, "prompt": e.prompt[:100],
          "status": e.result.status.value if e.result else "running"}
