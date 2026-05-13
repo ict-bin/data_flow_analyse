@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import logging
-from typing import Generator
+from dataclasses import dataclass
+from typing import Generator, Literal
 
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine, inspect, text
 from sqlalchemy.orm import Session, sessionmaker
 
 from .models import Base
@@ -15,32 +16,149 @@ logger = logging.getLogger("dfa.db")
 _engine = None
 _SessionLocal = None
 
+@dataclass(frozen=True)
+class Migration:
+    kind: Literal["column", "index"]
+    table_name: str
+    name: str
+    statement: str
+
+
 _MIGRATIONS = [
-    # Add task_config_json for per-task overrides / resume flags (added 2026-05)
-    "ALTER TABLE secflow_app_dfa_tasks ADD COLUMN task_config_json JSON NULL",
-    # Add stages_json for real-time stage event tracking (added 2026-05)
-    "ALTER TABLE secflow_app_dfa_tasks ADD COLUMN stages_json JSON NULL",
-    # Add prompt_template_id for template linkage (added 2026-05)
-    "ALTER TABLE secflow_app_dfa_tasks ADD COLUMN prompt_template_id VARCHAR(64) NULL",
-    "ALTER TABLE secflow_app_dfa_tasks ADD COLUMN task_origin_type VARCHAR(32) NULL",
-    "ALTER TABLE secflow_app_dfa_tasks ADD COLUMN parent_project_id VARCHAR(100) NULL",
-    "ALTER TABLE secflow_app_dfa_tasks ADD COLUMN parent_task_id VARCHAR(64) NULL",
-    "ALTER TABLE secflow_app_dfa_tasks ADD COLUMN parent_task_type VARCHAR(32) NULL",
-    "ALTER TABLE secflow_app_dfa_tasks ADD COLUMN parent_stage_name VARCHAR(64) NULL",
-    "ALTER TABLE secflow_app_dfa_tasks ADD COLUMN parent_stage_item_id VARCHAR(64) NULL",
-    "ALTER TABLE secflow_app_dfa_tasks ADD COLUMN parent_stage_item_key VARCHAR(255) NULL",
-    "ALTER TABLE secflow_app_dfa_tasks ADD COLUMN execution_owner_id VARCHAR(128) NULL",
-    "ALTER TABLE secflow_app_dfa_tasks ADD COLUMN execution_lease_until DATETIME NULL",
-    "ALTER TABLE secflow_app_dfa_tasks ADD COLUMN execution_heartbeat_at DATETIME NULL",
-    "ALTER TABLE secflow_app_dfa_tasks ADD COLUMN execution_epoch INT NOT NULL DEFAULT 0",
-    "ALTER TABLE secflow_app_dfa_tasks ADD COLUMN control_version INT NOT NULL DEFAULT 0",
-    "ALTER TABLE secflow_app_dfa_tasks ADD COLUMN dispatch_status VARCHAR(32) NULL",
-    "CREATE INDEX ix_dfa_tasks_project_deleted_created_id ON secflow_app_dfa_tasks (project_id, is_deleted, created_at, id)",
-    "CREATE INDEX ix_dfa_tasks_project_created_id ON secflow_app_dfa_tasks (project_id, created_at, id)",
-    "CREATE INDEX ix_dfa_tasks_project_deleted_status_created_id ON secflow_app_dfa_tasks (project_id, is_deleted, status, created_at, id)",
-    "CREATE INDEX ix_dfa_tasks_sched ON secflow_app_dfa_tasks (is_deleted, status, execution_lease_until, created_at, id)",
-    "CREATE INDEX ix_dfa_tasks_owner ON secflow_app_dfa_tasks (execution_owner_id, status)",
+    Migration(
+        kind="column",
+        table_name="secflow_app_dfa_tasks",
+        name="task_config_json",
+        statement="ALTER TABLE secflow_app_dfa_tasks ADD COLUMN task_config_json JSON NULL",
+    ),
+    Migration(
+        kind="column",
+        table_name="secflow_app_dfa_tasks",
+        name="stages_json",
+        statement="ALTER TABLE secflow_app_dfa_tasks ADD COLUMN stages_json JSON NULL",
+    ),
+    Migration(
+        kind="column",
+        table_name="secflow_app_dfa_tasks",
+        name="prompt_template_id",
+        statement="ALTER TABLE secflow_app_dfa_tasks ADD COLUMN prompt_template_id VARCHAR(64) NULL",
+    ),
+    Migration(
+        kind="column",
+        table_name="secflow_app_dfa_tasks",
+        name="task_origin_type",
+        statement="ALTER TABLE secflow_app_dfa_tasks ADD COLUMN task_origin_type VARCHAR(32) NULL",
+    ),
+    Migration(
+        kind="column",
+        table_name="secflow_app_dfa_tasks",
+        name="parent_project_id",
+        statement="ALTER TABLE secflow_app_dfa_tasks ADD COLUMN parent_project_id VARCHAR(100) NULL",
+    ),
+    Migration(
+        kind="column",
+        table_name="secflow_app_dfa_tasks",
+        name="parent_task_id",
+        statement="ALTER TABLE secflow_app_dfa_tasks ADD COLUMN parent_task_id VARCHAR(64) NULL",
+    ),
+    Migration(
+        kind="column",
+        table_name="secflow_app_dfa_tasks",
+        name="parent_task_type",
+        statement="ALTER TABLE secflow_app_dfa_tasks ADD COLUMN parent_task_type VARCHAR(32) NULL",
+    ),
+    Migration(
+        kind="column",
+        table_name="secflow_app_dfa_tasks",
+        name="parent_stage_name",
+        statement="ALTER TABLE secflow_app_dfa_tasks ADD COLUMN parent_stage_name VARCHAR(64) NULL",
+    ),
+    Migration(
+        kind="column",
+        table_name="secflow_app_dfa_tasks",
+        name="parent_stage_item_id",
+        statement="ALTER TABLE secflow_app_dfa_tasks ADD COLUMN parent_stage_item_id VARCHAR(64) NULL",
+    ),
+    Migration(
+        kind="column",
+        table_name="secflow_app_dfa_tasks",
+        name="parent_stage_item_key",
+        statement="ALTER TABLE secflow_app_dfa_tasks ADD COLUMN parent_stage_item_key VARCHAR(255) NULL",
+    ),
+    Migration(
+        kind="column",
+        table_name="secflow_app_dfa_tasks",
+        name="execution_owner_id",
+        statement="ALTER TABLE secflow_app_dfa_tasks ADD COLUMN execution_owner_id VARCHAR(128) NULL",
+    ),
+    Migration(
+        kind="column",
+        table_name="secflow_app_dfa_tasks",
+        name="execution_lease_until",
+        statement="ALTER TABLE secflow_app_dfa_tasks ADD COLUMN execution_lease_until DATETIME NULL",
+    ),
+    Migration(
+        kind="column",
+        table_name="secflow_app_dfa_tasks",
+        name="execution_heartbeat_at",
+        statement="ALTER TABLE secflow_app_dfa_tasks ADD COLUMN execution_heartbeat_at DATETIME NULL",
+    ),
+    Migration(
+        kind="column",
+        table_name="secflow_app_dfa_tasks",
+        name="execution_epoch",
+        statement="ALTER TABLE secflow_app_dfa_tasks ADD COLUMN execution_epoch INT NOT NULL DEFAULT 0",
+    ),
+    Migration(
+        kind="column",
+        table_name="secflow_app_dfa_tasks",
+        name="control_version",
+        statement="ALTER TABLE secflow_app_dfa_tasks ADD COLUMN control_version INT NOT NULL DEFAULT 0",
+    ),
+    Migration(
+        kind="column",
+        table_name="secflow_app_dfa_tasks",
+        name="dispatch_status",
+        statement="ALTER TABLE secflow_app_dfa_tasks ADD COLUMN dispatch_status VARCHAR(32) NULL",
+    ),
+    Migration(
+        kind="index",
+        table_name="secflow_app_dfa_tasks",
+        name="ix_dfa_tasks_project_deleted_created_id",
+        statement="CREATE INDEX ix_dfa_tasks_project_deleted_created_id ON secflow_app_dfa_tasks (project_id, is_deleted, created_at, id)",
+    ),
+    Migration(
+        kind="index",
+        table_name="secflow_app_dfa_tasks",
+        name="ix_dfa_tasks_project_created_id",
+        statement="CREATE INDEX ix_dfa_tasks_project_created_id ON secflow_app_dfa_tasks (project_id, created_at, id)",
+    ),
+    Migration(
+        kind="index",
+        table_name="secflow_app_dfa_tasks",
+        name="ix_dfa_tasks_project_deleted_status_created_id",
+        statement="CREATE INDEX ix_dfa_tasks_project_deleted_status_created_id ON secflow_app_dfa_tasks (project_id, is_deleted, status, created_at, id)",
+    ),
+    Migration(
+        kind="index",
+        table_name="secflow_app_dfa_tasks",
+        name="ix_dfa_tasks_sched",
+        statement="CREATE INDEX ix_dfa_tasks_sched ON secflow_app_dfa_tasks (is_deleted, status, execution_lease_until, created_at, id)",
+    ),
+    Migration(
+        kind="index",
+        table_name="secflow_app_dfa_tasks",
+        name="ix_dfa_tasks_owner",
+        statement="CREATE INDEX ix_dfa_tasks_owner ON secflow_app_dfa_tasks (execution_owner_id, status)",
+    ),
 ]
+
+
+def _migration_exists(engine, migration: Migration) -> bool:
+    inspector = inspect(engine)
+    if migration.kind == "column":
+        return migration.name in {col["name"] for col in inspector.get_columns(migration.table_name)}
+    return migration.name in {idx["name"] for idx in inspector.get_indexes(migration.table_name)}
 
 
 def _run_migrations(engine) -> None:
@@ -54,7 +172,11 @@ def _run_migrations(engine) -> None:
             conn.execute(text("SET SESSION innodb_lock_wait_timeout = 5"))
         except Exception:
             conn.rollback()
-        for stmt in _MIGRATIONS:
+        for migration in _MIGRATIONS:
+            stmt = migration.statement
+            if _migration_exists(engine, migration):
+                logger.info("Migration already satisfied: %s %s.%s", migration.kind, migration.table_name, migration.name)
+                continue
             try:
                 logger.info("Migration begin: %s", stmt[:120])
                 conn.execute(text(stmt))
