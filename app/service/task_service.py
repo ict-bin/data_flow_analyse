@@ -467,7 +467,20 @@ def _load_svc_config_from_db(db: Session, project_id: str) -> "object":
         cfg_dict = get_config_service().get_config(db, project_id)
         for _k in ("updated_at", "project_id"):
             cfg_dict.pop(_k, None)
-        return _ServiceConfig(**cfg_dict)
+        svc = _ServiceConfig(**cfg_dict)
+        if not svc.workers.agents or not svc.judges.agents:
+            logger.warning(
+                "project config has empty agents (%s), falling back to file defaults: workers=%s judges=%s",
+                project_id,
+                len(svc.workers.agents),
+                len(svc.judges.agents),
+            )
+            fallback = _load_svc_config()
+            if not svc.workers.agents:
+                svc.workers = fallback.workers
+            if not svc.judges.agents:
+                svc.judges = fallback.judges
+        return svc
     except Exception as _exc:
         logger.warning("_load_svc_config_from_db failed (%s), falling back to file: %s", project_id, _exc)
         return _load_svc_config()
