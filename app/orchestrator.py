@@ -82,6 +82,28 @@ def _nested_function_run_dir(root_out_dir: Path, tid: str, dep: int, func_name: 
     logical = f"{tid}-{func_name}"
     return root_out_dir / "subtasks" / f"depth_{dep:02d}" / _safe_dir_name(logical)
 
+
+def _relativize_round_artifacts(result: TaskResult, round_root: Path, root_out_dir: Path) -> None:
+    for rnd in result.rounds or []:
+        for worker in rnd.worker_results or []:
+            if getattr(worker, "session_file", None):
+                try:
+                    worker.session_file = str((round_root / worker.session_file).resolve().relative_to(root_out_dir.resolve())).replace("\\", "/")
+                except Exception:
+                    try:
+                        worker.session_file = str(Path(worker.session_file).resolve().relative_to(root_out_dir.resolve())).replace("\\", "/")
+                    except Exception:
+                        pass
+        for judge in rnd.judge_results or []:
+            if getattr(judge, "session_file", None):
+                try:
+                    judge.session_file = str((round_root / judge.session_file).resolve().relative_to(root_out_dir.resolve())).replace("\\", "/")
+                except Exception:
+                    try:
+                        judge.session_file = str(Path(judge.session_file).resolve().relative_to(root_out_dir.resolve())).replace("\\", "/")
+                    except Exception:
+                        pass
+
 class Orchestrator(JudgeMixin):
 
     def __init__(
@@ -549,9 +571,11 @@ class Orchestrator(JudgeMixin):
         analyzed.add(root_key)
 
         self._emit("task_start", root_task_id, task=cfg.task,
-                   agents=f"W={cfg.worker_count} J={cfg.judge_count}")
+                   agents=f"W={cfg.worker_count} J={cfg.judge_count}",
+                   function=cfg.function_name, source_file=cfg.source_file)
         self._emit("trace_start", root_task_id,
-                   function=cfg.function_name, depth=0, max_depth=max_depth)
+                   function=cfg.function_name, source_file=cfg.source_file,
+                   depth=0, max_depth=max_depth)
 
         # 根任务入队
         await queue.put((cfg.function_name, cfg.source_file, cfg.line_hint,
@@ -562,7 +586,8 @@ class Orchestrator(JudgeMixin):
 
             # 通知 CLI: 新函数开始
             self._emit("trace_start", tid,
-                       function=func_name, depth=dep, max_depth=max_depth)
+                       function=func_name, source_file=src_file,
+                       depth=dep, max_depth=max_depth)
 
             # 注入 tainted_context
             if taint_ctx and dep > 0:
@@ -629,8 +654,11 @@ class Orchestrator(JudgeMixin):
                     dep=dep,
                     max_depth=max_depth,
                     on_event=self.on_event,
+                    cancel_event=self._cancel_event,
                 )
                 result = await workflow.run()
+
+            _relativize_round_artifacts(result, out_dir, root_out_dir)
 
             # 通知 CLI: 函数分析完成
             self._emit("round_end", tid,

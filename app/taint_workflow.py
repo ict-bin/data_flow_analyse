@@ -402,6 +402,7 @@ class PerTaintWorkflow:
         dep: int = 0,
         max_depth: int = 5,
         on_event: Callable | None = None,
+        cancel_event: asyncio.Event | None = None,
     ):
         self.cfg = cfg
         self.func_name = func_name
@@ -414,6 +415,7 @@ class PerTaintWorkflow:
         self.dep = dep
         self.max_depth = max_depth
         self.on_event = on_event
+        self.cancel_event = cancel_event
 
         # Session 文件路径
         self.sess_dir = out_dir / "sessions"
@@ -477,7 +479,7 @@ class PerTaintWorkflow:
             thinking_level=(self.cfg.workers.agents[0].thinking_level
                             or self.cfg.workers.default_thinking_level),
             session_file=session_file,
-            cancel_event=None,
+            cancel_event=self.cancel_event,
             max_retries=self.cfg.agent_max_retries,
             retry_delay=self.cfg.agent_retry_delay,
             run_timeout_seconds=self.cfg.agent_run_timeout_seconds,
@@ -486,6 +488,12 @@ class PerTaintWorkflow:
             pi_max_retries=self.cfg.pi_max_retries,
             pi_retry_delay=self.cfg.pi_retry_delay,
         )
+
+    def _session_relpath(self, session_file: str | Path) -> str:
+        try:
+            return str(Path(session_file).resolve().relative_to(self.out_dir.resolve())).replace("\\", "/")
+        except Exception:
+            return str(session_file).replace("\\", "/")
 
     async def run(self) -> TaskResult:
         """主执行循环。"""
@@ -656,12 +664,13 @@ class PerTaintWorkflow:
                 (j_dir / "tainted.list").write_text(
                     tl.read_text(encoding="utf-8"), encoding="utf-8")
 
+            judge_session_file = str(judge_dir / f"judge-0-round-{rnd:03d}-summary.jsonl")
             self._emit("judge_start", judge_id="judge-0",
                        model=self.judge_model, round=rnd,
                        function=self.func_name)
             judge_result = await run_agent(
                 prompt=eval_prompt,
-                **self._agent_kwargs(None, is_judge=True)
+                **self._agent_kwargs(judge_session_file, is_judge=True)
             )
             self._emit("judge_done", judge_id="judge-0",
                        output=judge_result.output[:200],
@@ -710,7 +719,7 @@ class PerTaintWorkflow:
                         model=self.worker_model,
                         output=worker_output,
                         dataflow_file=df_file or "",
-                        session_file=self.summary_sess,
+                        session_file=self._session_relpath(self.summary_sess),
                         token_usage=summary_result.token_usage,
                     )
                 ],
@@ -718,7 +727,7 @@ class PerTaintWorkflow:
                     JudgeRoundResult(
                         judge_id="judge-0",
                         model=self.judge_model,
-                        session_file="",
+                        session_file=self._session_relpath(judge_session_file),
                         evaluations=[
                             WorkerEvaluation(
                                 worker_id="worker-summary",

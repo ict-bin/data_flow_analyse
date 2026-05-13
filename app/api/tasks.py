@@ -11,6 +11,7 @@ from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from app.db import get_db
+from app.service.session_index import build_session_catalog
 from app.service.task_service import generate_prompt_from_path, get_task_service
 
 from . import router
@@ -42,6 +43,77 @@ class TaskCreateRequest(BaseModel):
 
 class GeneratePromptRequest(BaseModel):
     input_path: str
+
+
+class TaskSessionIndexNodeResponse(BaseModel):
+    node_id: str
+    relative_path: str
+    session_name: str
+    display_name: str
+    role: str
+    role_label: str
+    status: str
+    is_active: bool = False
+    stage_key: str
+    stage_label: str
+    stage_order: int = 0
+    stage_group: str
+    module_name: Optional[str] = None
+    attempt: Optional[int] = None
+    judge_index: Optional[int] = None
+    batch_index: Optional[int] = None
+    parent_relative_path: Optional[str] = None
+    parallel_group: Optional[str] = None
+    family_key: Optional[str] = None
+    flow_kind: Optional[str] = None
+    started_at: Optional[str] = None
+    ended_at: Optional[str] = None
+    started_ts: Optional[float] = None
+    last_event_at: Optional[str] = None
+    last_event_ts: Optional[float] = None
+    mtime: float = 0
+    size: int = 0
+    event_count: int = 0
+    line_count: int = 0
+    warnings: List[str] = []
+    session_header: Dict[str, Any] = {}
+    cwd: Optional[str] = None
+    model: Optional[str] = None
+    latest_round_ref: Optional[Dict[str, Any]] = None
+    round_refs: List[Dict[str, Any]] = []
+    attempts_seen: List[int] = []
+
+
+class TaskSessionIndexEdgeResponse(BaseModel):
+    edge_id: str
+    source_node_id: str
+    target_node_id: str
+    kind: str
+    label: str
+
+
+class TaskSessionIndexGroupResponse(BaseModel):
+    group_id: str
+    kind: str
+    label: str
+    stage_key: Optional[str] = None
+    module_name: Optional[str] = None
+    node_ids: List[str] = []
+
+
+class TaskSessionIndexResponse(BaseModel):
+    version: int = 1
+    generated_at: Optional[str] = None
+    task_id: str
+    task_status: str
+    status: Optional[str] = None
+    sessions_root: Optional[str] = None
+    index_path: Optional[str] = None
+    summary: Dict[str, Any] = {}
+    nodes: List[TaskSessionIndexNodeResponse] = []
+    edges: List[TaskSessionIndexEdgeResponse] = []
+    groups: List[TaskSessionIndexGroupResponse] = []
+    warnings: List[str] = []
 
 
 def _get_task_row(db: Session, task_id: str):
@@ -200,6 +272,47 @@ def _parse_session_file(path: Path) -> Dict[str, Any]:
     return {"events": events, "warnings": warnings, "session_meta": session_meta, "line_count": len(path.read_text(encoding="utf-8", errors="replace").splitlines())}
 
 
+def _write_json_atomic(path: Path, payload: Dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.replace(path)
+
+
+def _build_task_session_catalog(row) -> Dict[str, Any]:
+    root = _task_root(row)
+    run_root = root / "run" if str(root) else Path()
+    if not run_root.exists():
+        return {
+            "task_id": row.task_id,
+            "status": row.status,
+            "sessions_root": str(run_root / "sessions"),
+            "index_path": str(run_root / "sessions" / "index.json"),
+            "generated_at": None,
+            "items": [],
+            "index": {
+                "version": 1,
+                "generated_at": None,
+                "task_id": row.task_id,
+                "task_status": row.status,
+                "sessions_root": str(run_root / "sessions"),
+                "summary": {},
+                "nodes": [],
+                "edges": [],
+                "groups": [],
+                "warnings": [],
+            },
+        }
+    result_json = _load_result_json(row, root, [])
+    return build_session_catalog(
+        task_id=row.task_id,
+        row_status=row.status,
+        run_root=run_root,
+        result_json=result_json,
+        write_json_atomic=_write_json_atomic,
+    )
+
+
 @router.post("/tasks", status_code=201)
 async def create_task(body: TaskCreateRequest, db: Session = Depends(get_db)):
     prompt = body.prompt_content
@@ -321,60 +434,22 @@ async def get_task_result(task_id: str, db: Session = Depends(get_db)):
 @router.get("/tasks/{task_id}/sessions")
 async def list_task_sessions(task_id: str, db: Session = Depends(get_db)):
     row = _get_task_row(db, task_id)
-    root = _task_root(row)
-    run_root = root / "run" if str(root) else Path()
-    if not run_root.exists():
-        return {"task_id": task_id, "items": []}
+    catalog = _build_task_session_catalog(row)
+    return {"task_id": task_id, "items": catalog.get("items", []), "current_epoch": None}
 
-    candidates = list((run_root / "sessions").glob("**/*.jsonl")) if (run_root / "sessions").exists() else []
-    if (run_root / "epochs").exists():
-        candidates.extend((run_root / "epochs").glob("**/sessions/**/*.jsonl"))
-    candidates.extend(run_root.glob("subtasks/**/sessions/**/*.jsonl"))
-    seen = set()
-    items: List[Dict[str, Any]] = []
-    now_ts = __import__("time").time()
-    latest_run_root = _latest_epoch_run_root(root)
-    for path in sorted(candidates):
-        resolved = path.resolve()
-        if resolved in seen or not path.is_file():
-            continue
-        seen.add(resolved)
-        rel = path.relative_to(run_root)
-        parts = rel.parts
-        stage_group = "root"
-        if len(parts) > 1:
-            stage_group = parts[0] if parts[0] != "sessions" else "root"
-            if parts[0] == "subtasks" and len(parts) > 2:
-                stage_group = "/".join(parts[:3])
-        stat = path.stat()
-        try:
-            event_count = sum(1 for line in path.open("r", encoding="utf-8", errors="replace") if line.strip())
-        except Exception:
-            event_count = 0
-        session_name = path.stem
-        is_latest_epoch = False
-        try:
-            path.relative_to(latest_run_root)
-            is_latest_epoch = True
-        except ValueError:
-            is_latest_epoch = False
-        items.append({
-            "session_id": str(rel),
-            "session_name": session_name,
-            "relative_path": str(rel),
-            "stage_group": stage_group,
-            "role_name": session_name,
-            "size": stat.st_size,
-            "mtime": stat.st_mtime,
-            "event_count": event_count,
-            "message_count": event_count,
-            "is_active": row.status == "running" and (now_ts - stat.st_mtime) < 120,
-            "display_name": session_name,
-            "epoch": _epoch_label(path),
-            "is_latest_epoch": is_latest_epoch,
-        })
-    items.sort(key=lambda item: (item["stage_group"], -float(item["mtime"]), item["relative_path"]))
-    return {"task_id": task_id, "items": items, "current_epoch": _epoch_label(latest_run_root)}
+
+@router.get("/tasks/{task_id}/sessions/index", response_model=TaskSessionIndexResponse)
+async def get_task_session_index(task_id: str, db: Session = Depends(get_db)):
+    row = _get_task_row(db, task_id)
+    catalog = _build_task_session_catalog(row)
+    return {
+        "task_id": catalog.get("task_id") or row.task_id,
+        "status": catalog.get("status") or row.status,
+        "sessions_root": catalog.get("sessions_root"),
+        "index_path": catalog.get("index_path"),
+        "generated_at": catalog.get("generated_at"),
+        **(catalog.get("index") or {}),
+    }
 
 
 @router.get("/tasks/{task_id}/sessions/file")

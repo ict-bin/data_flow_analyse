@@ -20,6 +20,13 @@ from .prompt_builder import _build_eval_prompt, _build_summary_prompt
 class JudgeMixin:
     """Judge 评审相关方法，通过多继承注入 Orchestrator。"""
 
+    @staticmethod
+    def _session_relpath(run_root: str | Path, session_file: str | Path) -> str:
+        try:
+            return str(Path(session_file).resolve().relative_to(Path(run_root).resolve())).replace("\\", "/")
+        except Exception:
+            return str(session_file).replace("\\", "/")
+
     async def _run_merge_agent(
         self,
         root_function: str,
@@ -75,6 +82,7 @@ class JudgeMixin:
                     file_count=len(dataflow_files))
 
         w_cfg = cfg.workers.agents[0] if cfg.workers.agents else AgentInstanceConfig(model="")
+        merge_session_file = str(Path(cwd) / "sessions" / f"merge-{re.sub(r'[^A-Za-z0-9_.-]+', '_', root_function)}.jsonl")
         ar = await run_agent(
             prompt=merge_prompt,
             model=w_cfg.model,
@@ -82,7 +90,7 @@ class JudgeMixin:
             system_prompt=sys_prompt,
             cwd=cwd,
             thinking_level=w_cfg.thinking_level or "off",
-            session_file=None,
+            session_file=merge_session_file,
             max_retries=cfg.agent_max_retries,
             retry_delay=cfg.agent_retry_delay,
             run_timeout_seconds=cfg.agent_run_timeout_seconds,
@@ -224,8 +232,9 @@ class JudgeMixin:
                 output_path=f"{w.worker_id}-output.md",
                 dataflow_path=f"{w.worker_id}-dataflow.md",
             )
+            eval_session_file = str(j_dir / f"{jid}-{w.worker_id}-round-{rnd_num:03d}-eval.jsonl")
             ar = await run_agent(
-                prompt=eval_prompt, **base_kwargs, session_file=None)
+                prompt=eval_prompt, **base_kwargs, session_file=eval_session_file)
             parsed = _parse_eval_md(ar.output)
             ev = WorkerEvaluation(
                 worker_id=w.worker_id,
@@ -258,9 +267,11 @@ class JudgeMixin:
                 round_workers, j_result.evaluations, eval_files)
 
             # 独立上下文
+            summary_session_file = str(j_dir / f"{jid}-round-{rnd_num:03d}-summary.jsonl")
             ar = await run_agent(
-                prompt=summary_prompt, **base_kwargs, session_file=None)
+                prompt=summary_prompt, **base_kwargs, session_file=summary_session_file)
             j_result.token_usage += ar.token_usage
+            j_result.session_file = self._session_relpath(sess_dir.parent, summary_session_file)
 
             parsed = _parse_summary_md(ar.output)
             j_result.summary = JudgeSummary(
@@ -283,6 +294,8 @@ class JudgeMixin:
                 reasoning=ev.feedback,
                 overall_passed=ev.passed,
             )
+            eval_only_session = str(j_dir / f"{jid}-{ev.worker_id}-round-{rnd_num:03d}-eval.jsonl")
+            j_result.session_file = self._session_relpath(sess_dir.parent, eval_only_session)
 
         return j_result
 

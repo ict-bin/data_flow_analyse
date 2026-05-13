@@ -98,6 +98,7 @@ class _FuncState:
     name: str
     short: str
     depth: int
+    source_file: str = ""
     rounds: list = dataclasses.field(default_factory=list)  # list[_RndState]
     final: str = ""
     t0: float = dataclasses.field(default_factory=time.time)
@@ -110,7 +111,9 @@ class _FuncState:
         hist = "→".join(r.fmt() for r in self.rounds)
         elapsed = f" {time.time()-self.t0:.0f}s"
         prefix = f"[{time.strftime('%H:%M:%S')}] " if ts else "  "
-        return f"{prefix}{self.short:<16} {hist}{self.final}{elapsed}"
+        location = f" @ {Path(self.source_file).name}" if self.source_file else ""
+        label = f"{self.short}{location}"
+        return f"{prefix}{label:<32} {hist}{self.final}{elapsed}"
 
 
 
@@ -212,21 +215,24 @@ class CliRenderer:
         if t == "trace_start":
             depth = d.get("depth", 0)
             func  = d.get("function", "?")
+            source_file = d.get("source_file", "")
             self._task_depth[tid] = depth
             self._task_func[tid]  = func
             self._func_count += 1
             if not self._root_id:
                 self._root_id = tid
             fs = _FuncState(task_id=tid, name=func,
-                            short=self._short(func), depth=depth)
+                            short=self._short(func), source_file=source_file,
+                            depth=depth)
             self._fstate[tid] = fs
+            file_label = f" @ {Path(source_file).name}" if source_file else ""
             sep = "━" * 60
             if depth == 0:
                 self._print("\n" + sep)
-                self._print("  ▶ " + func)
+                self._print("  ▶ " + func + file_label)
                 self._print(sep)
             else:
-                self._print(self._prefix_tree(depth) + f"[d{depth}] " + func)
+                self._print(self._prefix_tree(depth) + f"[d{depth}] " + func + file_label)
             self._push(tid)
 
         elif t == "task_start":
