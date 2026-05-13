@@ -28,6 +28,20 @@ class _JsonFormatter(logging.Formatter):
             val = getattr(record, key, None)
             if val is not None:
                 payload[key] = val
+        for key in (
+            "task_id",
+            "project_id",
+            "owner_id",
+            "epoch",
+            "control_version",
+            "dispatch_status",
+            "status",
+            "claimed_count",
+            "current_running",
+        ):
+            val = getattr(record, key, None)
+            if val is not None:
+                payload[key] = val
         if record.exc_info:
             payload["exc_info"] = self.formatException(record.exc_info)
         return json.dumps(payload, ensure_ascii=False)

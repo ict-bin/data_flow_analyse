@@ -46,7 +46,10 @@ from .config import build_task_config, get_service_yaml, load_service_config
 from .logging_utils import configure_container_logging
 from .models import SwarmEvent, TaskResult, TaskStatus, make_id
 from .orchestrator import Orchestrator
+from .runtime_context import DISPATCH_POLL_INTERVAL_SECONDS, INSTANCE_ID
+from .service.task_service import get_task_service
 from .time_utils import now_local
+from .logging_utils import log_event
 
 load_dotenv()
 configure_container_logging("01-dataflow_analyse")
@@ -73,6 +76,8 @@ class TaskEntry:
 
 
 _tasks: dict[str, TaskEntry] = {}
+_dispatcher_task: asyncio.Task | None = None
+_dispatcher_stop = asyncio.Event()
 
 
 # ─── Lifespan ────────────────────────────────────────────────────────────────
@@ -95,32 +100,48 @@ async def lifespan(app: FastAPI):
         from .api import router as mgmt_router
         app.include_router(mgmt_router)
 
-        # Recover orphaned tasks from a previous crash
-        from .db import get_db
-        from .db.models import AppDfaTask
-        _db = next(get_db())
-        orphaned = _db.query(AppDfaTask).filter(
-            AppDfaTask.status.in_(["running", "pending"]),
-            AppDfaTask.is_deleted.is_(False),
-        ).all()
-        if orphaned:
-            for _t in orphaned:
-                _t.status = "error"
-                _t.error = "服务重启，任务被中断"
-                _t.finished_at = now_local()
-            _db.commit()
-            logger.warning("Recovered %d orphaned task(s)", len(orphaned))
-
         # Start menu registry heartbeat
         from .service.registry_service import get_registry_service
         _registry = get_registry_service()
         await _registry.register()
         _registry.start()
+
+        async def _dispatcher_loop() -> None:
+            svc = get_task_service()
+            while not _dispatcher_stop.is_set():
+                try:
+                    claimed = await svc.dispatch_until_full()
+                    if claimed:
+                        log_event(
+                            logger,
+                            logging.INFO,
+                            "dispatcher claimed tasks",
+                            event="dispatcher_claim_batch",
+                            owner_id=INSTANCE_ID,
+                            claimed_count=claimed,
+                            current_running=svc.local_running_task_count(),
+                        )
+                except Exception as exc:
+                    logger.warning("dispatcher loop failed on %s: %s", INSTANCE_ID, exc, exc_info=True)
+                await asyncio.sleep(DISPATCH_POLL_INTERVAL_SECONDS)
+
+        global _dispatcher_task
+        _dispatcher_stop.clear()
+        _dispatcher_task = asyncio.create_task(_dispatcher_loop(), name="dfa_dispatcher")
+        log_event(logger, logging.INFO, "dispatcher started", event="dispatcher_started", owner_id=INSTANCE_ID)
     except Exception as exc:
         logger.warning("DB init failed (management APIs unavailable): %s", exc)
 
     yield
     # --- shutdown ---
+    _dispatcher_stop.set()
+    if _dispatcher_task is not None:
+        _dispatcher_task.cancel()
+        try:
+            await _dispatcher_task
+        except asyncio.CancelledError:
+            pass
+    log_event(logger, logging.INFO, "dispatcher stopped", event="dispatcher_stopped", owner_id=INSTANCE_ID)
     try:
         from .service.registry_service import get_registry_service
         get_registry_service().stop()
@@ -162,8 +183,11 @@ class AnalyseRequest(BaseModel):
 async def health():
     return {
         "status": "ok",
+        "instance_id": INSTANCE_ID,
         "active": sum(1 for t in _tasks.values() if t.result is None),
         "completed": sum(1 for t in _tasks.values() if t.result is not None),
+        "dispatcher_running": bool(_dispatcher_task and not _dispatcher_task.done()),
+        "leased_tasks": get_task_service().local_running_task_count(),
     }
 
 

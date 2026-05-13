@@ -11,6 +11,7 @@ import hashlib
 import json
 import logging
 import os
+import shutil
 import time as _time
 import uuid
 from datetime import datetime
@@ -24,6 +25,8 @@ from app.db.models import AppDfaTask
 from app.logging_utils import log_event
 from app.models import SwarmEvent, TaskStatus
 from app.orchestrator import Orchestrator
+from app.runtime_context import HEARTBEAT_INTERVAL_SECONDS, INSTANCE_ID, MAX_LOCAL_RUNNING_TASKS
+from app.service.execution_coordinator import begin_execution_if_owner, claim_one_runnable_task, commit_terminal_state_if_owner, load_execution_snapshot, release_lease, renew_lease, still_owner
 from app.time_utils import isoformat_local, now_local
 
 logger = logging.getLogger("dfa.task_service")
@@ -45,9 +48,38 @@ def _task_run_root(row: AppDfaTask) -> Path | None:
     return root / "run" if root else None
 
 
+def _task_epoch_run_root(row: AppDfaTask, epoch: int) -> Path | None:
+    root = _task_run_root(row)
+    if root is None:
+        return None
+    return root / "epochs" / f"{int(epoch):04d}"
+
+
 def _task_result_path(row: AppDfaTask) -> Path | None:
     run_root = _task_run_root(row)
     return run_root / "result.json" if run_root else None
+
+
+def _latest_epoch_run_root(row: AppDfaTask) -> Path | None:
+    run_root = _task_run_root(row)
+    if run_root is None:
+        return None
+    epochs_root = run_root / "epochs"
+    if not epochs_root.is_dir():
+        return run_root
+    candidates = sorted([path for path in epochs_root.iterdir() if path.is_dir()], key=lambda path: path.name)
+    return candidates[-1] if candidates else run_root
+
+
+def _epoch_label_from_path(path: Path | None) -> str | None:
+    if path is None:
+        return None
+    parts = path.parts
+    if "epochs" in parts:
+        idx = parts.index("epochs")
+        if idx + 1 < len(parts):
+            return parts[idx + 1]
+    return None
 
 
 def _write_json_atomic(path: Path, payload: dict) -> None:
@@ -75,6 +107,24 @@ def _write_task_result_json(row: AppDfaTask, payload: dict) -> str | None:
         return None
     _write_json_atomic(path, payload)
     return str(path)
+
+
+def _persist_terminal_failure(row: AppDfaTask, error: str, *, status: str = "error") -> dict:
+    payload = {
+        "task_id": row.task_id,
+        "status": status,
+        "analysis_status": status,
+        "completion_reason": error,
+        "task": row.prompt_content or row.task_name or "",
+        "error": error,
+        "rounds": [],
+        "total_duration_ms": 0,
+        "total_tokens": _token_usage_dict(None),
+    }
+    result_file = _write_task_result_json(row, payload)
+    row.result_json = _lightweight_result_json(row, payload, result_file)
+    row.error = error
+    return payload
 
 
 def _input_manifest_path(row: AppDfaTask) -> Path | None:
@@ -463,7 +513,7 @@ def generate_prompt_from_path(input_path: str) -> str:
     )
 
 
-def _flush_stages(task_id: str, events: list[dict]) -> None:
+def _flush_stages(task_id: str, events: list[dict], owner_id: str | None = None, epoch: int | None = None, control_version: int | None = None) -> None:
     """将实时事件缓冲写入 DB，供前端轮询展示进度。"""
     try:
         from sqlalchemy.orm.attributes import flag_modified
@@ -473,6 +523,13 @@ def _flush_stages(task_id: str, events: list[dict]) -> None:
         try:
             _r = _db.query(AppDfaTask).filter_by(task_id=task_id).first()
             if _r:
+                if owner_id is not None and epoch is not None and control_version is not None:
+                    if not (
+                        _r.execution_owner_id == owner_id
+                        and int(_r.execution_epoch or 0) == int(epoch)
+                        and int(_r.control_version or 0) == int(control_version)
+                    ):
+                        return
                 _r.stages_json = {"events": [dict(e) for e in events]}
                 flag_modified(_r, "stages_json")
                 _db.commit()
@@ -486,15 +543,73 @@ def _flush_stages(task_id: str, events: list[dict]) -> None:
 
 
 class TaskService:
+    def local_running_task_count(self) -> int:
+        return sum(1 for task in _running_tasks.values() if not task.done())
+
+    async def dispatch_once(self) -> str | None:
+        if self.local_running_task_count() >= MAX_LOCAL_RUNNING_TASKS:
+            return None
+        from app.db import get_db
+        db_gen = get_db()
+        db: Session = next(db_gen)
+        try:
+            claimed = claim_one_runnable_task(db, INSTANCE_ID)
+            if claimed is None:
+                return None
+            if claimed.task_id in _running_tasks and not _running_tasks[claimed.task_id].done():
+                release_lease(db, claimed.task_id, INSTANCE_ID, claimed.epoch)
+                log_event(
+                    logger,
+                    logging.WARNING,
+                    "claimed task already running locally, released duplicate lease",
+                    event="task_lease_released_duplicate_local",
+                    task_id=claimed.task_id,
+                    owner_id=INSTANCE_ID,
+                    epoch=claimed.epoch,
+                    control_version=claimed.control_version,
+                )
+                return None
+            asyncio_task = asyncio.create_task(
+                self._execute_task(claimed.task_id, claimed.epoch, claimed.control_version),
+                name=f"dfa_task_{claimed.task_id}",
+            )
+            _running_tasks[claimed.task_id] = asyncio_task
+            log_event(
+                logger,
+                logging.INFO,
+                "task leased by dispatcher",
+                event="task_leased",
+                task_id=claimed.task_id,
+                owner_id=INSTANCE_ID,
+                epoch=claimed.epoch,
+                control_version=claimed.control_version,
+            )
+            return claimed.task_id
+        finally:
+            try:
+                next(db_gen)
+            except StopIteration:
+                pass
+
+    async def dispatch_until_full(self) -> int:
+        claimed = 0
+        while self.local_running_task_count() < MAX_LOCAL_RUNNING_TASKS:
+            task_id = await self.dispatch_once()
+            if not task_id:
+                break
+            claimed += 1
+        return claimed
 
     def get_task_evaluation(self, db: Session, task_id: str) -> dict:
         row = self._get_or_404(db, task_id)
-        run_root = _task_run_root(row)
+        run_root = _latest_epoch_run_root(row)
         warnings: list[str] = []
         if not run_root or not run_root.is_dir():
             return {
                 "task_id": row.task_id,
                 "status": row.status,
+                "current_epoch": None,
+                "run_root": None,
                 "available": False,
                 "summary": None,
                 "rounds": [],
@@ -544,6 +659,8 @@ class TaskService:
         return {
             "task_id": row.task_id,
             "status": row.status,
+            "current_epoch": _epoch_label_from_path(run_root),
+            "run_root": str(run_root),
             "available": bool(summary or rounds),
             "summary": summary,
             "rounds": rounds,
@@ -567,6 +684,23 @@ class TaskService:
 
     def get_task(self, db: Session, task_id: str) -> dict:
         return self._row_to_dict(self._get_or_404(db, task_id))
+
+    def get_task_execution(self, db: Session, task_id: str) -> dict:
+        row = self._get_or_404(db, task_id)
+        snapshot = load_execution_snapshot(db, task_id)
+        return {
+            "task_id": row.task_id,
+            "project_id": row.project_id,
+            "status": row.status,
+            "execution": None if snapshot is None else {
+                "owner_id": snapshot.execution_owner_id,
+                "epoch": snapshot.execution_epoch,
+                "control_version": snapshot.control_version,
+                "dispatch_status": snapshot.dispatch_status,
+                "lease_until": isoformat_local(snapshot.execution_lease_until),
+                "heartbeat_at": isoformat_local(snapshot.execution_heartbeat_at),
+            },
+        }
 
     def create_task(self, db: Session, *, project_id: str, task_name: str,
                     input_path: str, output_path: Optional[str] = None,
@@ -606,11 +740,14 @@ class TaskService:
             parent_stage_name=parent_stage_name,
             parent_stage_item_id=parent_stage_item_id,
             parent_stage_item_key=parent_stage_item_key,
+            execution_owner_id=None,
+            execution_lease_until=None,
+            execution_heartbeat_at=None,
+            execution_epoch=0,
+            control_version=0,
+            dispatch_status="pending",
         )
         db.add(row); db.commit(); db.refresh(row)
-        asyncio_task = asyncio.create_task(self._execute_task(task_id),
-                                            name=f"dfa_task_{task_id}")
-        _running_tasks[task_id] = asyncio_task
         log_event(logger, logging.INFO, "task created",
                   event="task_created", task_id=task_id, project_id=project_id)
         return self._row_to_dict(row)
@@ -618,14 +755,7 @@ class TaskService:
     def restart_task(self, db: Session, task_id: str) -> dict:
         """在原任务ID上重置并重新执行（SA 模式：in-place restart）。"""
         row = self._get_or_404(db, task_id)
-        # 自动取消正在运行/等待的任务，而不是报错
-        if row.status in ("pending", "running"):
-            at = _running_tasks.get(task_id)
-            if at and not at.done():
-                at.cancel()
-            _running_tasks.pop(task_id, None)
         from sqlalchemy.orm.attributes import flag_modified
-        # 清除上次续跑的 start_stage / resume_workspace，保留其他覆盖项
         clean_config = {k: v for k, v in (row.task_config_json or {}).items()
                         if k not in ("start_stage", "resume_workspace", "resume")} or None
         row.task_config_json = clean_config
@@ -635,24 +765,18 @@ class TaskService:
         row.stages_json = None
         row.result_json = None
         row.error = None
+        row.execution_owner_id = None
+        row.execution_lease_until = None
+        row.execution_heartbeat_at = None
+        row.control_version = int(row.control_version or 0) + 1
+        row.dispatch_status = "pending"
         flag_modified(row, "task_config_json")
         db.commit(); db.refresh(row)
-        # 删除上次执行目录，保证从零开始
-        # 路径逻辑与 _execute_task 一致：优先用 row.output_path，否则从 svc config 取默认值
-        import shutil as _shutil
-        _svc_cleanup = _load_svc_config_from_db(db, row.project_id)
-        _effective_output = row.output_path or _svc_cleanup.output_dir
-        task_root = os.path.join(_effective_output, task_id)
-        if os.path.isdir(task_root):
-            try:
-                _shutil.rmtree(task_root)
-            except Exception as _e:
-                logger.warning("Failed to clean task dir %s: %s", task_root, _e)
-        asyncio_task = asyncio.create_task(self._execute_task(task_id),
-                                            name=f"dfa_task_{task_id}")
-        _running_tasks[task_id] = asyncio_task
+        at = _running_tasks.get(task_id)
+        if at and not at.done():
+            at.cancel()
         log_event(logger, logging.INFO, "task restarted in-place", event="task_restarted",
-                  task_id=task_id, project_id=row.project_id)
+                  task_id=task_id, project_id=row.project_id, control_version=row.control_version)
         return self._row_to_dict(row)
 
     def resume_task(self, db: Session, task_id: str) -> dict:
@@ -664,25 +788,29 @@ class TaskService:
         from sqlalchemy.orm.attributes import flag_modified
         svc = _load_svc_config_from_db(db, row.project_id)
         effective_output = row.output_path or svc.output_dir
-        resume_workspace = os.path.join(effective_output, task_id, "run", "workspace-worker-0")
+        prior_epoch = max(1, int(row.execution_epoch or 0))
+        resume_workspace = os.path.join(effective_output, task_id, "run", "epochs", f"{prior_epoch:04d}", "workspace-worker-0")
         tcfg = dict(row.task_config_json or {})
         tcfg["start_stage"] = 3
         tcfg["resume_workspace"] = resume_workspace
-        # 保持旧的 resume 标志兼容性
         tcfg["resume"] = True
         row.task_config_json = tcfg
         row.status = "pending"
-        # 保留 started_at 和 stages_json，续跑后仍能看到前序阶段记录
         row.finished_at = None
         row.result_json = None
         row.error = None
+        row.execution_owner_id = None
+        row.execution_lease_until = None
+        row.execution_heartbeat_at = None
+        row.control_version = int(row.control_version or 0) + 1
+        row.dispatch_status = "pending"
         flag_modified(row, "task_config_json")
         db.commit(); db.refresh(row)
-        asyncio_task = asyncio.create_task(self._execute_task(task_id),
-                                            name=f"dfa_task_{task_id}")
-        _running_tasks[task_id] = asyncio_task
+        at = _running_tasks.get(task_id)
+        if at and not at.done():
+            at.cancel()
         log_event(logger, logging.INFO, "task resumed in-place", event="task_resumed",
-                  task_id=task_id, project_id=row.project_id, resume_workspace=resume_workspace)
+                  task_id=task_id, project_id=row.project_id, control_version=row.control_version, status="pending")
         return self._row_to_dict(row)
 
     def cancel_task(self, db: Session, task_id: str) -> dict:
@@ -694,33 +822,71 @@ class TaskService:
             at.cancel()
         row.status = "cancelled"
         row.finished_at = now_local()
+        row.control_version = int(row.control_version or 0) + 1
+        row.execution_lease_until = now_local()
+        row.dispatch_status = None
         db.commit(); db.refresh(row)
+        log_event(logger, logging.INFO, "task cancelled by control plane", event="task_cancel_requested",
+                  task_id=task_id, project_id=row.project_id, control_version=row.control_version, status=row.status)
         return self._row_to_dict(row)
 
     def delete_task(self, db: Session, task_id: str, *, delete_files: bool = True) -> None:
         """软删除任务记录，并可选删除输出目录下的任务文件。运行中任务不允许删除。"""
-        import shutil as _shutil
         from fastapi import HTTPException
         row = self._get_or_404(db, task_id)
-        if row.status == "running":
+        lease_live = bool(row.execution_owner_id and row.execution_lease_until and row.execution_lease_until >= now_local())
+        if row.status == "running" or lease_live:
             raise HTTPException(status_code=409, detail="任务正在运行，请先取消后再删除")
         if delete_files and row.output_path:
             task_dir = os.path.join(row.output_path, task_id)
             if os.path.isdir(task_dir):
                 try:
-                    _shutil.rmtree(task_dir)
+                    shutil.rmtree(task_dir)
                     logger.info("delete_task: removed task dir %s", task_dir)
                 except Exception as _e:
                     logger.warning("delete_task: failed to remove %s: %s", task_dir, _e)
         row.is_deleted = True
         db.commit()
 
-    async def _execute_task(self, task_id: str) -> None:
+    async def _execute_task(self, task_id: str, epoch: int, control_version: int) -> None:
         """Run the Orchestrator engine and persist results."""
         from app.db import get_db
         db_gen = get_db()
         db: Session = next(db_gen)
         event_buffer: list[dict] = []
+        stop_heartbeat = asyncio.Event()
+        heartbeat_task: asyncio.Task | None = None
+        guard_counter = 0
+        orch_holder: dict[str, Orchestrator] = {}
+
+        async def _heartbeat_loop(orch: Orchestrator) -> None:
+            from app.db import get_db as _get_db
+            while not stop_heartbeat.is_set():
+                await asyncio.sleep(HEARTBEAT_INTERVAL_SECONDS)
+                _hb_gen = _get_db()
+                _hb_db: Session = next(_hb_gen)
+                try:
+                    ok = renew_lease(_hb_db, task_id, INSTANCE_ID, epoch)
+                    if not ok or not still_owner(_hb_db, task_id, INSTANCE_ID, epoch, control_version):
+                        log_event(
+                            logger,
+                            logging.WARNING,
+                            "lease lost during heartbeat, aborting task",
+                            event="task_lease_lost",
+                            task_id=task_id,
+                            owner_id=INSTANCE_ID,
+                            epoch=epoch,
+                            control_version=control_version,
+                        )
+                        if orch._cancel_event is not None:
+                            orch._cancel_event.set()
+                        stop_heartbeat.set()
+                        return
+                finally:
+                    try:
+                        next(_hb_gen)
+                    except StopIteration:
+                        pass
 
         # Snapshot any previously-saved events BEFORE execution begins.
         # On resume, row.stages_json already has correct historical events
@@ -734,22 +900,62 @@ class TaskService:
             _baseline_events = list(_prev_row_for_baseline.stages_json.get("events") or [])
 
         def on_event(event: SwarmEvent) -> None:
+            nonlocal guard_counter
             event_buffer.append({"ts": _time.time(), "type": event.type,
                                   "data": dict(event.data)})
             n = len(event_buffer)
             if n == 1 or n % 3 == 0:
-                _flush_stages(task_id, _baseline_events + event_buffer)
+                _flush_stages(task_id, _baseline_events + event_buffer, INSTANCE_ID, epoch, control_version)
+            guard_counter += 1
+            if guard_counter % 10 == 0:
+                try:
+                    from app.db import get_db as _get_db
+                    _guard_gen = _get_db()
+                    _guard_db: Session = next(_guard_gen)
+                    try:
+                        if not still_owner(_guard_db, task_id, INSTANCE_ID, epoch, control_version):
+                            log_event(
+                                logger,
+                                logging.WARNING,
+                                "control-plane ownership changed during event streaming",
+                                event="task_control_guard_abort",
+                                task_id=task_id,
+                                owner_id=INSTANCE_ID,
+                                epoch=epoch,
+                                control_version=control_version,
+                            )
+                            stop_heartbeat.set()
+                            orch = orch_holder.get("orch")
+                            if orch and orch._cancel_event is not None:
+                                orch._cancel_event.set()
+                    finally:
+                        try:
+                            next(_guard_gen)
+                        except StopIteration:
+                            pass
+                except Exception as exc:
+                    logger.warning("control guard check failed for %s: %s", task_id, exc, exc_info=True)
 
         try:
             row = db.query(AppDfaTask).filter_by(task_id=task_id).first()
             if not row or row.status == "cancelled":
+                log_event(logger, logging.INFO, "task skipped before execution", event="task_skip_pre_execute",
+                          task_id=task_id, owner_id=INSTANCE_ID, epoch=epoch, control_version=control_version, status=row.status if row else "missing")
+                return
+            if not still_owner(db, task_id, INSTANCE_ID, epoch, control_version):
+                log_event(logger, logging.INFO, "task lost ownership before execution", event="task_not_owner_pre_execute",
+                          task_id=task_id, owner_id=INSTANCE_ID, epoch=epoch, control_version=control_version)
                 return
 
-            row.status = "running"
-            # 续跑时保留原始 started_at，首次运行才设置
-            if row.started_at is None:
-                row.started_at = now_local()
-            db.commit()
+            started_at = row.started_at or now_local()
+            if not begin_execution_if_owner(db, task_id, INSTANCE_ID, epoch, control_version, started_at=started_at):
+                log_event(logger, logging.INFO, "failed to enter running state as owner", event="task_begin_execution_rejected",
+                          task_id=task_id, owner_id=INSTANCE_ID, epoch=epoch, control_version=control_version)
+                return
+            log_event(logger, logging.INFO, "task execution started", event="task_execution_started",
+                      task_id=task_id, project_id=row.project_id, owner_id=INSTANCE_ID, epoch=epoch, control_version=control_version, status="running")
+            db.expire(row)
+            db.refresh(row)
             _write_input_manifest(row)
 
             _write_models_json_from_db(db)
@@ -771,6 +977,18 @@ class TaskService:
                 svc.archive_dir = row.output_path
                 svc.result_dir = row.output_path
 
+            epoch_run_root = _task_epoch_run_root(row, epoch)
+            root_output_dir = (_task_root(row) / "output") if _task_root(row) else None
+            if epoch_run_root is not None and not bool(tcfg.get("resume", False)):
+                if epoch_run_root.exists():
+                    try:
+                        shutil.rmtree(epoch_run_root)
+                    except OSError as exc:
+                        logger.warning("failed to clean epoch run root %s: %s", epoch_run_root, exc)
+                epoch_run_root.mkdir(parents=True, exist_ok=True)
+            elif epoch_run_root is not None:
+                epoch_run_root.mkdir(parents=True, exist_ok=True)
+
             cfg = build_task_config(svc, row.prompt_content, cwd=row.input_path)
             if tcfg.get("source_file"):
                 cfg.source_file = str(tcfg["source_file"])
@@ -781,46 +999,101 @@ class TaskService:
             if isinstance(tcfg.get("taint_params"), list):
                 cfg.taint_params = [str(value).strip() for value in tcfg["taint_params"] if str(value).strip()]
             orch = Orchestrator(config=cfg, on_event=on_event)
-            result = await orch.execute_recursive(task_id, resume=bool(tcfg.get("resume", False)))
+            orch_holder["orch"] = orch
+            heartbeat_task = asyncio.create_task(_heartbeat_loop(orch), name=f"dfa_heartbeat_{task_id}")
+            result = await orch.execute_recursive(
+                task_id,
+                _root_out_dir=epoch_run_root,
+                _root_output_dir=root_output_dir,
+                resume=bool(tcfg.get("resume", False)),
+            )
+            stop_heartbeat.set()
+            await heartbeat_task
 
-            _flush_stages(task_id, _baseline_events + event_buffer)
+            _flush_stages(task_id, _baseline_events + event_buffer, INSTANCE_ID, epoch, control_version)
             db.expire(row); db.refresh(row)
             if row.status == "cancelled":
+                log_event(logger, logging.INFO, "task stopped after control-plane cancel", event="task_cancelled_during_execution",
+                          task_id=task_id, owner_id=INSTANCE_ID, epoch=epoch, control_version=control_version, status=row.status)
+                return
+            if not still_owner(db, task_id, INSTANCE_ID, epoch, control_version):
+                log_event(logger, logging.INFO, "task lost ownership before terminal commit", event="task_not_owner_pre_commit",
+                          task_id=task_id, owner_id=INSTANCE_ID, epoch=epoch, control_version=control_version)
                 return
 
-            row.status = result.status.value if result else "error"
-            row.finished_at = now_local()
-            # _baseline_events already contains all prior history; just append
-            # the new event_buffer.  Do NOT re-read row.stages_json here because
-            # _flush_stages already wrote (_baseline + buffer) to DB, so re-reading
-            # would produce duplicates.
-            row.stages_json = {"events": _baseline_events + event_buffer, "final": True}
+            finished_at = now_local()
+            stages_json = {"events": _baseline_events + event_buffer, "final": True}
+            lightweight_result = None
+            terminal_error = None
             if result:
                 result_payload = result.model_dump(mode="json")
                 result_file = _write_task_result_json(row, result_payload)
                 _write_task_evaluation_files(row, result_payload)
-                row.result_json = _lightweight_result_json(row, result_payload, result_file)
+                lightweight_result = _lightweight_result_json(row, result_payload, result_file)
                 if result.error:
-                    row.error = result.error
-            db.commit()
+                    terminal_error = result.error
+            if not commit_terminal_state_if_owner(
+                db,
+                task_id,
+                INSTANCE_ID,
+                epoch,
+                control_version,
+                status=result.status.value if result else "error",
+                finished_at=finished_at,
+                stages_json=stages_json,
+                result_json=lightweight_result,
+                error=terminal_error,
+            ):
+                log_event(logger, logging.WARNING, "terminal commit rejected for stale owner", event="task_terminal_commit_rejected",
+                          task_id=task_id, owner_id=INSTANCE_ID, epoch=epoch, control_version=control_version)
+                return
+            log_event(logger, logging.INFO, "terminal state committed", event="task_terminal_committed",
+                      task_id=task_id, owner_id=INSTANCE_ID, epoch=epoch, control_version=control_version,
+                      status=result.status.value if result else "error")
 
         except asyncio.CancelledError:
+            log_event(logger, logging.INFO, "task coroutine cancelled", event="task_coroutine_cancelled",
+                      task_id=task_id, owner_id=INSTANCE_ID, epoch=epoch, control_version=control_version)
             pass
         except Exception as exc:
             log_event(logger, logging.ERROR, "task execution failed",
-                      event="task_error", task_id=task_id, error=str(exc))
+                      event="task_error", task_id=task_id, owner_id=INSTANCE_ID, epoch=epoch, control_version=control_version, error=str(exc))
             try:
                 db.rollback()
                 r = db.query(AppDfaTask).filter_by(task_id=task_id).first()
-                if r and r.status == "running":
-                    r.status = "error"
-                    r.error = str(exc)
-                    r.finished_at = now_local()
-                    r.stages_json = {"events": _baseline_events + event_buffer, "final": True}
-                    db.commit()
+                if r and r.status == "running" and still_owner(db, task_id, INSTANCE_ID, epoch, control_version):
+                    _persist_terminal_failure(r, str(exc), status="error")
+                    commit_terminal_state_if_owner(
+                        db,
+                        task_id,
+                        INSTANCE_ID,
+                        epoch,
+                        control_version,
+                        status="error",
+                        finished_at=now_local(),
+                        stages_json={"events": _baseline_events + event_buffer, "final": True},
+                        result_json=r.result_json,
+                        error=str(exc),
+                    )
+                    log_event(logger, logging.ERROR, "error terminal state committed", event="task_error_committed",
+                              task_id=task_id, owner_id=INSTANCE_ID, epoch=epoch, control_version=control_version, status="error")
             except Exception:
                 pass
         finally:
+            stop_heartbeat.set()
+            if heartbeat_task is not None and not heartbeat_task.done():
+                heartbeat_task.cancel()
+                try:
+                    await heartbeat_task
+                except asyncio.CancelledError:
+                    pass
+            try:
+                released = release_lease(db, task_id, INSTANCE_ID, epoch)
+                if released:
+                    log_event(logger, logging.INFO, "lease released", event="task_lease_released",
+                              task_id=task_id, owner_id=INSTANCE_ID, epoch=epoch, control_version=control_version)
+            except Exception:
+                db.rollback()
             _running_tasks.pop(task_id, None)
             try:
                 next(db_gen)
@@ -863,6 +1136,12 @@ class TaskService:
                 AppDfaTask.updated_at,
                 AppDfaTask.started_at,
                 AppDfaTask.finished_at,
+                AppDfaTask.execution_owner_id,
+                AppDfaTask.execution_lease_until,
+                AppDfaTask.execution_heartbeat_at,
+                AppDfaTask.execution_epoch,
+                AppDfaTask.control_version,
+                AppDfaTask.dispatch_status,
             ),
         )
 
@@ -884,6 +1163,12 @@ class TaskService:
             "created_by": row.created_by,
             "created_at": fmt(row.created_at), "updated_at": fmt(row.updated_at),
             "started_at": fmt(row.started_at), "finished_at": fmt(row.finished_at),
+            "execution_owner_id": row.execution_owner_id,
+            "execution_lease_until": fmt(row.execution_lease_until),
+            "execution_heartbeat_at": fmt(row.execution_heartbeat_at),
+            "execution_epoch": int(row.execution_epoch or 0),
+            "control_version": int(row.control_version or 0),
+            "dispatch_status": row.dispatch_status,
         }
 
 

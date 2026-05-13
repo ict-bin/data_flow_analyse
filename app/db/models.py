@@ -53,6 +53,12 @@ class AppDfaTask(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=now_local, onupdate=now_local)
     started_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
     finished_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    execution_owner_id: Mapped[Optional[str]] = mapped_column(String(128), nullable=True, index=True)
+    execution_lease_until: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True, index=True)
+    execution_heartbeat_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    execution_epoch: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    control_version: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    dispatch_status: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
 
     is_deleted: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
 
@@ -88,4 +94,3 @@ class AppDfaProjectConfig(Base):
     project_id: Mapped[str] = mapped_column(String(100), nullable=False, unique=True, index=True)
     config_json: Mapped[Optional[Dict[str, Any]]] = mapped_column(JSON, nullable=True)
     updated_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=now_local, onupdate=now_local)
-

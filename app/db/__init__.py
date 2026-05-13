@@ -29,9 +29,17 @@ _MIGRATIONS = [
     "ALTER TABLE secflow_app_dfa_tasks ADD COLUMN parent_stage_name VARCHAR(64) NULL",
     "ALTER TABLE secflow_app_dfa_tasks ADD COLUMN parent_stage_item_id VARCHAR(64) NULL",
     "ALTER TABLE secflow_app_dfa_tasks ADD COLUMN parent_stage_item_key VARCHAR(255) NULL",
+    "ALTER TABLE secflow_app_dfa_tasks ADD COLUMN execution_owner_id VARCHAR(128) NULL",
+    "ALTER TABLE secflow_app_dfa_tasks ADD COLUMN execution_lease_until DATETIME NULL",
+    "ALTER TABLE secflow_app_dfa_tasks ADD COLUMN execution_heartbeat_at DATETIME NULL",
+    "ALTER TABLE secflow_app_dfa_tasks ADD COLUMN execution_epoch INT NOT NULL DEFAULT 0",
+    "ALTER TABLE secflow_app_dfa_tasks ADD COLUMN control_version INT NOT NULL DEFAULT 0",
+    "ALTER TABLE secflow_app_dfa_tasks ADD COLUMN dispatch_status VARCHAR(32) NULL",
     "CREATE INDEX ix_dfa_tasks_project_deleted_created_id ON secflow_app_dfa_tasks (project_id, is_deleted, created_at, id)",
     "CREATE INDEX ix_dfa_tasks_project_created_id ON secflow_app_dfa_tasks (project_id, created_at, id)",
     "CREATE INDEX ix_dfa_tasks_project_deleted_status_created_id ON secflow_app_dfa_tasks (project_id, is_deleted, status, created_at, id)",
+    "CREATE INDEX ix_dfa_tasks_sched ON secflow_app_dfa_tasks (is_deleted, status, execution_lease_until, created_at, id)",
+    "CREATE INDEX ix_dfa_tasks_owner ON secflow_app_dfa_tasks (execution_owner_id, status)",
 ]
 
 

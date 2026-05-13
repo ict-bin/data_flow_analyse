@@ -482,6 +482,7 @@ class Orchestrator(JudgeMixin):
         tainted_context: str = "",
         _analyzed: set[str] | None = None,
         _root_out_dir: Path | None = None,
+        _root_output_dir: Path | None = None,
         resume: bool = False,
     ) -> TaskResult:
         """BFS 队列 + 工作池架构:
@@ -829,10 +830,10 @@ class Orchestrator(JudgeMixin):
                            error=f"LLM merge failed, keeping programmatic report: {e}")
 
         # ── 最终归档 ──────────────────────────────────────────────────────────
-        self._do_final_archive(root_result, root_out_dir)
+        self._do_final_archive(root_result, root_out_dir, _root_output_dir)
         return root_result
 
-    def _do_final_archive(self, result: TaskResult, root_out_dir: Path | None):
+    def _do_final_archive(self, result: TaskResult, root_out_dir: Path | None, root_output_dir: Path | None = None):
         """统一归档:写报告 + 输出结果文件到 output/ 目录 + 写 flag。不创建压缩包,不清理工作目录。"""
         cfg = self.cfg
         if not root_out_dir or not root_out_dir.exists():
@@ -843,7 +844,7 @@ class Orchestrator(JudgeMixin):
         (root_out_dir / "result.json").write_text(result.model_dump_json(indent=2), encoding="utf-8")
 
         # output/ 目录存放最终输出
-        output_path = root_out_dir.parent / "output"
+        output_path = root_output_dir or (root_out_dir.parent / "output")
         output_path.mkdir(parents=True, exist_ok=True)
 
         # 格式化最终输出 → output/
