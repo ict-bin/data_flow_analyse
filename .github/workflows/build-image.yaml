@@ -1,5 +1,9 @@
 name: build-secflow-app-dataflow-analyse-image
 
+env:
+  IMAGE_OWNER: runshine
+  IMAGE_NAME: secflow-app-dataflow-analyse
+
 on:
   push:
     branches:
@@ -13,15 +17,10 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       date_tag: ${{ steps.date.outputs.date_tag }}
-      owner_lc: ${{ steps.owner.outputs.owner_lc }}
     steps:
       - name: Generate date tag
         id: date
         run: echo "date_tag=$(date +'%Y%m%d')" >> "$GITHUB_OUTPUT"
-
-      - name: Normalize owner
-        id: owner
-        run: echo "owner_lc=${GITHUB_REPOSITORY_OWNER,,}" >> "$GITHUB_OUTPUT"
 
   build-amd64:
     needs: prepare
@@ -37,21 +36,21 @@ jobs:
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
-          username: ${{ github.repository_owner }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          username: ${{ secrets.GHCR_USERNAME || env.IMAGE_OWNER }}
+          password: ${{ secrets.GHCR_TOKEN || secrets.GITHUB_TOKEN }}
 
       - name: Build amd64 image
         run: |
           docker build \
             --file Dockerfile \
-            --tag ghcr.io/${{ needs.prepare.outputs.owner_lc }}/secflow-app-dataflow-analyse:amd64-latest \
-            --tag ghcr.io/${{ needs.prepare.outputs.owner_lc }}/secflow-app-dataflow-analyse:amd64-${{ needs.prepare.outputs.date_tag }} \
+            --tag ghcr.io/${{ env.IMAGE_OWNER }}/${{ env.IMAGE_NAME }}:amd64-latest \
+            --tag ghcr.io/${{ env.IMAGE_OWNER }}/${{ env.IMAGE_NAME }}:amd64-${{ needs.prepare.outputs.date_tag }} \
             .
 
       - name: Push amd64 image
         run: |
-          docker push ghcr.io/${{ needs.prepare.outputs.owner_lc }}/secflow-app-dataflow-analyse:amd64-latest
-          docker push ghcr.io/${{ needs.prepare.outputs.owner_lc }}/secflow-app-dataflow-analyse:amd64-${{ needs.prepare.outputs.date_tag }}
+          docker push ghcr.io/${{ env.IMAGE_OWNER }}/${{ env.IMAGE_NAME }}:amd64-latest
+          docker push ghcr.io/${{ env.IMAGE_OWNER }}/${{ env.IMAGE_NAME }}:amd64-${{ needs.prepare.outputs.date_tag }}
 
   build-arm64:
     needs: prepare
@@ -67,21 +66,21 @@ jobs:
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
-          username: ${{ github.repository_owner }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          username: ${{ secrets.GHCR_USERNAME || env.IMAGE_OWNER }}
+          password: ${{ secrets.GHCR_TOKEN || secrets.GITHUB_TOKEN }}
 
       - name: Build arm64 image
         run: |
           docker build \
             --file Dockerfile \
-            --tag ghcr.io/${{ needs.prepare.outputs.owner_lc }}/secflow-app-dataflow-analyse:arm64-latest \
-            --tag ghcr.io/${{ needs.prepare.outputs.owner_lc }}/secflow-app-dataflow-analyse:arm64-${{ needs.prepare.outputs.date_tag }} \
+            --tag ghcr.io/${{ env.IMAGE_OWNER }}/${{ env.IMAGE_NAME }}:arm64-latest \
+            --tag ghcr.io/${{ env.IMAGE_OWNER }}/${{ env.IMAGE_NAME }}:arm64-${{ needs.prepare.outputs.date_tag }} \
             .
 
       - name: Push arm64 image
         run: |
-          docker push ghcr.io/${{ needs.prepare.outputs.owner_lc }}/secflow-app-dataflow-analyse:arm64-latest
-          docker push ghcr.io/${{ needs.prepare.outputs.owner_lc }}/secflow-app-dataflow-analyse:arm64-${{ needs.prepare.outputs.date_tag }}
+          docker push ghcr.io/${{ env.IMAGE_OWNER }}/${{ env.IMAGE_NAME }}:arm64-latest
+          docker push ghcr.io/${{ env.IMAGE_OWNER }}/${{ env.IMAGE_NAME }}:arm64-${{ needs.prepare.outputs.date_tag }}
 
   merge-manifest:
     needs: [prepare, build-amd64, build-arm64]
@@ -94,19 +93,19 @@ jobs:
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
-          username: ${{ github.repository_owner }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          username: ${{ secrets.GHCR_USERNAME || env.IMAGE_OWNER }}
+          password: ${{ secrets.GHCR_TOKEN || secrets.GITHUB_TOKEN }}
 
       - name: Create and push multi-arch manifest (latest)
         run: |
-          docker manifest create ghcr.io/${{ needs.prepare.outputs.owner_lc }}/secflow-app-dataflow-analyse:latest \
-            --amend ghcr.io/${{ needs.prepare.outputs.owner_lc }}/secflow-app-dataflow-analyse:amd64-latest \
-            --amend ghcr.io/${{ needs.prepare.outputs.owner_lc }}/secflow-app-dataflow-analyse:arm64-latest
-          docker manifest push ghcr.io/${{ needs.prepare.outputs.owner_lc }}/secflow-app-dataflow-analyse:latest
+          docker manifest create ghcr.io/${{ env.IMAGE_OWNER }}/${{ env.IMAGE_NAME }}:latest \
+            --amend ghcr.io/${{ env.IMAGE_OWNER }}/${{ env.IMAGE_NAME }}:amd64-latest \
+            --amend ghcr.io/${{ env.IMAGE_OWNER }}/${{ env.IMAGE_NAME }}:arm64-latest
+          docker manifest push ghcr.io/${{ env.IMAGE_OWNER }}/${{ env.IMAGE_NAME }}:latest
 
       - name: Create and push multi-arch manifest (date tag)
         run: |
-          docker manifest create ghcr.io/${{ needs.prepare.outputs.owner_lc }}/secflow-app-dataflow-analyse:${{ needs.prepare.outputs.date_tag }} \
-            --amend ghcr.io/${{ needs.prepare.outputs.owner_lc }}/secflow-app-dataflow-analyse:amd64-${{ needs.prepare.outputs.date_tag }} \
-            --amend ghcr.io/${{ needs.prepare.outputs.owner_lc }}/secflow-app-dataflow-analyse:arm64-${{ needs.prepare.outputs.date_tag }}
-          docker manifest push ghcr.io/${{ needs.prepare.outputs.owner_lc }}/secflow-app-dataflow-analyse:${{ needs.prepare.outputs.date_tag }}
+          docker manifest create ghcr.io/${{ env.IMAGE_OWNER }}/${{ env.IMAGE_NAME }}:${{ needs.prepare.outputs.date_tag }} \
+            --amend ghcr.io/${{ env.IMAGE_OWNER }}/${{ env.IMAGE_NAME }}:amd64-${{ needs.prepare.outputs.date_tag }} \
+            --amend ghcr.io/${{ env.IMAGE_OWNER }}/${{ env.IMAGE_NAME }}:arm64-${{ needs.prepare.outputs.date_tag }}
+          docker manifest push ghcr.io/${{ env.IMAGE_OWNER }}/${{ env.IMAGE_NAME }}:${{ needs.prepare.outputs.date_tag }}
