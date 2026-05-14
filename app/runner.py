@@ -21,6 +21,7 @@ import contextlib
 import json
 import logging
 import os
+import re
 import shutil
 import tempfile
 from pathlib import Path
@@ -31,6 +32,26 @@ from .models import TokenUsage
 logger = logging.getLogger("dfa.runner")
 
 _MAX_BACKOFF = 300  # 退避上限 5 分钟
+_DEFAULT_CONTEXT_WINDOW = 128_000
+_SINGLE_INPUT_CONTEXT_RATIO = 0.75
+_PROMPT_TOKEN_OVERHEAD = 128
+_COMPACTION_TRIGGER_PROMPT = (
+    "请立即触发一次当前会话的自动压缩（compaction），"
+    "仅保留后续继续执行任务所需的关键结论、约束和待办。"
+    "不要继续业务分析，只回复 COMPACTION_OK。"
+)
+_CONTEXT_WINDOW_BY_MODEL = {
+    "gpt-5.4": 128_000,
+    "gpt-5.4-mini": 128_000,
+    "gpt-5.5": 256_000,
+    "gpt-5.3-codex": 128_000,
+    "gpt-5.2": 200_000,
+    "minimax/minimax-m2.5": 163_804,
+    "minimax-m2.5": 163_804,
+    "minimax-m2.7": 128_000,
+    "glm-5.1": 128_000,
+    "zai-org/glm-5": 128_000,
+}
 
 
 # ─── 结果类 ───────────────────────────────────────────────────────────────────
@@ -116,6 +137,87 @@ def _cmd_preview(args: list[str]) -> str:
     for a in args:
         parts.append(a[:80] + "…" if len(a) > 100 else a)
     return " ".join(parts)
+
+
+def _estimate_tokens(text: str) -> int:
+    if not text:
+        return 0
+    ascii_chars = sum(1 for ch in text if ord(ch) < 128)
+    non_ascii_chars = len(text) - ascii_chars
+    return max(1, (ascii_chars + 3) // 4 + non_ascii_chars)
+
+
+def _model_context_window(model: str) -> int:
+    normalized = str(model or "").strip().lower()
+    for key, value in _CONTEXT_WINDOW_BY_MODEL.items():
+        if key in normalized:
+            return value
+    return _DEFAULT_CONTEXT_WINDOW
+
+
+def _single_input_token_estimate(system_prompt: str, prompt: str, post_skill_prompt: str | None = None) -> int:
+    return (
+        _estimate_tokens(system_prompt)
+        + _estimate_tokens(prompt)
+        + _estimate_tokens(post_skill_prompt or "")
+        + _PROMPT_TOKEN_OVERHEAD
+    )
+
+
+def _single_input_token_limit(context_window: int) -> int:
+    return max(1, int(context_window * _SINGLE_INPUT_CONTEXT_RATIO))
+
+
+def _parse_context_overflow_details(error_text: str | None) -> dict[str, int]:
+    text = str(error_text or "")
+    lowered = text.lower()
+    details = {
+        "input_tokens": 0,
+        "requested_output_tokens": 0,
+        "context_length": 0,
+        "max_input_tokens": 0,
+    }
+    if "context length" not in lowered and "input tokens" not in lowered:
+        return details
+    patterns = {
+        "input_tokens": r"passed\s+(\d+)\s+input tokens",
+        "requested_output_tokens": r"requested\s+(\d+)\s+output tokens",
+        "context_length": r"context length is only\s+(\d+)\s+tokens",
+        "max_input_tokens": r"maximum input length(?: of)?\s+(\d+)\s+tokens",
+    }
+    for key, pattern in patterns.items():
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            details[key] = int(match.group(1))
+    return details
+
+
+def _is_context_overflow_error(error_text: str | None) -> bool:
+    details = _parse_context_overflow_details(error_text)
+    if details["context_length"] > 0:
+        return True
+    lowered = str(error_text or "").lower()
+    return (
+        "context length" in lowered
+        and "input tokens" in lowered
+        and ("badrequesterror" in lowered or "400" in lowered)
+    )
+
+
+def _format_context_overflow_failure(
+    original_error: str | None,
+    *,
+    context_window: int,
+    single_input_tokens: int,
+    single_input_limit: int,
+    compaction_attempted: bool,
+) -> str:
+    action = "已先触发一次会话自动压缩并重试" if compaction_attempted else "未能触发会话自动压缩"
+    return (
+        f"{action}，但当前单次输入估算约 {single_input_tokens} tokens，"
+        f"超过上下文窗口 75% 阈值 {single_input_limit}/{context_window}，"
+        f"本次请求不再继续重试。原始错误: {original_error or 'unknown'}"
+    )
 
 
 def _find_pi_command() -> list[str]:
@@ -283,6 +385,100 @@ def _is_pi_crash(result: AgentResult) -> bool:
     return True
 
 
+async def _run_with_context_overflow_recovery(
+    *,
+    pi_cmd: list[str],
+    args: list[str],
+    prompt: str,
+    system_prompt: str,
+    post_skill_prompt: str | None,
+    model: str,
+    tools: list[str],
+    thinking_level: str,
+    session_file: str | None,
+    cwd: str,
+    env: dict[str, str] | None,
+    on_stream: Callable[[str], None] | None,
+    cancel_event: asyncio.Event | None,
+    max_retries: int,
+    retry_delay: float,
+    pi_max_retries: int,
+    pi_retry_delay: float,
+) -> AgentResult:
+    result = await _run_with_pi_retry(
+        args=args,
+        cwd=cwd,
+        env=env,
+        prompt=prompt,
+        post_skill_prompt=post_skill_prompt,
+        cancel_event=cancel_event,
+        on_stream=on_stream,
+        max_retries=max_retries,
+        retry_delay=retry_delay,
+        pi_max_retries=pi_max_retries,
+        pi_retry_delay=pi_retry_delay,
+    )
+    if not _is_context_overflow_error(result.error):
+        return result
+
+    overflow = _parse_context_overflow_details(result.error)
+    context_window = overflow["context_length"] or _model_context_window(model)
+    single_input_tokens = _single_input_token_estimate(system_prompt, prompt, post_skill_prompt)
+    single_input_limit = _single_input_token_limit(context_window)
+    compaction_attempted = False
+
+    if session_file:
+        compaction_attempted = True
+        msg = (
+            "检测到智能体单次请求触发上下文超限，先触发一次会话自动压缩，"
+            "随后重试原请求。"
+        )
+        _log_warn(msg)
+        if on_stream:
+            on_stream(f"\n⚠️ {msg}\n")
+        compaction_args = _build_args(pi_cmd, model, tools, thinking_level, session_file)
+        await _run_with_pi_retry(
+            args=compaction_args,
+            cwd=cwd,
+            env=env,
+            prompt=_COMPACTION_TRIGGER_PROMPT,
+            post_skill_prompt=None,
+            cancel_event=cancel_event,
+            on_stream=None,
+            max_retries=max_retries,
+            retry_delay=retry_delay,
+            pi_max_retries=pi_max_retries,
+            pi_retry_delay=pi_retry_delay,
+        )
+
+    if single_input_tokens > single_input_limit:
+        result.error = _format_context_overflow_failure(
+            result.error,
+            context_window=context_window,
+            single_input_tokens=single_input_tokens,
+            single_input_limit=single_input_limit,
+            compaction_attempted=compaction_attempted,
+        )
+        return result
+
+    if not session_file:
+        return result
+
+    return await _run_with_pi_retry(
+        args=args,
+        cwd=cwd,
+        env=env,
+        prompt=prompt,
+        post_skill_prompt=post_skill_prompt,
+        cancel_event=cancel_event,
+        on_stream=on_stream,
+        max_retries=max_retries,
+        retry_delay=retry_delay,
+        pi_max_retries=pi_max_retries,
+        pi_retry_delay=pi_retry_delay,
+    )
+
+
 # ═════════════════════════════════════════════════════════════════════════════
 # 公开接口
 # ═════════════════════════════════════════════════════════════════════════════
@@ -356,12 +552,18 @@ async def run_agent(
     try:
         while True:
             try:
-                coro = _run_with_pi_retry(
+                coro = _run_with_context_overflow_recovery(
+                    pi_cmd=pi_cmd,
                     args=args,
+                    prompt=prompt,
+                    system_prompt=system_prompt,
+                    post_skill_prompt=post_skill_prompt,
+                    model=model,
+                    tools=tools,
+                    thinking_level=thinking_level,
+                    session_file=session_file,
                     cwd=os.path.abspath(cwd),
                     env=env,
-                    prompt=prompt,
-                    post_skill_prompt=post_skill_prompt,
                     cancel_event=cancel_event,
                     on_stream=on_stream,
                     max_retries=max_retries,
