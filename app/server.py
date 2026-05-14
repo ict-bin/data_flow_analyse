@@ -33,6 +33,7 @@ import asyncio
 import json
 import logging
 import os
+import time
 from contextlib import asynccontextmanager
 
 import httpx
@@ -40,11 +41,13 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel, Field
 from sse_starlette.sse import EventSourceResponse
 
 from .config import build_task_config, get_service_yaml, load_service_config
 from .logging_utils import configure_container_logging
+from .metrics import observe_request as observe_metrics_request, render_metrics
 from .models import SwarmEvent, TaskResult, TaskStatus, make_id
 from .orchestrator import Orchestrator
 from .runtime_context import (
@@ -220,6 +223,14 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="data_flow_analyse", version="2.0.0", lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
+
+@app.middleware("http")
+async def collect_request_metrics(request, call_next):
+    started = time.perf_counter()
+    response = await call_next(request)
+    observe_metrics_request(request.method, request.url.path, response.status_code, time.perf_counter() - started)
+    return response
+
 # 启动时加载一次服务配置
 _svc_config = None
 
@@ -234,6 +245,12 @@ def _get_svc_config():
         if _svc_config is None:
             raise RuntimeError(f"服务配置文件不存在: {SERVICE_CONFIG_PATH}")
     return _svc_config
+
+
+@app.get("/metrics")
+@app.get("/api/app/dataflow-analyse/metrics", include_in_schema=False)
+async def metrics():
+    return PlainTextResponse(render_metrics(), media_type="text/plain; version=0.0.4; charset=utf-8")
 
 
 # ─── 请求体 ──────────────────────────────────────────────────────────────────
