@@ -1,5 +1,6 @@
 {
     "max_rounds": 3,
+    "max_rounds_exceeded_review_strategy": "treat_as_passed",
     "min_rounds": 2,
     "pass_threshold": 1,
     "agent_max_retries": 100,

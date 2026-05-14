@@ -12,6 +12,40 @@ from typing import Optional
 from pydantic import BaseModel, Field
 
 
+MAX_ROUNDS_EXCEEDED_REVIEW_STRATEGIES = {
+    "treat_as_passed",
+    "treat_as_failed",
+}
+
+
+def normalize_max_rounds_exceeded_review_strategy(value: str | None) -> str:
+    candidate = str(value or "").strip().lower()
+    if candidate in MAX_ROUNDS_EXCEEDED_REVIEW_STRATEGIES:
+        return candidate
+    return "treat_as_passed"
+
+
+def normalize_pass_threshold(value: object) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return "majority"
+    if isinstance(value, int):
+        if value <= 0:
+            return "majority"
+        if value == 1:
+            return "majority"
+        return "all"
+    candidate = str(value).strip().lower()
+    if not candidate:
+        return None
+    if candidate.isdigit():
+        return normalize_pass_threshold(int(candidate))
+    if candidate in {"all", "majority"}:
+        return candidate
+    return "majority"
+
+
 # ─── Agent 实例配置 ───────────────────────────────────────────────────────────
 
 class AgentInstanceConfig(BaseModel):
@@ -34,6 +68,10 @@ class RoleConfig(BaseModel):
 class ServiceConfig(BaseModel):
     """config.json — 服务提供者配置，不含任务信息"""
     max_rounds: int = Field(default=3, ge=-1, description="每个函数最大 Worker+Judge 迭ge轮数，-1=无限")
+    max_rounds_exceeded_review_strategy: str = Field(
+        default="treat_as_passed",
+        description="达到最大轮次且评审仍未通过时的处理策略：treat_as_passed/treat_as_failed",
+    )
     min_rounds: int = Field(default=2, ge=1, le=10, description="最少执行轮数（第1轮后强制自我反思）")
     pass_threshold: Optional[str | int] = Field(default=None, description="裁判通过策略：'all'=全部通过, 'majority'=半数以上(ceil(J/2))，也兼容旧整数阈值配置")
     agent_max_retries: int = Field(default=100, description="API 错误时最大重试次数")
@@ -68,6 +106,7 @@ class TaskConfig(BaseModel):
 
     # 服务配置部分（从 ServiceConfig 合并）
     max_rounds: int = Field(default=3)
+    max_rounds_exceeded_review_strategy: str = Field(default="treat_as_passed")
     min_rounds: int = Field(default=2)
     pass_threshold: Optional[int] = Field(default=None)
     agent_max_retries: int = Field(default=100)

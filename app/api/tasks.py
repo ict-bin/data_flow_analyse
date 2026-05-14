@@ -437,7 +437,6 @@ async def list_task_sessions(task_id: str, db: Session = Depends(get_db)):
     catalog = _build_task_session_catalog(row)
     return {"task_id": task_id, "items": catalog.get("items", []), "current_epoch": None}
 
-
 @router.get("/tasks/{task_id}/sessions/index", response_model=TaskSessionIndexResponse)
 async def get_task_session_index(task_id: str, db: Session = Depends(get_db)):
     row = _get_task_row(db, task_id)

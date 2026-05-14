@@ -44,6 +44,7 @@ from .models import (
     WorkerEvaluation,
     WorkerResult,
     make_id,
+    normalize_max_rounds_exceeded_review_strategy,
 )
 from .runner import run_agent
 
@@ -499,6 +500,9 @@ class PerTaintWorkflow:
         """主执行循环。"""
         cfg = self.cfg
         max_rounds = cfg.max_rounds if cfg.max_rounds > 0 else 20
+        max_rounds_strategy = normalize_max_rounds_exceeded_review_strategy(
+            getattr(cfg, "max_rounds_exceeded_review_strategy", None)
+        )
         total_tokens = TokenUsage()
         round_results: list[RoundResult] = []
 
@@ -784,14 +788,23 @@ class PerTaintWorkflow:
             if rnd >= max_rounds:
                 self._ensure_tainted_list(df_content)
                 if round_results:
-                    round_results[-1].completion_reason = "max_rounds_exceeded"
+                    if max_rounds_strategy == "treat_as_passed":
+                        round_results[-1].status = "passed_with_max_rounds_policy"
+                        round_results[-1].module_completed = True
+                        round_results[-1].completion_reason = "max_rounds_exceeded_treated_as_passed"
+                    else:
+                        round_results[-1].completion_reason = "max_rounds_exceeded"
                 return self._make_result(
                     df_content,
                     summary_result,
-                    passed=False,
+                    passed=max_rounds_strategy == "treat_as_passed",
                     rounds=round_results,
                     total_tokens=total_tokens,
-                    completion_reason="max_rounds_exceeded",
+                    completion_reason=(
+                        "max_rounds_exceeded_treated_as_passed"
+                        if max_rounds_strategy == "treat_as_passed"
+                        else "max_rounds_exceeded"
+                    ),
                 )
 
         if round_results:

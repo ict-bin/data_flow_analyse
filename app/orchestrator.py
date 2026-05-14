@@ -34,6 +34,7 @@ from .models import (
     WorkerResult,
     CalleeRef,
     make_id,
+    normalize_max_rounds_exceeded_review_strategy,
 )
 from .runner import run_agent, run_agents_parallel
 from .taint_workflow import PerTaintWorkflow
@@ -138,6 +139,9 @@ class Orchestrator(JudgeMixin):
         target_dir = os.path.abspath(cfg.cwd)  # /data/target(只读,源文件在这里)
         threshold = cfg.pass_threshold if cfg.pass_threshold is not None else math.ceil(cfg.judge_count / 2)
         self._cancel_event = asyncio.Event()
+        max_rounds_strategy = normalize_max_rounds_exceeded_review_strategy(
+            getattr(cfg, "max_rounds_exceeded_review_strategy", None)
+        )
 
         # 任务目录结构: output_dir/task_id/input|run|output。递归函数子任务只在根 run/subtasks 下建中间目录。
         if run_dir is not None:
@@ -410,8 +414,10 @@ class Orchestrator(JudgeMixin):
                     pass_count=pass_count,
                     total_judges=cfg.judge_count,
                     passed=is_passed,
+                    status="passed" if is_passed else "failed",
                     best_worker_id=best_wid,
                     feedback_to_workers=feedback_md,
+                    completion_reason="passed" if is_passed else "",
                 )
                 result.rounds.append(rnd)
 
@@ -433,9 +439,19 @@ class Orchestrator(JudgeMixin):
                 # 下一轮的反馈
                 feedback_for_workers = feedback_md
                 if cfg.max_rounds >= 0 and rnd_num == cfg.max_rounds:
-                    result.status = TaskStatus.FAILED
                     best_w = next((w for w in round_workers if w.worker_id == best_wid), round_workers[0])
                     result.final_output = _get_best_output(best_w)
+                    if max_rounds_strategy == "treat_as_passed":
+                        result.status = TaskStatus.PASSED
+                        rnd.status = "passed_with_max_rounds_policy"
+                        rnd.module_completed = True
+                        rnd.completion_reason = "max_rounds_exceeded_treated_as_passed"
+                        result.completion_reason = "max_rounds_exceeded_treated_as_passed"
+                    else:
+                        result.status = TaskStatus.FAILED
+                        rnd.completion_reason = "max_rounds_exceeded"
+                        result.completion_reason = "max_rounds_exceeded"
+                    break
 
         except Exception as e:
             result.status = TaskStatus.ERROR

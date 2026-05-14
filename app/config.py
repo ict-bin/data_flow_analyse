@@ -15,7 +15,14 @@ from typing import Any, Dict, Optional
 
 import yaml
 
-from .models import AgentInstanceConfig, RoleConfig, ServiceConfig, TaskConfig
+from .models import (
+    AgentInstanceConfig,
+    RoleConfig,
+    ServiceConfig,
+    TaskConfig,
+    normalize_max_rounds_exceeded_review_strategy,
+    normalize_pass_threshold,
+)
 
 logger = logging.getLogger("dfa.config")
 
@@ -216,6 +223,7 @@ def load_service_config(config_path: str) -> ServiceConfig:
     if not p.is_file():
         raise FileNotFoundError(f"服务配置文件不存在: {config_path}")
     raw = json.loads(p.read_text(encoding="utf-8"))
+    raw["pass_threshold"] = normalize_pass_threshold(raw.get("pass_threshold"))
     return ServiceConfig(**raw)
 
 
@@ -237,6 +245,9 @@ def build_task_config(svc: ServiceConfig, prompt: str, cwd: str = None) -> TaskC
         line_hint=line_hint,
         cwd=cwd,
         max_rounds=svc.max_rounds,
+        max_rounds_exceeded_review_strategy=normalize_max_rounds_exceeded_review_strategy(
+            getattr(svc, "max_rounds_exceeded_review_strategy", None)
+        ),
         min_rounds=svc.min_rounds,
         agent_max_retries=svc.agent_max_retries,
         agent_retry_delay=svc.agent_retry_delay,
@@ -257,10 +268,8 @@ def build_task_config(svc: ServiceConfig, prompt: str, cwd: str = None) -> TaskC
     _backfill_role(cfg.workers)
     _backfill_role(cfg.judges)
 
-    mode = svc.pass_threshold if svc.pass_threshold is not None else "majority"
-    if isinstance(mode, int):
-        cfg.pass_threshold = max(1, min(mode, cfg.judge_count or 1))
-    elif mode == "all":
+    mode = normalize_pass_threshold(getattr(svc, "pass_threshold", None)) or "majority"
+    if mode == "all":
         cfg.pass_threshold = cfg.judge_count
     else:  # "majority" or unknown
         cfg.pass_threshold = math.ceil(cfg.judge_count / 2)
