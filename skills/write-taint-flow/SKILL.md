@@ -26,6 +26,10 @@ write("taint-flow-PARAM_NAME.md", """
 ### 派生变量
 - `derived_var = operation(PARAM_NAME)` → 🔴 TAINTED
 
+## 新导入的污点对象
+- `out_var` 🔴 TAINTED — 由 `Recv/Read/Get/...(&out_var)` 在某行写入（如适用）
+- 若当前函数通过输出参数/缓冲区导入了新的污点对象，必须在此列出，并在后续传播路径中继续追踪该对象
+
 ## 接收此污点的子函数
 （只列在当前函数内调用的、实际接收此污点数据的函数）
 

@@ -221,12 +221,15 @@ def _build_taint_prompt(param: str, func_name: str,
         + "Requirements:" + chr(10)
         + "- Trace every use of `" + param + "` line-by-line" + chr(10)
         + "- Mark derived variables with 🔴 TAINTED" + chr(10)
+        + "- If tainted data is written into an output parameter / carrier object (e.g. `&out_var`, `&buf`, `&msg`, `out_pkt`), you MUST promote that variable to a NEW tainted carrier and continue tracing it line-by-line in the current function." + chr(10)
+        + "- For Recv/Read/Get/Decode/Parse style calls that load external data into an output object, do NOT stop at the call itself; continue following the new tainted object after the call." + chr(10)
+        + "- When generating callee list, include callees that receive the NEW tainted carrier even if the original parameter `" + param + "` is no longer passed directly." + chr(10)
         + "- **DIRECT SINK**: flag dangerous operations in THIS function body using `"
             + param + "` or derived values DIRECTLY:" + chr(10)
         + "  e.g. memcpy/strcpy/sprintf with tainted size or pointer, tainted array index," + chr(10)
         + "  integer truncation (uint16_t→uint8_t cast), loop bounds from tainted length." + chr(10)
         + "  Mark these ⚠️ DIRECT_SINK even if not a sub-function call." + chr(10)
-        + "- Identify sub-function calls receiving `" + param + "` or derived values" + chr(10)
+        + "- Identify sub-function calls receiving `" + param + "` or derived values, including newly introduced tainted carriers" + chr(10)
         + "- Do NOT analyze sub-function internals" + chr(10)
         + read_instruction + chr(10)*2
         + "After analysis write `taint-flow-" + safe_p + ".md` using the write tool."
@@ -241,6 +244,7 @@ def _build_taint_post_skill(param: str) -> str:
         f"```\n"
         f"# 污点流: {param}\n\n"
         f"## 污点源\n- {param} 🔴 TAINTED\n\n"
+        f"## 新导入的污点对象\n- 如有：`out_var` 🔴 TAINTED — 由 `Recv/Read/...(&out_var)` 在某行写入\n\n"
         f"## 传播路径\n[tree diagram with 🔴 marks]\n\n"
         f"## 接收此污点的子函数\n"
         f"| 函数 | 调用位置 | 接收的形参 |\n"
@@ -273,12 +277,14 @@ def _build_summary_prompt(func_name: str, taint_params: list[str],
         + taint_files + chr(10)*2
         + "Use `read` tool for each, then:" + chr(10)
         + "1. Merge all taint paths into `dataflow-" + func_name + ".md`" + chr(10)
-        + "2. From each file's callee table, generate `tainted.list`" + chr(10)*2
+        + "2. Merge any \"newly introduced tainted objects\" (for example an output variable written by `&out_var`) into the function-level analysis and keep tracing their downstream callees." + chr(10)
+        + "3. From each file's callee table, generate `tainted.list`" + chr(10)*2
         + "**IMPORTANT**: Only valid input files are: " + valid_files + chr(10)
         + "Do NOT read any other .md or source files." + chr(10)*2
         + "Output steps (must follow order):" + chr(10)
         + "1. write tool -> `dataflow-" + func_name + ".md`" + chr(10)
-        + "2. write tool -> `tainted.list` (format: `file###Class::Func###L_line###params`)" + chr(10)
+        + "2. write tool -> `taintvars.json` (structured newly introduced tainted objects in current function)" + chr(10)
+        + "3. write tool -> `tainted.list` (format: `file###Class::Func###L_line###params`)" + chr(10)
         + "**tainted.list rules**: list CALLEE functions receiving tainted data; "
             + "**NEVER** list `" + func_name + "` (the current function) as a callee;"
             + " NEVER list a function as a callee of itself." + chr(10)
@@ -291,13 +297,16 @@ def _build_summary_post_skill(func_name: str, taint_params: list[str]) -> str:
     return (
         f"Based on your merged analysis above, now write the two output files:\n\n"
         f"**File 1**: `dataflow-{func_name}.md` — complete merged dataflow report\n"
-        f"**File 2**: `tainted.list` — callee functions that receive tainted params\n\n"
+        f"**File 2**: `taintvars.json` — newly introduced tainted objects inside current function\n"
+        f"**File 3**: `tainted.list` — callee functions that receive tainted params\n\n"
+        f"For `taintvars.json`, write a JSON array like:\n"
+        + "`[{\"name\":\"out_var\",\"line\":\"L123\",\"source\":\"RecvPacket\",\"kind\":\"output-param\"}]`\n\n"
         f"For tainted.list, one line per callee:\n"
         f"`file_path###Class::FuncName###L_line###param1,param2`\n\n"
         f"Use unknown fields: `-` for path/line, `*` for params.\n"
         f"Only include functions that actually receive tainted data (no getters, no conditions).\n\n"
         f"Source files were: {taint_files}\n"
-        f"Write BOTH files now using the write tool."
+        f"Write ALL THREE files now using the write tool."
     )
 
 
@@ -818,39 +827,121 @@ class PerTaintWorkflow:
             completion_reason="failed",
         )
 
+    def _load_taintvars(self) -> list[dict]:
+        tv = self.ws / "taintvars.json"
+        if not tv.exists():
+            return []
+        try:
+            data = json.loads(tv.read_text(encoding="utf-8", errors="replace") or "[]")
+            return [item for item in data if isinstance(item, dict) and item.get("name")]
+        except Exception:
+            return []
+
+    def _append_taintvar_callees_from_source(self, out_lines: list[str], seen_keys: set[str]) -> None:
+        """Best-effort heuristic: if newly introduced taint vars exist,
+        scan current function body and append callees receiving those vars.
+        """
+        taintvars = self._load_taintvars()
+        if not taintvars:
+            return
+        func_body = _extract_function_body(self.ws, self.src_file, self.func_name, self.line_hint)
+        if not func_body:
+            return
+        from .cpp_resolver import _resolve_cpp_name, _get_definition_line, _function_has_definition
+        target_dir = str(self.cfg.cwd)
+        lines = func_body.splitlines()
+        for tv in taintvars:
+            name = str(tv.get("name", "")).strip()
+            if not name:
+                continue
+            var_pattern = re.compile(rf"\b{name}\b")
+            call_pattern = re.compile(r'([A-Za-z_][\w:]*)\s*\((.*)\)')
+            for line in lines:
+                stripped = line.strip()
+                if not stripped.startswith("L"):
+                    continue
+                if not var_pattern.search(stripped):
+                    continue
+                m_line = re.match(r'^(L\d+):\s*(.*)$', stripped)
+                if not m_line:
+                    continue
+                abs_line, code = m_line.group(1), m_line.group(2)
+                if name not in code or "(" not in code or ")" not in code:
+                    continue
+                m_call = call_pattern.search(code)
+                if not m_call:
+                    continue
+                fname = m_call.group(1).strip()
+                args = m_call.group(2)
+                if fname in {self.func_name, self.func_name.split("::")[-1]}:
+                    continue
+                if not re.search(rf'(^|[^A-Za-z0-9_]){re.escape(name)}([^A-Za-z0-9_]|$)', args):
+                    continue
+                if not _function_has_definition(target_dir, fname):
+                    continue
+                qname, rfile = _resolve_cpp_name(target_dir, fname, self.src_file or "")
+                if not qname:
+                    qname = fname
+                if not rfile:
+                    rfile = self.src_file or "-"
+                defline = _get_definition_line(target_dir, qname, rfile) or abs_line
+                key = f"{rfile}###{qname}###{defline}###{name}"
+                if key in seen_keys:
+                    continue
+                seen_keys.add(key)
+                out_lines.append(key)
+
     def _ensure_tainted_list(self, df_content: str):
-        """fallback: parse callees from dataflow doc, resolve file + defline."""
+        """fallback: parse callees from dataflow doc, resolve file + defline.
+        Also supplements callees that receive newly introduced tainted objects from taintvars.json.
+        """
         from .orchestrator import _parse_callees as _pc
         from .cpp_resolver import _resolve_cpp_name, _get_definition_line
         tl = self.ws / "tainted.list"
+        existing_lines: list[str] = []
+        seen_keys: set[str] = set()
         if tl.exists():
-            return
-        if not df_content:
-            return
-        callees = _pc(df_content)
-        if not callees:
-            return
-        target_dir = str(self.cfg.cwd)
-        out_lines = []
-        for c in callees:
-            # 跳过与当前函数同名的条目（自引用）
-            if c.function_name == self.func_name:
-                continue
-            short_c = c.function_name.split("::")[-1]
-            short_f = self.func_name.split("::")[-1]
-            if short_c == short_f:
-                continue
-            qname, rfile = _resolve_cpp_name(target_dir, c.function_name, c.file or "")
-            if not rfile:
-                rfile = c.file or "-"
-            defline = _get_definition_line(target_dir, qname, rfile)
-            if not defline:
-                defline = c.line or "-"
-            params = c.tainted_params or "*"
-            out_lines.append(rfile + "###" + qname + "###" + defline + "###" + params)
+            try:
+                for raw in tl.read_text(encoding="utf-8", errors="replace").splitlines():
+                    line = raw.strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    existing_lines.append(line)
+                    seen_keys.add(line)
+            except OSError:
+                pass
+
+        out_lines = list(existing_lines)
+        if df_content:
+            callees = _pc(df_content)
+            target_dir = str(self.cfg.cwd)
+            for c in callees:
+                if c.function_name == self.func_name:
+                    continue
+                short_c = c.function_name.split("::")[-1]
+                short_f = self.func_name.split("::")[-1]
+                if short_c == short_f:
+                    continue
+                qname, rfile = _resolve_cpp_name(target_dir, c.function_name, c.file or "")
+                if not rfile:
+                    rfile = c.file or "-"
+                defline = _get_definition_line(target_dir, qname, rfile)
+                if not defline:
+                    defline = c.line or "-"
+                params = c.tainted_params or "*"
+                key = rfile + "###" + qname + "###" + defline + "###" + params
+                if key not in seen_keys:
+                    seen_keys.add(key)
+                    out_lines.append(key)
+
+        self._append_taintvar_callees_from_source(out_lines, seen_keys)
+
         try:
             nl = chr(10)
-            tl.write_text(nl.join(out_lines) + nl, encoding="utf-8")
+            if out_lines:
+                tl.write_text(nl.join(out_lines) + nl, encoding="utf-8")
+            elif not tl.exists():
+                tl.write_text("# 无需跟入子函数\n", encoding="utf-8")
         except OSError:
             pass
 
