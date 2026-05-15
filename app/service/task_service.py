@@ -36,6 +36,15 @@ SERVICE_CONFIG_PATH = os.environ.get("SERVICE_CONFIG", "/app/config.json")
 # Running asyncio tasks keyed by task_id so we can cancel them
 _running_tasks: dict[str, asyncio.Task] = {}
 
+_TASK_LIST_SORT_COLUMNS = {
+    "created_at": AppDfaTask.created_at,
+    "updated_at": AppDfaTask.updated_at,
+    "started_at": AppDfaTask.started_at,
+    "finished_at": AppDfaTask.finished_at,
+    "status": AppDfaTask.status,
+    "task_name": AppDfaTask.task_name,
+}
+
 
 def _task_root(row: AppDfaTask) -> Path | None:
     if not row.output_path:
@@ -681,16 +690,40 @@ class TaskService:
         }
 
     def list_tasks(self, db: Session, *, project_id: str, page: int = 1,
-                   per_page: int = 100, status: Optional[str] = None) -> dict:
+                   per_page: int = 100, status: Optional[str] = None,
+                   mode: Optional[str] = None,
+                   parent_task_id: Optional[str] = None,
+                   sort_by: str = "created_at",
+                   sort_order: str = "desc") -> dict:
         query = db.query(AppDfaTask).filter(
             AppDfaTask.project_id == project_id,
             AppDfaTask.is_deleted.is_(False),
         )
         if status:
             query = query.filter(AppDfaTask.status == status)
+        normalized_mode = str(mode or "").strip().lower()
+        if normalized_mode == "manual":
+            query = query.filter(
+                (AppDfaTask.task_origin_type.is_(None)) | (AppDfaTask.task_origin_type != "binary_security")
+            )
+        elif normalized_mode == "binary":
+            query = query.filter(
+                AppDfaTask.task_origin_type == "binary_security",
+                (AppDfaTask.parent_task_type.is_(None)) | (AppDfaTask.parent_task_type != "source"),
+            )
+        elif normalized_mode == "source":
+            query = query.filter(
+                AppDfaTask.task_origin_type == "binary_security",
+                AppDfaTask.parent_task_type == "source",
+            )
+        normalized_parent_task_id = str(parent_task_id or "").strip()
+        if normalized_parent_task_id:
+            query = query.filter(AppDfaTask.parent_task_id == normalized_parent_task_id)
+        sort_column = _TASK_LIST_SORT_COLUMNS.get(str(sort_by or "").strip(), AppDfaTask.created_at)
+        order_expr = sort_column.asc() if str(sort_order or "").lower() == "asc" else sort_column.desc()
         total = query.count()
         rows = (query.options(*self._list_load_options())
-                .order_by(AppDfaTask.created_at.desc())
+                .order_by(order_expr, AppDfaTask.id.desc())
                 .offset((page - 1) * per_page).limit(per_page).all())
         return {"items": [self._row_to_dict(r, include_heavy=False) for r in rows],
                 "total": total, "page": page, "per_page": per_page}
