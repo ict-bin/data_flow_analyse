@@ -98,8 +98,9 @@ async def run_agent_dryrun(
         )
         (cwd_path / "tainted.list").write_text(
             "-###DryrunSubFunc###L240###dryParam\n", encoding="utf-8")
+        (cwd_path / "taintvars.json").write_text("[]\n", encoding="utf-8")
         if on_stream:
-            on_stream(f"[DRYRUN] wrote dataflow-{func_name}.md + tainted.list\n")
+            on_stream(f"[DRYRUN] wrote dataflow-{func_name}.md + tainted.list + taintvars.json\n")
 
     # ── Judge: return pass ────────────────────────────────────────────────────
     if is_judge:

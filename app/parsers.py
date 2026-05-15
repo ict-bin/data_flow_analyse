@@ -94,6 +94,7 @@ def _read_tainted_list(worker_cwd: str) -> list[CalleeRef]:
 
     搜索顺序: workspace-worker-*/ → round_*/workers/ → round-*/workers/
     注意: 不使用 rglob，避免把 subtasks/ 子任务的 tainted.list 误认为本函数的 callee 列表。
+    特殊记录 `@taintvar###name###Lx###source` 会被忽略（由 taintvars.json 单独消费）。
     """
     callees: list[CalleeRef] = []
     task_dir = Path(worker_cwd)
@@ -124,6 +125,8 @@ def _read_tainted_list(worker_cwd: str) -> list[CalleeRef]:
             continue
         parts = line.split("###")
         if len(parts) < 2:
+            continue
+        if parts[0].strip() == "@taintvar":
             continue
         fpath  = parts[0].strip() if parts[0].strip() not in ("-", "") else ""
         fname  = parts[1].strip() if len(parts) > 1 else ""
