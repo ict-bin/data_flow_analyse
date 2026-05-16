@@ -32,6 +32,11 @@ class TaskCreateRequest(BaseModel):
     function_name: Optional[str] = None
     line_hint: Optional[str] = None
     taint_params: list[str] = []
+    function_description: Optional[str] = None
+    function_description_source: Optional[str] = None
+    entry_reason: Optional[str] = None
+    entry_reason_source: Optional[str] = None
+    taint_details: list[Dict[str, Any]] = []
     task_origin_type: Optional[str] = None
     parent_project_id: Optional[str] = None
     parent_task_id: Optional[str] = None
@@ -328,6 +333,25 @@ async def create_task(body: TaskCreateRequest, db: Session = Depends(get_db)):
         task_config_json["line_hint"] = body.line_hint
     if body.taint_params:
         task_config_json["taint_params"] = [str(value).strip() for value in body.taint_params if str(value).strip()]
+    if body.function_description:
+        task_config_json["function_description"] = str(body.function_description).strip()
+    if body.entry_reason:
+        task_config_json["entry_reason"] = str(body.entry_reason).strip()
+    if body.function_description or body.function_description_source:
+        task_config_json["function_description_source"] = str(body.function_description_source or "agent").strip() or "agent"
+    if body.entry_reason or body.entry_reason_source:
+        task_config_json["entry_reason_source"] = str(body.entry_reason_source or "agent").strip() or "agent"
+    if body.taint_details:
+        task_config_json["taint_details"] = [
+            {
+                "name": str(item.get("name") or item.get("taint") or item.get("param") or "").strip(),
+                "description": str(item.get("description") or item.get("summary") or "").strip(),
+                "description_source": "agent" if str(item.get("description") or item.get("summary") or "").strip() else "default",
+                **({"source_kind": str(item.get("source_kind")).strip()} if str(item.get("source_kind") or "").strip() else {}),
+            }
+            for item in body.taint_details
+            if isinstance(item, dict) and str(item.get("name") or item.get("taint") or item.get("param") or "").strip()
+        ]
 
     svc = get_task_service()
     return svc.create_task(

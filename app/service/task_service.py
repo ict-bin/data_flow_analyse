@@ -32,6 +32,9 @@ from app.time_utils import isoformat_local, now_local
 logger = logging.getLogger("dfa.task_service")
 
 SERVICE_CONFIG_PATH = os.environ.get("SERVICE_CONFIG", "/app/config.json")
+ENTRY_CONTEXT_MAX_CHARS = 32000
+ENTRY_CONTEXT_MAX_TAINTS = 64
+ENTRY_CONTEXT_MAX_DESC_CHARS = 2240
 
 # Running asyncio tasks keyed by task_id so we can cancel them
 _running_tasks: dict[str, asyncio.Task] = {}
@@ -116,6 +119,58 @@ def _write_task_result_json(row: AppDfaTask, payload: dict) -> str | None:
         return None
     _write_json_atomic(path, payload)
     return str(path)
+
+
+def _build_entry_analysis_context(task_config_json: dict | None) -> str:
+    cfg = task_config_json if isinstance(task_config_json, dict) else {}
+    function_description = str(cfg.get("function_description") or "").strip()
+    entry_reason = str(cfg.get("entry_reason") or "").strip()
+    taint_details = cfg.get("taint_details") if isinstance(cfg.get("taint_details"), list) else []
+    taint_params = [
+        str(value).strip()
+        for value in (cfg.get("taint_params") or [])
+        if str(value).strip()
+    ]
+    if not function_description and not entry_reason and not taint_details:
+        return ""
+
+    lines = ["# 上游入口分析提供的上下文"]
+    if function_description:
+        fn_source = str(cfg.get("function_description_source") or "").strip()
+        fn_suffix = f" [source={fn_source}]" if fn_source else ""
+        lines.append(f"- 函数说明{fn_suffix}: {function_description[:ENTRY_CONTEXT_MAX_DESC_CHARS]}")
+    if entry_reason:
+        reason_source = str(cfg.get("entry_reason_source") or "").strip()
+        reason_suffix = f" [source={reason_source}]" if reason_source else ""
+        lines.append(f"- 入口判定原因{reason_suffix}: {entry_reason[:ENTRY_CONTEXT_MAX_DESC_CHARS]}")
+    if taint_params:
+        lines.append(f"- 上游标记的污点参数: {', '.join(taint_params)}")
+    if taint_details:
+        lines.append("- 污点参数说明:")
+        omitted = max(0, len(taint_details) - ENTRY_CONTEXT_MAX_TAINTS)
+        for item in taint_details[:ENTRY_CONTEXT_MAX_TAINTS]:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("name") or "").strip()
+            if not name:
+                continue
+            description = (str(item.get("description") or "").strip() or "上游未提供额外说明。")[:ENTRY_CONTEXT_MAX_DESC_CHARS]
+            source_kind = str(item.get("source_kind") or "").strip()
+            description_source = str(item.get("description_source") or "").strip()
+            suffix_parts = []
+            if source_kind:
+                suffix_parts.append(f"source_kind={source_kind}")
+            if description_source:
+                suffix_parts.append(f"source={description_source}")
+            suffix = f" ({', '.join(suffix_parts)})" if suffix_parts else ""
+            lines.append(f"  - {name}: {description}{suffix}")
+        if omitted > 0:
+            lines.append(f"  - ... 另有 {omitted} 个 taint 说明被折叠，避免上下文过长。")
+    lines.append("以上信息来自上游入口分析，仅作为辅助上下文；若与源码不一致，以源码为准。")
+    context = "\n".join(lines)
+    if len(context) > ENTRY_CONTEXT_MAX_CHARS:
+        context = context[:ENTRY_CONTEXT_MAX_CHARS].rstrip() + "\n...（上游入口分析上下文已截断）"
+    return context
 
 
 def _persist_terminal_failure(row: AppDfaTask, error: str, *, status: str = "error") -> dict:
@@ -1044,6 +1099,28 @@ class TaskService:
                 cfg.line_hint = str(tcfg["line_hint"])
             if isinstance(tcfg.get("taint_params"), list):
                 cfg.taint_params = [str(value).strip() for value in tcfg["taint_params"] if str(value).strip()]
+            if tcfg.get("function_description"):
+                cfg.function_description = str(tcfg["function_description"]).strip()
+            if tcfg.get("function_description_source"):
+                cfg.function_description_source = str(tcfg["function_description_source"]).strip()
+            if tcfg.get("entry_reason"):
+                cfg.entry_reason = str(tcfg["entry_reason"]).strip()
+            if tcfg.get("entry_reason_source"):
+                cfg.entry_reason_source = str(tcfg["entry_reason_source"]).strip()
+            if isinstance(tcfg.get("taint_details"), list):
+                cfg.taint_details = [
+                    {
+                        "name": str(item.get("name") or "").strip(),
+                        "description": str(item.get("description") or "").strip(),
+                        **({"description_source": str(item.get("description_source")).strip()} if str(item.get("description_source") or "").strip() else {}),
+                        **({"source_kind": str(item.get("source_kind")).strip()} if str(item.get("source_kind") or "").strip() else {}),
+                    }
+                    for item in tcfg["taint_details"]
+                    if isinstance(item, dict) and str(item.get("name") or "").strip()
+                ]
+            entry_context = _build_entry_analysis_context(tcfg)
+            if entry_context:
+                cfg.context = ((cfg.context or "").rstrip() + "\n\n" + entry_context).strip()
             orch = Orchestrator(config=cfg, on_event=on_event)
             orch_holder["orch"] = orch
             heartbeat_task = asyncio.create_task(_heartbeat_loop(orch), name=f"dfa_heartbeat_{task_id}")

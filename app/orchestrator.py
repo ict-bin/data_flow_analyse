@@ -228,7 +228,14 @@ class Orchestrator(JudgeMixin):
 
                 worker_prompt = _build_worker_prompt(
                     cfg.task, cfg.context, rnd_num, feedback_for_workers,
-                    function_name=cfg.function_name, source_file=cfg.source_file)
+                    function_name=cfg.function_name,
+                    source_file=cfg.source_file,
+                    function_description=cfg.function_description,
+                    function_description_source=cfg.function_description_source,
+                    entry_reason=cfg.entry_reason,
+                    entry_reason_source=cfg.entry_reason_source,
+                    taint_details=cfg.taint_details,
+                )
 
                 w_tasks = []
                 # write-dataflow skill 已安装到 ~/.pi/agent/skills/（支持该机制的模型可自动发现）

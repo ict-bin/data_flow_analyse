@@ -102,6 +102,11 @@ class TaskConfig(BaseModel):
     function_name: str = Field(default="", description="从 prompt 解析出的函数名")
     line_hint: str = Field(default="", description="函数起始行号提示，如 'L228'，用于区分同名重载")
     taint_params: list[str] = Field(default_factory=list, description="显式指定的污点参数列表")
+    function_description: str = Field(default="", description="上游入口分析给出的函数职责说明")
+    function_description_source: str = Field(default="", description="函数职责说明来源：agent/default")
+    entry_reason: str = Field(default="", description="上游入口分析给出的入口判定原因")
+    entry_reason_source: str = Field(default="", description="入口判定原因来源：agent/default")
+    taint_details: list[dict[str, str]] = Field(default_factory=list, description="上游入口分析给出的逐 taint 说明")
     cwd: str = Field(default="/data/target", description="待分析文件所在目录")
 
     # 服务配置部分（从 ServiceConfig 合并）
@@ -245,6 +250,8 @@ class TaskResult(BaseModel):
     analysis_status: str = ""
     completion_reason: str = ""
     config_snapshot: Optional[dict] = None
+    upstream_entry_metadata: dict = Field(default_factory=dict)
+    taint_hint_summary: list[dict] = Field(default_factory=list)
     rounds: list[RoundResult] = Field(default_factory=list)
     final_output: str = ""
     total_duration_ms: float = 0

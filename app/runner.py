@@ -32,6 +32,7 @@ from .models import TokenUsage
 logger = logging.getLogger("dfa.runner")
 
 _MAX_BACKOFF = 300  # 退避上限 5 分钟
+_QUERY_ENGINE_401_MAX_RETRIES = 10
 _DEFAULT_CONTEXT_WINDOW = 128_000
 _SINGLE_INPUT_CONTEXT_RATIO = 0.75
 _PROMPT_TOKEN_OVERHEAD = 128
@@ -286,7 +287,6 @@ _FATAL_PATTERNS = [
     ("invalid", "api_key"),
     ("unauthorized",),
     ("authentication", "failed"),
-    ("401",),
 ]
 
 # API 可重试错误
@@ -318,6 +318,12 @@ _RETRYABLE_API_PATTERNS = [
     "too many requests",    # 429 另一种表达
     "ENOBUFS",              # pipe buffer 满（大响应导致）
     "EPIPE",                # 管道断裂
+]
+
+_RETRYABLE_QUERY_ENGINE_401_PATTERNS = [
+    ("401", "authentication error"),
+    ("client is not connected to the query engine",),
+    ("must call `connect()` before attempting to query data",),
 ]
 
 # 速率限制模式：这些关键词匹配时延长待机时间
@@ -367,6 +373,17 @@ def _is_retryable_api_error(result: AgentResult) -> bool:
     error_text = (result.error or "").lower()
     for pattern in _RETRYABLE_API_PATTERNS:
         if pattern in error_text:
+            return True
+    return False
+
+
+def _is_retryable_query_engine_401_error(result: AgentResult) -> bool:
+    """query engine 会话态 401：按 API 超时机制重试，但有单独次数上限。"""
+    if result.exit_code == 0 and not result.error:
+        return False
+    error_text = (result.error or "").lower()
+    for pattern in _RETRYABLE_QUERY_ENGINE_401_PATTERNS:
+        if all(p in error_text for p in pattern):
             return True
     return False
 
@@ -719,6 +736,7 @@ async def _run_with_api_retry(
 ) -> AgentResult:
     """内层循环：启动 pi 子进程，处理 API 级错误重试。"""
     api_attempt = 0
+    query_engine_401_failures = 0
 
     while True:
         result = AgentResult()
@@ -917,6 +935,35 @@ async def _run_with_api_retry(
         # ── 致命错误 → 不重试，直接返回让外层处理 ──
         if _is_fatal_error(result):
             return result
+
+        # ── Query engine 401：使用 API 超时同款退避，但单独限制连续 10 次 ──
+        if _is_retryable_query_engine_401_error(result):
+            query_engine_401_failures += 1
+            if query_engine_401_failures <= _QUERY_ENGINE_401_MAX_RETRIES:
+                delay = _backoff(retry_delay, query_engine_401_failures)
+                label = f"{query_engine_401_failures}/{_QUERY_ENGINE_401_MAX_RETRIES}"
+                _log_warn(
+                    f"query engine 401 [{label}], {delay:.0f}s 后重试: "
+                    f"{(result.error or '')[:200]}"
+                )
+                if on_stream:
+                    on_stream(
+                        f"\n⚠️ Query engine 连接失效，{delay:.0f}s 后重试 "
+                        f"({label})...\n"
+                    )
+                await asyncio.sleep(delay)
+                continue
+            _log_error(
+                f"query engine 401 重试耗尽 "
+                f"[{query_engine_401_failures}/{_QUERY_ENGINE_401_MAX_RETRIES}]: "
+                f"{(result.error or '')[:200]}"
+            )
+            result.error = (
+                (result.error or "")
+                + f" [query engine 401 连续重试耗尽: {query_engine_401_failures} 次失败]"
+            )
+            return result
+        query_engine_401_failures = 0
 
         # ── API 可重试错误 ──
         if _is_retryable_api_error(result):

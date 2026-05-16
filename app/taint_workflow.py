@@ -185,6 +185,7 @@ def _build_taint_prompt(param: str, func_name: str,
                         func_body: str = "",
                         src_file: str = "",
                         line_hint: str = "",
+                        taint_hint: dict | None = None,
                         feedback: str = "", rnd: int = 1) -> str:
     import uuid
     nonce = uuid.uuid4().hex[:8]
@@ -196,6 +197,23 @@ def _build_taint_prompt(param: str, func_name: str,
             + chr(10)*2 + feedback + chr(10)*2 + "Please revise your analysis."
         )
     src_block = ""
+    taint_hint_block = ""
+    if isinstance(taint_hint, dict):
+        hint_desc = str(taint_hint.get("description") or "").strip()
+        hint_source_kind = str(taint_hint.get("source_kind") or "").strip()
+        hint_source = str(taint_hint.get("description_source") or "").strip()
+        if hint_desc or hint_source_kind or hint_source:
+            suffix_parts = []
+            if hint_source_kind:
+                suffix_parts.append(f"source_kind={hint_source_kind}")
+            if hint_source:
+                suffix_parts.append(f"source={hint_source}")
+            suffix = f" ({', '.join(suffix_parts)})" if suffix_parts else ""
+            taint_hint_block = (
+                "## Upstream Taint Hint" + chr(10)*2
+                + "- `" + param + "`: " + (hint_desc or "No extra upstream description.") + suffix + chr(10)*2
+                + "Treat this as a hint only; validate it against actual source usage before concluding." + chr(10)*2
+            )
     if func_body:
         src_block = (
             "## Function Source Code (absolute line numbers shown as L{n}:)" + chr(10)*2
@@ -217,6 +235,7 @@ def _build_taint_prompt(param: str, func_name: str,
         "<!-- " + nonce + " -->" + chr(10)
         + "# Deep taint analysis: `" + param + "` in `" + func_name + "`" + chr(10)*2
         + "**Analyze ONLY this one parameter within the current function.**" + chr(10)*2
+        + taint_hint_block
         + src_block
         + "Requirements:" + chr(10)
         + "- Trace every use of `" + param + "` line-by-line" + chr(10)
@@ -394,6 +413,76 @@ def _parse_feedback_routing(feedback: str, taint_params: list[str]
     return routing
 
 
+def _build_upstream_entry_metadata(cfg: TaskConfig) -> dict:
+    return {
+        "function_description": str(getattr(cfg, "function_description", "") or "").strip(),
+        "function_description_source": str(getattr(cfg, "function_description_source", "") or "").strip(),
+        "entry_reason": str(getattr(cfg, "entry_reason", "") or "").strip(),
+        "entry_reason_source": str(getattr(cfg, "entry_reason_source", "") or "").strip(),
+        "taint_params": [str(value).strip() for value in (getattr(cfg, "taint_params", None) or []) if str(value).strip()],
+    }
+
+
+def _build_taint_hint_summary(cfg: TaskConfig, runtime_taint_params: list[str]) -> list[dict]:
+    detail_map: dict[str, dict] = {}
+    for item in getattr(cfg, "taint_details", None) or []:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name") or "").strip()
+        if name:
+            detail_map[name] = item
+    summary: list[dict] = []
+    for taint in runtime_taint_params:
+        detail = detail_map.get(taint) or {}
+        summary.append(
+            {
+                "name": taint,
+                "upstream_description": str(detail.get("description") or "").strip(),
+                "description_source": str(detail.get("description_source") or "").strip() or "missing",
+                "source_kind": str(detail.get("source_kind") or "").strip(),
+                "consumed_by": ["worker_prompt", "taint_prompt"],
+                "has_upstream_hint": bool(str(detail.get("description") or "").strip()),
+            }
+        )
+    return summary
+
+
+def _prepend_upstream_hint_section(
+    final_output: str,
+    *,
+    entry_metadata: dict,
+    taint_hint_summary: list[dict],
+) -> str:
+    lines: list[str] = ["## Upstream Entry Hints", ""]
+    function_description = str(entry_metadata.get("function_description") or "").strip()
+    function_description_source = str(entry_metadata.get("function_description_source") or "").strip()
+    entry_reason = str(entry_metadata.get("entry_reason") or "").strip()
+    entry_reason_source = str(entry_metadata.get("entry_reason_source") or "").strip()
+    if function_description:
+        suffix = f" [source={function_description_source}]" if function_description_source else ""
+        lines.append(f"- Function Summary{suffix}: {function_description}")
+    if entry_reason:
+        suffix = f" [source={entry_reason_source}]" if entry_reason_source else ""
+        lines.append(f"- Entry Reason{suffix}: {entry_reason}")
+    taint_params = entry_metadata.get("taint_params") or []
+    if taint_params:
+        lines.append(f"- Upstream Taints: {', '.join(f'`{item}`' for item in taint_params)}")
+    if taint_hint_summary:
+        lines.append("")
+        lines.append("| Taint | Upstream Hint | source_kind | source | Consumed By |")
+        lines.append("|---|---|---|---|---|")
+        for item in taint_hint_summary:
+            name = str(item.get("name") or "").strip() or "-"
+            desc = str(item.get("upstream_description") or "").strip() or "上游未提供额外说明"
+            source_kind = str(item.get("source_kind") or "").strip() or "-"
+            source = str(item.get("description_source") or "").strip() or "-"
+            consumed = ", ".join(item.get("consumed_by") or []) or "-"
+            lines.append(f"| `{name}` | {desc} | {source_kind} | {source} | {consumed} |")
+    lines.extend(["", "---", ""])
+    body = final_output.strip()
+    return "\n".join(lines) + body
+
+
 # ─── 主工作流类 ───────────────────────────────────────────────────────────────
 
 class PerTaintWorkflow:
@@ -518,6 +607,12 @@ class PerTaintWorkflow:
         # 跟踪各 session 已完成的轮次（用于反馈路由）
         taint_feedbacks: dict[str, str] = {p: "" for p in self.taint_params}
         summary_feedback: str = ""
+        taint_hint_map: dict[str, dict] = {}
+        for item in getattr(cfg, "taint_details", []) or []:
+            if isinstance(item, dict):
+                name = str(item.get("name") or "").strip()
+                if name:
+                    taint_hint_map[name] = item
         # Extract function body ONCE on the orchestrator side.
         # Inject into taint prompts so model never needs to read files.
         func_body = _extract_function_body(self.ws, self.src_file, self.func_name,
@@ -587,6 +682,7 @@ class PerTaintWorkflow:
                     prompt = _build_taint_prompt(
                         param, self.func_name,
                         src_file=self.src_file, line_hint=self.line_hint,
+                        taint_hint=taint_hint_map.get(param),
                         feedback=fb, rnd=rnd)
                     post_skill = _build_taint_post_skill(param)
                     self._emit("worker_start",
@@ -960,12 +1056,21 @@ class PerTaintWorkflow:
         from .models import TaskStatus
         status = status_override or (TaskStatus.PASSED if passed else TaskStatus.FAILED)
         final_output = final_output_override if final_output_override is not None else (df_content or (summary_result.output if summary_result else ""))
+        entry_metadata = _build_upstream_entry_metadata(self.cfg)
+        taint_hint_summary = _build_taint_hint_summary(self.cfg, self.taint_params)
+        final_output = _prepend_upstream_hint_section(
+            final_output,
+            entry_metadata=entry_metadata,
+            taint_hint_summary=taint_hint_summary,
+        )
         return TaskResult(
             task_id=self.task_id,
             task=self.cfg.task,
             status=status,
             analysis_status=status.value,
             completion_reason=completion_reason,
+            upstream_entry_metadata=entry_metadata,
+            taint_hint_summary=taint_hint_summary,
             final_output=final_output,
             rounds=rounds or [],
             total_tokens=total_tokens or TokenUsage(),

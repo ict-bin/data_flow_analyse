@@ -11,7 +11,12 @@ from .models import TaskConfig, TaskResult, TaskStatus, WorkerResult, WorkerEval
 
 
 def _build_worker_prompt(task, context, rnd, feedback,
-                          function_name: str = "", source_file: str = ""):
+                          function_name: str = "", source_file: str = "",
+                          function_description: str = "",
+                          function_description_source: str = "",
+                          entry_reason: str = "",
+                          entry_reason_source: str = "",
+                          taint_details: list[dict] | None = None):
     import uuid
     # 随机 nonce 确保每次请求 token 前缀不同,破坏 vllm prefix cache
     # (防止 temperature=0 加 prefix cache 导致确定性复现"不调 write"的行为)
@@ -27,8 +32,39 @@ def _build_worker_prompt(task, context, rnd, feedback,
             f"- `src-vul/` 目录是只读挂载,导新任何写入都会失败!请将文件写到当前目录"
         )
     parts = [f"<!-- {nonce} -->\n# Task\n\n{task_block}"]
+    if function_description or entry_reason or taint_details:
+        lines = ["# Upstream Entry Metadata"]
+        if function_description:
+            suffix = f" [source={function_description_source}]" if function_description_source else ""
+            lines.append(f"- Function Summary{suffix}: {function_description}")
+        if entry_reason:
+            suffix = f" [source={entry_reason_source}]" if entry_reason_source else ""
+            lines.append(f"- Entry Reason{suffix}: {entry_reason}")
+        if taint_details:
+            lines.append("- Taint Hints:")
+            for item in taint_details:
+                if not isinstance(item, dict):
+                    continue
+                name = str(item.get("name") or "").strip()
+                if not name:
+                    continue
+                description = str(item.get("description") or "").strip()
+                suffix_parts = []
+                if str(item.get("source_kind") or "").strip():
+                    suffix_parts.append(f"source_kind={str(item.get('source_kind')).strip()}")
+                if str(item.get("description_source") or "").strip():
+                    suffix_parts.append(f"source={str(item.get('description_source')).strip()}")
+                suffix = f" ({', '.join(suffix_parts)})" if suffix_parts else ""
+                lines.append(f"  - {name}: {description}{suffix}")
+        lines.append("Use the metadata above as structured hints, but always re-check against source code before concluding.")
+        parts.append("\n".join(lines))
     if context:
-        parts.append(f"# Additional Context\n\n{context}")
+        parts.append(
+            "# Additional Context\n\n"
+            f"{context}\n\n"
+            "若上下文中包含上游入口分析提供的函数说明、入口判定原因或 taint 说明，"
+            "请将其作为辅助线索使用，但必须结合源码重新验证；如与源码不一致，以源码为准并在结果中指出偏差。"
+        )
     if rnd > 1 and feedback:
         # 结构性问题(F1/F2/F3)置顶,避免被长上下文忽视
         is_structural = any(tag in feedback for tag in ("[F1]", "[F2]", "[F3]"))
