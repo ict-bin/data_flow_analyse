@@ -748,6 +748,7 @@ class TaskService:
                    per_page: int = 100, status: Optional[str] = None,
                    mode: Optional[str] = None,
                    parent_task_id: Optional[str] = None,
+                   parent_stage_item_id: Optional[str] = None,
                    sort_by: str = "created_at",
                    sort_order: str = "desc") -> dict:
         query = db.query(AppDfaTask).filter(
@@ -774,6 +775,9 @@ class TaskService:
         normalized_parent_task_id = str(parent_task_id or "").strip()
         if normalized_parent_task_id:
             query = query.filter(AppDfaTask.parent_task_id == normalized_parent_task_id)
+        normalized_parent_stage_item_id = str(parent_stage_item_id or "").strip()
+        if normalized_parent_stage_item_id:
+            query = query.filter(AppDfaTask.parent_stage_item_id == normalized_parent_stage_item_id)
         sort_column = _TASK_LIST_SORT_COLUMNS.get(str(sort_by or "").strip(), AppDfaTask.created_at)
         order_expr = sort_column.asc() if str(sort_order or "").lower() == "asc" else sort_column.desc()
         total = query.count()
