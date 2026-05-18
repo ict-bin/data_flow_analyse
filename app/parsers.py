@@ -344,6 +344,12 @@ _STDLIB_SKIP: frozenset[str] = frozenset({
     'sendto', 'recvfrom', 'setsockopt', 'getsockopt', 'htons', 'ntohs', 'htonl', 'ntohl',
     # 其他 C++ 内置
     'operator', 'swap',
+    # C/C++ 关键字（不得被误当作函数名递归）
+    'if', 'else', 'while', 'for', 'do', 'switch', 'case', 'break',
+    'continue', 'return', 'goto', 'typedef', 'struct', 'union', 'enum',
+    'class', 'namespace', 'template', 'typename', 'sizeof', 'typeof',
+    'static', 'extern', 'inline', 'void', 'int', 'char', 'long',
+    'unsigned', 'signed', 'const', 'volatile', 'auto', 'register',
 })
 
 

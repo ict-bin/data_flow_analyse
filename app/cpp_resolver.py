@@ -175,6 +175,19 @@ def _function_has_definition(target_dir: str, function_name: str) -> bool:
     import subprocess
     if function_name in _STDLIB_SKIP:
         return False
+    # 不得把 C/C++ 关键字 / 语法标识误判为函数定义
+    _KEYWORDS = frozenset({
+        'if', 'else', 'while', 'for', 'do', 'switch', 'case', 'break',
+        'continue', 'return', 'goto', 'typedef', 'struct', 'union', 'enum',
+        'class', 'namespace', 'template', 'typename', 'sizeof', 'typeof',
+        'static', 'extern', 'inline', 'void', 'int', 'char', 'long',
+        'unsigned', 'signed', 'const', 'volatile', 'auto', 'register',
+    })
+    if function_name in _KEYWORDS:
+        return False
+    # 函数名必须是合法标识符，且长度 >= 3
+    if not re.match(r'^[A-Za-z_][A-Za-z0-9_:]*$', function_name) or len(function_name) < 3:
+        return False
     try:
         exts = ["--include=*.c", "--include=*.h", "--include=*.hpp",
                 "--include=*.cpp", "--include=*.cc", "--include=*.cxx"]
