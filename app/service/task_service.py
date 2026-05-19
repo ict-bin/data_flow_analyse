@@ -625,6 +625,9 @@ class TaskService:
 
     async def dispatch_once(self) -> str | None:
         if self.local_running_task_count() >= MAX_LOCAL_RUNNING_TASKS:
+            from app.metrics import observe_local_event
+
+            observe_local_event("dispatch_capacity_blocked", "skip")
             return None
         from app.db import get_db
         db_gen = get_db()
@@ -632,9 +635,15 @@ class TaskService:
         try:
             claimed = claim_one_runnable_task(db, INSTANCE_ID)
             if claimed is None:
+                from app.metrics import observe_local_event
+
+                observe_local_event("dispatch_claim", "empty")
                 return None
             if claimed.task_id in _running_tasks and not _running_tasks[claimed.task_id].done():
                 release_lease(db, claimed.task_id, INSTANCE_ID, claimed.epoch)
+                from app.metrics import observe_local_event
+
+                observe_local_event("dispatch_claim", "duplicate_local")
                 log_event(
                     logger,
                     logging.WARNING,
@@ -651,6 +660,9 @@ class TaskService:
                 name=f"dfa_task_{claimed.task_id}",
             )
             _running_tasks[claimed.task_id] = asyncio_task
+            from app.metrics import observe_local_event
+
+            observe_local_event("dispatch_claim", "success")
             log_event(
                 logger,
                 logging.INFO,
@@ -966,6 +978,7 @@ class TaskService:
 
         async def _heartbeat_loop(orch: Orchestrator) -> None:
             from app.db import get_db as _get_db
+            from app.metrics import observe_local_event
             while not stop_heartbeat.is_set():
                 await asyncio.sleep(HEARTBEAT_INTERVAL_SECONDS)
                 _hb_gen = _get_db()
@@ -973,6 +986,7 @@ class TaskService:
                 try:
                     ok = renew_lease(_hb_db, task_id, INSTANCE_ID, epoch)
                     if not ok or not still_owner(_hb_db, task_id, INSTANCE_ID, epoch, control_version):
+                        observe_local_event("lease_renew", "failed")
                         log_event(
                             logger,
                             logging.WARNING,
@@ -987,6 +1001,7 @@ class TaskService:
                             orch._cancel_event.set()
                         stop_heartbeat.set()
                         return
+                    observe_local_event("lease_renew", "success")
                 finally:
                     try:
                         next(_hb_gen)
@@ -1054,9 +1069,15 @@ class TaskService:
 
             started_at = row.started_at or now_local()
             if not begin_execution_if_owner(db, task_id, INSTANCE_ID, epoch, control_version, started_at=started_at):
+                from app.metrics import observe_local_event
+
+                observe_local_event("task_started", "rejected")
                 log_event(logger, logging.INFO, "failed to enter running state as owner", event="task_begin_execution_rejected",
                           task_id=task_id, owner_id=INSTANCE_ID, epoch=epoch, control_version=control_version)
                 return
+            from app.metrics import observe_local_event
+
+            observe_local_event("task_started", "success")
             log_event(logger, logging.INFO, "task execution started", event="task_execution_started",
                       task_id=task_id, project_id=row.project_id, owner_id=INSTANCE_ID, epoch=epoch, control_version=control_version, status="running")
             db.expire(row)
@@ -1171,18 +1192,31 @@ class TaskService:
                 result_json=lightweight_result,
                 error=terminal_error,
             ):
+                from app.metrics import observe_local_event
+
+                observe_local_event("task_finished", "commit_rejected")
                 log_event(logger, logging.WARNING, "terminal commit rejected for stale owner", event="task_terminal_commit_rejected",
                           task_id=task_id, owner_id=INSTANCE_ID, epoch=epoch, control_version=control_version)
                 return
+            from app.metrics import observe_local_event
+
+            terminal_status = result.status.value if result else "error"
+            observe_local_event("task_finished", terminal_status)
             log_event(logger, logging.INFO, "terminal state committed", event="task_terminal_committed",
                       task_id=task_id, owner_id=INSTANCE_ID, epoch=epoch, control_version=control_version,
-                      status=result.status.value if result else "error")
+                      status=terminal_status)
 
         except asyncio.CancelledError:
+            from app.metrics import observe_local_event
+
+            observe_local_event("task_finished", "cancelled")
             log_event(logger, logging.INFO, "task coroutine cancelled", event="task_coroutine_cancelled",
                       task_id=task_id, owner_id=INSTANCE_ID, epoch=epoch, control_version=control_version)
             pass
         except Exception as exc:
+            from app.metrics import observe_local_event
+
+            observe_local_event("task_finished", "exception")
             log_event(logger, logging.ERROR, "task execution failed",
                       event="task_error", task_id=task_id, owner_id=INSTANCE_ID, epoch=epoch, control_version=control_version, error=str(exc))
             try:
@@ -1217,9 +1251,19 @@ class TaskService:
             try:
                 released = release_lease(db, task_id, INSTANCE_ID, epoch)
                 if released:
+                    from app.metrics import observe_local_event
+
+                    observe_local_event("lease_release", "success")
                     log_event(logger, logging.INFO, "lease released", event="task_lease_released",
                               task_id=task_id, owner_id=INSTANCE_ID, epoch=epoch, control_version=control_version)
+                else:
+                    from app.metrics import observe_local_event
+
+                    observe_local_event("lease_release", "noop")
             except Exception:
+                from app.metrics import observe_local_event
+
+                observe_local_event("lease_release", "failed")
                 db.rollback()
             _running_tasks.pop(task_id, None)
             try:

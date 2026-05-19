@@ -26,6 +26,8 @@ from .service.task_service import get_task_service
 _REQUEST_LOCK = threading.Lock()
 _REQUEST_TOTAL = defaultdict(int)
 _REQUEST_DURATION = defaultdict(lambda: {"count": 0, "sum": 0.0})
+_LOCAL_EVENT_LOCK = threading.Lock()
+_LOCAL_EVENT_TOTAL = defaultdict(int)
 _TERMINAL_STATUSES = {"passed", "failed", "error", "cancelled"}
 
 
@@ -36,6 +38,12 @@ def observe_request(method: str, path: str, status_code: int, duration_seconds: 
         bucket = _REQUEST_DURATION[key]
         bucket["count"] += 1
         bucket["sum"] += max(0.0, float(duration_seconds))
+
+
+def observe_local_event(event: str, result: str = "success") -> None:
+    key = (str(event or "unknown"), str(result or "success"))
+    with _LOCAL_EVENT_LOCK:
+        _LOCAL_EVENT_TOTAL[key] += 1
 
 
 def render_metrics() -> str:
@@ -98,7 +106,7 @@ def _render_request_metrics() -> list[str]:
 def _render_local_runtime_metrics() -> list[str]:
     task_service = get_task_service()
     local_running = int(task_service.local_running_task_count())
-    return [
+    lines = [
         "# HELP secflow_dfa_local_role_info Static role info for this pod.",
         "# TYPE secflow_dfa_local_role_info gauge",
         f"secflow_dfa_local_role_info{_labels(role=ROLE)} 1",
@@ -121,6 +129,15 @@ def _render_local_runtime_metrics() -> list[str]:
         "# TYPE secflow_dfa_local_running_capacity gauge",
         f"secflow_dfa_local_running_capacity {MAX_LOCAL_RUNNING_TASKS}",
     ]
+    with _LOCAL_EVENT_LOCK:
+        local_events = dict(_LOCAL_EVENT_TOTAL)
+    lines.extend([
+        "# HELP secflow_dfa_local_events_total Local execution events observed by this pod.",
+        "# TYPE secflow_dfa_local_events_total counter",
+    ])
+    for (event, result), value in sorted(local_events.items()):
+        lines.append(f"secflow_dfa_local_events_total{_labels(event=event, result=result)} {value}")
+    return lines
 
 
 def _render_cluster_task_metrics() -> list[str]:
@@ -163,6 +180,8 @@ def _render_cluster_task_metrics() -> list[str]:
     heartbeat_age_max = 0.0
     heartbeat_live = 0
     session_gauge = 0
+    observed_active_owners: set[str] = set()
+    observed_live_heartbeat_owners: set[str] = set()
 
     now = datetime.now(timezone.utc).timestamp()
     for row in rows:
@@ -171,6 +190,7 @@ def _render_cluster_task_metrics() -> list[str]:
         dispatch_counts[str(row.dispatch_status or "unknown")] += 1
         if row.execution_owner_id and row.execution_lease_until and row.execution_lease_until.timestamp() >= now:
             leased_tasks += 1
+            observed_active_owners.add(str(row.execution_owner_id))
         elif row.execution_owner_id:
             stale_leases += 1
         if row.started_at and row.created_at:
@@ -230,6 +250,8 @@ def _render_cluster_task_metrics() -> list[str]:
             heartbeat_age_max = max(heartbeat_age_max, age)
             if age <= HEARTBEAT_INTERVAL_SECONDS * 2:
                 heartbeat_live += 1
+                if row.execution_owner_id:
+                    observed_live_heartbeat_owners.add(str(row.execution_owner_id))
 
         classification = _classify_failure(row.error, result_json)
         if classification == "timeout":
@@ -246,6 +268,8 @@ def _render_cluster_task_metrics() -> list[str]:
     configured_slots = configured_workers * configured_capacity_per_worker
     busy_slots = max(0, status_counts.get("running", 0))
     free_slots = max(0, configured_slots - busy_slots) if configured_slots > 0 else 0
+    observed_active_worker_count = len(observed_active_owners)
+    observed_live_heartbeat_worker_count = len(observed_live_heartbeat_owners)
     heartbeat_stale = max(0, status_counts.get("running", 0) - heartbeat_live)
     lines = [
         "# HELP secflow_dfa_db_up Database query path for metrics is available.",
@@ -270,6 +294,8 @@ def _render_cluster_task_metrics() -> list[str]:
         "# HELP secflow_dfa_cluster_workers Worker counts by state.",
         "# TYPE secflow_dfa_cluster_workers gauge",
         f'secflow_dfa_cluster_workers{{state="configured"}} {configured_workers}',
+        f'secflow_dfa_cluster_workers{{state="observed_active_owner"}} {observed_active_worker_count}',
+        f'secflow_dfa_cluster_workers{{state="observed_live_heartbeat_owner"}} {observed_live_heartbeat_worker_count}',
         "# HELP secflow_dfa_cluster_worker_slots Worker slot counts by kind.",
         "# TYPE secflow_dfa_cluster_worker_slots gauge",
         f'secflow_dfa_cluster_worker_slots{{kind="capacity"}} {configured_slots}',
