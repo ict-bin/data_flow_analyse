@@ -271,6 +271,9 @@ def _render_cluster_task_metrics() -> list[str]:
     observed_active_worker_count = len(observed_active_owners)
     observed_live_heartbeat_worker_count = len(observed_live_heartbeat_owners)
     heartbeat_stale = max(0, status_counts.get("running", 0) - heartbeat_live)
+    slot_utilization_ratio = (busy_slots / configured_slots) if configured_slots > 0 else 0.0
+    observed_worker_coverage_ratio = (observed_active_worker_count / configured_workers) if configured_workers > 0 else 0.0
+    queue_pressure_ratio = (status_counts.get("pending", 0) / configured_slots) if configured_slots > 0 else 0.0
     lines = [
         "# HELP secflow_dfa_db_up Database query path for metrics is available.",
         "# TYPE secflow_dfa_db_up gauge",
@@ -304,6 +307,15 @@ def _render_cluster_task_metrics() -> list[str]:
         "# HELP secflow_dfa_cluster_worker_capacity_per_pod Configured per-worker task capacity.",
         "# TYPE secflow_dfa_cluster_worker_capacity_per_pod gauge",
         f"secflow_dfa_cluster_worker_capacity_per_pod {configured_capacity_per_worker}",
+        "# HELP secflow_dfa_cluster_worker_slot_utilization_ratio Busy slot ratio over configured capacity.",
+        "# TYPE secflow_dfa_cluster_worker_slot_utilization_ratio gauge",
+        f"secflow_dfa_cluster_worker_slot_utilization_ratio {_fmt(slot_utilization_ratio)}",
+        "# HELP secflow_dfa_cluster_worker_observed_coverage_ratio Observed active owners over configured workers.",
+        "# TYPE secflow_dfa_cluster_worker_observed_coverage_ratio gauge",
+        f"secflow_dfa_cluster_worker_observed_coverage_ratio {_fmt(observed_worker_coverage_ratio)}",
+        "# HELP secflow_dfa_cluster_queue_pressure_ratio Pending tasks over configured worker slots.",
+        "# TYPE secflow_dfa_cluster_queue_pressure_ratio gauge",
+        f"secflow_dfa_cluster_queue_pressure_ratio {_fmt(queue_pressure_ratio)}",
         "# HELP secflow_dfa_cluster_queue_wait_seconds Queue wait duration aggregated over tasks.",
         "# TYPE secflow_dfa_cluster_queue_wait_seconds summary",
         f"secflow_dfa_cluster_queue_wait_seconds_count {queue_count}",
