@@ -10,7 +10,17 @@ from typing import Any
 from sqlalchemy.orm import Session
 
 from .db.models import AppDfaTask
-from .runtime_context import DISPATCHER_ENABLED, EXECUTOR_ENABLED, HEARTBEAT_INTERVAL_SECONDS
+from .runtime_context import (
+    CLUSTER_EXPECTED_WORKER_CAPACITY,
+    CLUSTER_EXPECTED_WORKERS,
+    DISPATCHER_ENABLED,
+    EXECUTOR_ENABLED,
+    HEARTBEAT_INTERVAL_SECONDS,
+    MAX_LOCAL_RUNNING_TASKS,
+    PUBLIC_API_ENABLED,
+    REGISTRY_ENABLED,
+    ROLE,
+)
 from .service.task_service import get_task_service
 
 _REQUEST_LOCK = threading.Lock()
@@ -29,13 +39,39 @@ def observe_request(method: str, path: str, status_code: int, duration_seconds: 
 
 
 def render_metrics() -> str:
+    return render_local_metrics()
+
+
+def render_local_metrics() -> str:
     lines = ["# HELP secflow_dfa_up Service metrics scrape succeeded.", "# TYPE secflow_dfa_up gauge"]
     try:
         lines.append("secflow_dfa_up 1")
         lines.extend(_render_request_metrics())
-        lines.extend(_render_task_metrics())
+        lines.extend(_render_local_runtime_metrics())
     except Exception:
         lines.append("secflow_dfa_up 0")
+    return "\n".join(lines) + "\n"
+
+
+def render_aggregate_metrics() -> str:
+    lines = [
+        "# HELP secflow_dfa_metrics_aggregate_up DFA aggregate metrics scrape succeeded.",
+        "# TYPE secflow_dfa_metrics_aggregate_up gauge",
+    ]
+    try:
+        started = time.perf_counter()
+        lines.append("secflow_dfa_metrics_aggregate_up 1")
+        lines.extend(_render_cluster_task_metrics())
+        lines.extend([
+            "# HELP secflow_dfa_metrics_aggregate_partial Aggregate metrics returned a partial response.",
+            "# TYPE secflow_dfa_metrics_aggregate_partial gauge",
+            "secflow_dfa_metrics_aggregate_partial 0",
+            "# HELP secflow_dfa_metrics_aggregate_duration_seconds Aggregate metrics render duration in seconds.",
+            "# TYPE secflow_dfa_metrics_aggregate_duration_seconds gauge",
+            f"secflow_dfa_metrics_aggregate_duration_seconds {_fmt(time.perf_counter() - started)}",
+        ])
+    except Exception:
+        lines.append("secflow_dfa_metrics_aggregate_up 0")
     return "\n".join(lines) + "\n"
 
 
@@ -59,7 +95,35 @@ def _render_request_metrics() -> list[str]:
     return lines
 
 
-def _render_task_metrics() -> list[str]:
+def _render_local_runtime_metrics() -> list[str]:
+    task_service = get_task_service()
+    local_running = int(task_service.local_running_task_count())
+    return [
+        "# HELP secflow_dfa_local_role_info Static role info for this pod.",
+        "# TYPE secflow_dfa_local_role_info gauge",
+        f"secflow_dfa_local_role_info{_labels(role=ROLE)} 1",
+        "# HELP secflow_dfa_local_public_api_enabled Public API enabled flag for this pod.",
+        "# TYPE secflow_dfa_local_public_api_enabled gauge",
+        f"secflow_dfa_local_public_api_enabled {1 if PUBLIC_API_ENABLED else 0}",
+        "# HELP secflow_dfa_local_dispatcher_enabled Dispatcher enabled flag for this pod.",
+        "# TYPE secflow_dfa_local_dispatcher_enabled gauge",
+        f"secflow_dfa_local_dispatcher_enabled {1 if DISPATCHER_ENABLED else 0}",
+        "# HELP secflow_dfa_local_executor_enabled Executor enabled flag for this pod.",
+        "# TYPE secflow_dfa_local_executor_enabled gauge",
+        f"secflow_dfa_local_executor_enabled {1 if EXECUTOR_ENABLED else 0}",
+        "# HELP secflow_dfa_local_registry_enabled Registry enabled flag for this pod.",
+        "# TYPE secflow_dfa_local_registry_enabled gauge",
+        f"secflow_dfa_local_registry_enabled {1 if REGISTRY_ENABLED else 0}",
+        "# HELP secflow_dfa_local_running_tasks Current running tasks in this pod.",
+        "# TYPE secflow_dfa_local_running_tasks gauge",
+        f"secflow_dfa_local_running_tasks {local_running}",
+        "# HELP secflow_dfa_local_running_capacity Configured max running tasks for this pod.",
+        "# TYPE secflow_dfa_local_running_capacity gauge",
+        f"secflow_dfa_local_running_capacity {MAX_LOCAL_RUNNING_TASKS}",
+    ]
+
+
+def _render_cluster_task_metrics() -> list[str]:
     from .db import get_db
 
     db_up = 0
@@ -95,6 +159,7 @@ def _render_task_metrics() -> list[str]:
     trace_depth_max = 0
     trace_callee_total = 0
     leased_tasks = 0
+    stale_leases = 0
     heartbeat_age_max = 0.0
     heartbeat_live = 0
     session_gauge = 0
@@ -106,6 +171,8 @@ def _render_task_metrics() -> list[str]:
         dispatch_counts[str(row.dispatch_status or "unknown")] += 1
         if row.execution_owner_id and row.execution_lease_until and row.execution_lease_until.timestamp() >= now:
             leased_tasks += 1
+        elif row.execution_owner_id:
+            stale_leases += 1
         if row.started_at and row.created_at:
             queue_sum += _seconds_between(row.created_at, row.started_at)
             queue_count += 1
@@ -172,131 +239,152 @@ def _render_task_metrics() -> list[str]:
         if classification != "none":
             failure_category_counts[classification] += 1
 
-    task_service = get_task_service()
-    local_running = int(task_service.local_running_task_count())
     dispatcher_running = 1 if DISPATCHER_ENABLED else 0
     executor_running = 1 if EXECUTOR_ENABLED else 0
+    configured_workers = max(0, int(CLUSTER_EXPECTED_WORKERS))
+    configured_capacity_per_worker = max(0, int(CLUSTER_EXPECTED_WORKER_CAPACITY))
+    configured_slots = configured_workers * configured_capacity_per_worker
+    busy_slots = max(0, status_counts.get("running", 0))
+    free_slots = max(0, configured_slots - busy_slots) if configured_slots > 0 else 0
+    heartbeat_stale = max(0, status_counts.get("running", 0) - heartbeat_live)
     lines = [
         "# HELP secflow_dfa_db_up Database query path for metrics is available.",
         "# TYPE secflow_dfa_db_up gauge",
         f"secflow_dfa_db_up {db_up}",
-        "# HELP secflow_dfa_tasks_status Number of tasks by status.",
-        "# TYPE secflow_dfa_tasks_status gauge",
+        "# HELP secflow_dfa_cluster_tasks Number of tasks by status.",
+        "# TYPE secflow_dfa_cluster_tasks gauge",
     ]
     for status in sorted(status_counts):
-        lines.append(f"secflow_dfa_tasks_status{_labels(status=status)} {status_counts[status]}")
+        lines.append(f"secflow_dfa_cluster_tasks{_labels(status=status)} {status_counts[status]}")
     finished_count = sum(count for status, count in status_counts.items() if status in _TERMINAL_STATUSES)
     lines.extend([
-        "# HELP secflow_dfa_tasks_pending Pending tasks.",
-        "# TYPE secflow_dfa_tasks_pending gauge",
-        f"secflow_dfa_tasks_pending {status_counts.get('pending', 0)}",
-        "# HELP secflow_dfa_tasks_running Running tasks.",
-        "# TYPE secflow_dfa_tasks_running gauge",
-        f"secflow_dfa_tasks_running {status_counts.get('running', 0)}",
-        "# HELP secflow_dfa_tasks_finished Finished tasks.",
-        "# TYPE secflow_dfa_tasks_finished gauge",
-        f"secflow_dfa_tasks_finished {finished_count}",
-        "# HELP secflow_dfa_queue_wait_seconds Queue wait duration aggregated over tasks.",
-        "# TYPE secflow_dfa_queue_wait_seconds summary",
-        f"secflow_dfa_queue_wait_seconds_count {queue_count}",
-        f"secflow_dfa_queue_wait_seconds_sum {_fmt(queue_sum)}",
-        "# HELP secflow_dfa_execution_seconds Execution duration aggregated over tasks.",
-        "# TYPE secflow_dfa_execution_seconds summary",
-        f"secflow_dfa_execution_seconds_count {execution_count}",
-        f"secflow_dfa_execution_seconds_sum {_fmt(execution_sum)}",
-        "# HELP secflow_dfa_turnaround_seconds End-to-end turnaround duration aggregated over tasks.",
-        "# TYPE secflow_dfa_turnaround_seconds summary",
-        f"secflow_dfa_turnaround_seconds_count {turnaround_count}",
-        f"secflow_dfa_turnaround_seconds_sum {_fmt(turnaround_sum)}",
-        "# HELP secflow_dfa_workers Local running task count.",
-        "# TYPE secflow_dfa_workers gauge",
-        f"secflow_dfa_workers {local_running}",
-        "# HELP secflow_dfa_judges Aggregated judge count.",
-        "# TYPE secflow_dfa_judges gauge",
-        f"secflow_dfa_judges {judge_total}",
-        "# HELP secflow_dfa_sessions Aggregated session file count.",
-        "# TYPE secflow_dfa_sessions gauge",
-        f"secflow_dfa_sessions {session_gauge}",
-        "# HELP secflow_dfa_leased_tasks Active leased task count.",
-        "# TYPE secflow_dfa_leased_tasks gauge",
-        f"secflow_dfa_leased_tasks {leased_tasks}",
-        "# HELP secflow_dfa_dispatcher_running Dispatcher role enabled flag.",
-        "# TYPE secflow_dfa_dispatcher_running gauge",
-        f"secflow_dfa_dispatcher_running {dispatcher_running}",
-        "# HELP secflow_dfa_executor_running Executor role enabled flag.",
-        "# TYPE secflow_dfa_executor_running gauge",
-        f"secflow_dfa_executor_running {executor_running}",
-        "# HELP secflow_dfa_heartbeat_live Current tasks with fresh heartbeat.",
-        "# TYPE secflow_dfa_heartbeat_live gauge",
-        f"secflow_dfa_heartbeat_live {heartbeat_live}",
-        "# HELP secflow_dfa_heartbeat_age_seconds_max Max heartbeat age in seconds.",
-        "# TYPE secflow_dfa_heartbeat_age_seconds_max gauge",
-        f"secflow_dfa_heartbeat_age_seconds_max {_fmt(heartbeat_age_max)}",
-        "# HELP secflow_dfa_retry_total Aggregated retry count derived from extra rounds.",
-        "# TYPE secflow_dfa_retry_total counter",
-        f"secflow_dfa_retry_total {retry_total}",
-        "# HELP secflow_dfa_timeout_total Timeout-classified terminal tasks.",
-        "# TYPE secflow_dfa_timeout_total counter",
-        f"secflow_dfa_timeout_total {timeout_total}",
-        "# HELP secflow_dfa_cancel_total Cancelled tasks.",
-        "# TYPE secflow_dfa_cancel_total counter",
-        f"secflow_dfa_cancel_total {cancel_total}",
-        "# HELP secflow_dfa_failure_category_total Terminal tasks classified by failure category.",
-        "# TYPE secflow_dfa_failure_category_total counter",
+        "# HELP secflow_dfa_cluster_tasks_pending Pending tasks.",
+        "# TYPE secflow_dfa_cluster_tasks_pending gauge",
+        f"secflow_dfa_cluster_tasks_pending {status_counts.get('pending', 0)}",
+        "# HELP secflow_dfa_cluster_tasks_running Running tasks.",
+        "# TYPE secflow_dfa_cluster_tasks_running gauge",
+        f"secflow_dfa_cluster_tasks_running {status_counts.get('running', 0)}",
+        "# HELP secflow_dfa_cluster_tasks_terminal Terminal tasks.",
+        "# TYPE secflow_dfa_cluster_tasks_terminal gauge",
+        f"secflow_dfa_cluster_tasks_terminal {finished_count}",
+        "# HELP secflow_dfa_cluster_workers Worker counts by state.",
+        "# TYPE secflow_dfa_cluster_workers gauge",
+        f'secflow_dfa_cluster_workers{{state="configured"}} {configured_workers}',
+        "# HELP secflow_dfa_cluster_worker_slots Worker slot counts by kind.",
+        "# TYPE secflow_dfa_cluster_worker_slots gauge",
+        f'secflow_dfa_cluster_worker_slots{{kind="capacity"}} {configured_slots}',
+        f'secflow_dfa_cluster_worker_slots{{kind="busy"}} {busy_slots}',
+        f'secflow_dfa_cluster_worker_slots{{kind="free"}} {free_slots}',
+        "# HELP secflow_dfa_cluster_worker_capacity_per_pod Configured per-worker task capacity.",
+        "# TYPE secflow_dfa_cluster_worker_capacity_per_pod gauge",
+        f"secflow_dfa_cluster_worker_capacity_per_pod {configured_capacity_per_worker}",
+        "# HELP secflow_dfa_cluster_queue_wait_seconds Queue wait duration aggregated over tasks.",
+        "# TYPE secflow_dfa_cluster_queue_wait_seconds summary",
+        f"secflow_dfa_cluster_queue_wait_seconds_count {queue_count}",
+        f"secflow_dfa_cluster_queue_wait_seconds_sum {_fmt(queue_sum)}",
+        "# HELP secflow_dfa_cluster_execution_seconds Execution duration aggregated over tasks.",
+        "# TYPE secflow_dfa_cluster_execution_seconds summary",
+        f"secflow_dfa_cluster_execution_seconds_count {execution_count}",
+        f"secflow_dfa_cluster_execution_seconds_sum {_fmt(execution_sum)}",
+        "# HELP secflow_dfa_cluster_turnaround_seconds End-to-end turnaround duration aggregated over tasks.",
+        "# TYPE secflow_dfa_cluster_turnaround_seconds summary",
+        f"secflow_dfa_cluster_turnaround_seconds_count {turnaround_count}",
+        f"secflow_dfa_cluster_turnaround_seconds_sum {_fmt(turnaround_sum)}",
+        "# HELP secflow_dfa_cluster_rounds Aggregated round count snapshot.",
+        "# TYPE secflow_dfa_cluster_rounds gauge",
+        f"secflow_dfa_cluster_rounds {round_total}",
+        "# HELP secflow_dfa_cluster_judges Aggregated judge count snapshot.",
+        "# TYPE secflow_dfa_cluster_judges gauge",
+        f"secflow_dfa_cluster_judges {judge_total}",
+        "# HELP secflow_dfa_cluster_sessions Aggregated session count snapshot.",
+        "# TYPE secflow_dfa_cluster_sessions gauge",
+        f"secflow_dfa_cluster_sessions {session_gauge}",
+        "# HELP secflow_dfa_cluster_leased_tasks Active leased task count.",
+        "# TYPE secflow_dfa_cluster_leased_tasks gauge",
+        f"secflow_dfa_cluster_leased_tasks {leased_tasks}",
+        "# HELP secflow_dfa_cluster_stale_leases Expired lease count for owned tasks.",
+        "# TYPE secflow_dfa_cluster_stale_leases gauge",
+        f"secflow_dfa_cluster_stale_leases {stale_leases}",
+        "# HELP secflow_dfa_cluster_dispatcher_enabled Dispatcher feature enabled on this scrape source.",
+        "# TYPE secflow_dfa_cluster_dispatcher_enabled gauge",
+        f"secflow_dfa_cluster_dispatcher_enabled {dispatcher_running}",
+        "# HELP secflow_dfa_cluster_executor_enabled Executor feature enabled on this scrape source.",
+        "# TYPE secflow_dfa_cluster_executor_enabled gauge",
+        f"secflow_dfa_cluster_executor_enabled {executor_running}",
+        "# HELP secflow_dfa_cluster_heartbeat_live_tasks Running tasks with fresh heartbeat.",
+        "# TYPE secflow_dfa_cluster_heartbeat_live_tasks gauge",
+        f"secflow_dfa_cluster_heartbeat_live_tasks {heartbeat_live}",
+        "# HELP secflow_dfa_cluster_heartbeat_stale_tasks Running tasks with stale heartbeat.",
+        "# TYPE secflow_dfa_cluster_heartbeat_stale_tasks gauge",
+        f"secflow_dfa_cluster_heartbeat_stale_tasks {heartbeat_stale}",
+        "# HELP secflow_dfa_cluster_heartbeat_age_seconds_max Max heartbeat age in seconds.",
+        "# TYPE secflow_dfa_cluster_heartbeat_age_seconds_max gauge",
+        f"secflow_dfa_cluster_heartbeat_age_seconds_max {_fmt(heartbeat_age_max)}",
+        "# HELP secflow_dfa_cluster_retry_count Aggregated retry count derived from extra rounds.",
+        "# TYPE secflow_dfa_cluster_retry_count gauge",
+        f"secflow_dfa_cluster_retry_count {retry_total}",
+        "# HELP secflow_dfa_cluster_timeout_count Timeout-classified terminal tasks.",
+        "# TYPE secflow_dfa_cluster_timeout_count gauge",
+        f"secflow_dfa_cluster_timeout_count {timeout_total}",
+        "# HELP secflow_dfa_cluster_cancel_count Cancelled tasks.",
+        "# TYPE secflow_dfa_cluster_cancel_count gauge",
+        f"secflow_dfa_cluster_cancel_count {cancel_total}",
+        "# HELP secflow_dfa_cluster_failure_category Failure distribution by category.",
+        "# TYPE secflow_dfa_cluster_failure_category gauge",
     ])
     for category in sorted(failure_category_counts):
-        lines.append(f"secflow_dfa_failure_category_total{_labels(category=category)} {failure_category_counts[category]}")
+        lines.append(f"secflow_dfa_cluster_failure_category{_labels(category=category)} {failure_category_counts[category]}")
     lines.extend([
-        "# HELP secflow_dfa_token_input_total Aggregated input tokens.",
-        "# TYPE secflow_dfa_token_input_total counter",
-        f"secflow_dfa_token_input_total {token_input_total}",
-        "# HELP secflow_dfa_token_output_total Aggregated output tokens.",
-        "# TYPE secflow_dfa_token_output_total counter",
-        f"secflow_dfa_token_output_total {token_output_total}",
-        "# HELP secflow_dfa_token_cost_total Aggregated token cost.",
-        "# TYPE secflow_dfa_token_cost_total counter",
-        f"secflow_dfa_token_cost_total {_fmt(token_cost_total)}",
-        "# HELP secflow_dfa_token_input_running Current running-task input tokens snapshot.",
-        "# TYPE secflow_dfa_token_input_running gauge",
-        f"secflow_dfa_token_input_running {token_input_running}",
-        "# HELP secflow_dfa_token_output_running Current running-task output tokens snapshot.",
-        "# TYPE secflow_dfa_token_output_running gauge",
-        f"secflow_dfa_token_output_running {token_output_running}",
-        "# HELP secflow_dfa_token_cost_running Current running-task token cost snapshot.",
-        "# TYPE secflow_dfa_token_cost_running gauge",
-        f"secflow_dfa_token_cost_running {_fmt(token_cost_running)}",
-        "# HELP secflow_dfa_round_duration_seconds Aggregated round duration.",
-        "# TYPE secflow_dfa_round_duration_seconds summary",
-        f"secflow_dfa_round_duration_seconds_count {round_total}",
-        f"secflow_dfa_round_duration_seconds_sum {_fmt(round_duration_sum)}",
-        "# HELP secflow_dfa_judge_duration_seconds Aggregated judge duration.",
-        "# TYPE secflow_dfa_judge_duration_seconds summary",
-        f"secflow_dfa_judge_duration_seconds_count {judge_total}",
-        f"secflow_dfa_judge_duration_seconds_sum {_fmt(judge_duration_sum)}",
-        "# HELP secflow_dfa_function_total Aggregated function analysis count.",
-        "# TYPE secflow_dfa_function_total counter",
-        f"secflow_dfa_function_total {function_total}",
-        "# HELP secflow_dfa_total_duration_accumulated_seconds Aggregated cumulative total_duration_ms converted to seconds.",
-        "# TYPE secflow_dfa_total_duration_accumulated_seconds counter",
-        f"secflow_dfa_total_duration_accumulated_seconds {_fmt(cumulative_duration_total)}",
-        "# HELP secflow_dfa_wall_clock_duration_seconds Aggregated wall-clock task duration in seconds.",
-        "# TYPE secflow_dfa_wall_clock_duration_seconds counter",
-        f"secflow_dfa_wall_clock_duration_seconds {_fmt(wall_clock_duration_total)}",
-        "# HELP secflow_dfa_trace_depth_max Maximum trace depth observed from stage events.",
-        "# TYPE secflow_dfa_trace_depth_max gauge",
-        f"secflow_dfa_trace_depth_max {trace_depth_max}",
-        "# HELP secflow_dfa_trace_callee_total Aggregated trace callee count observed from stage events.",
-        "# TYPE secflow_dfa_trace_callee_total counter",
-        f"secflow_dfa_trace_callee_total {trace_callee_total}",
-        "# HELP secflow_dfa_dispatch_status Aggregated dispatch status count.",
-        "# TYPE secflow_dfa_dispatch_status gauge",
+        "# HELP secflow_dfa_cluster_token_usage Aggregated token usage snapshot.",
+        "# TYPE secflow_dfa_cluster_token_usage gauge",
+        f'secflow_dfa_cluster_token_usage{{type="input"}} {token_input_total}',
+        f'secflow_dfa_cluster_token_usage{{type="output"}} {token_output_total}',
+        f'secflow_dfa_cluster_token_usage{{type="cache_read"}} {token_cache_read_total}',
+        f'secflow_dfa_cluster_token_usage{{type="cache_write"}} {token_cache_write_total}',
+        f'secflow_dfa_cluster_token_usage{{type="total"}} {token_input_total + token_output_total + token_cache_read_total + token_cache_write_total}',
+        "# HELP secflow_dfa_cluster_token_cost Aggregated token cost snapshot.",
+        "# TYPE secflow_dfa_cluster_token_cost gauge",
+        f"secflow_dfa_cluster_token_cost {_fmt(token_cost_total)}",
+        "# HELP secflow_dfa_cluster_running_token_usage Running-task token usage snapshot.",
+        "# TYPE secflow_dfa_cluster_running_token_usage gauge",
+        f'secflow_dfa_cluster_running_token_usage{{type="input"}} {token_input_running}',
+        f'secflow_dfa_cluster_running_token_usage{{type="output"}} {token_output_running}',
+        f'secflow_dfa_cluster_running_token_usage{{type="total"}} {token_input_running + token_output_running}',
+        "# HELP secflow_dfa_cluster_running_token_cost Running-task token cost snapshot.",
+        "# TYPE secflow_dfa_cluster_running_token_cost gauge",
+        f"secflow_dfa_cluster_running_token_cost {_fmt(token_cost_running)}",
+        "# HELP secflow_dfa_cluster_round_duration_seconds Aggregated round duration.",
+        "# TYPE secflow_dfa_cluster_round_duration_seconds summary",
+        f"secflow_dfa_cluster_round_duration_seconds_count {round_total}",
+        f"secflow_dfa_cluster_round_duration_seconds_sum {_fmt(round_duration_sum)}",
+        "# HELP secflow_dfa_cluster_judge_duration_seconds Aggregated judge duration.",
+        "# TYPE secflow_dfa_cluster_judge_duration_seconds summary",
+        f"secflow_dfa_cluster_judge_duration_seconds_count {judge_total}",
+        f"secflow_dfa_cluster_judge_duration_seconds_sum {_fmt(judge_duration_sum)}",
+        "# HELP secflow_dfa_cluster_functions Aggregated function analysis count snapshot.",
+        "# TYPE secflow_dfa_cluster_functions gauge",
+        f"secflow_dfa_cluster_functions {function_total}",
+        "# HELP secflow_dfa_cluster_total_duration_accumulated_seconds Aggregated cumulative total_duration_ms converted to seconds.",
+        "# TYPE secflow_dfa_cluster_total_duration_accumulated_seconds gauge",
+        f"secflow_dfa_cluster_total_duration_accumulated_seconds {_fmt(cumulative_duration_total)}",
+        "# HELP secflow_dfa_cluster_wall_clock_duration_seconds Aggregated wall-clock task duration in seconds.",
+        "# TYPE secflow_dfa_cluster_wall_clock_duration_seconds gauge",
+        f"secflow_dfa_cluster_wall_clock_duration_seconds {_fmt(wall_clock_duration_total)}",
+        "# HELP secflow_dfa_cluster_trace_depth_max Maximum trace depth observed from stage events.",
+        "# TYPE secflow_dfa_cluster_trace_depth_max gauge",
+        f"secflow_dfa_cluster_trace_depth_max {trace_depth_max}",
+        "# HELP secflow_dfa_cluster_trace_callees Aggregated trace callee count observed from stage events.",
+        "# TYPE secflow_dfa_cluster_trace_callees gauge",
+        f"secflow_dfa_cluster_trace_callees {trace_callee_total}",
+        "# HELP secflow_dfa_cluster_dispatch_status Aggregated dispatch status count.",
+        "# TYPE secflow_dfa_cluster_dispatch_status gauge",
     ])
     for dispatch_status in sorted(dispatch_counts):
-        lines.append(f"secflow_dfa_dispatch_status{_labels(status=dispatch_status)} {dispatch_counts[dispatch_status]}")
+        lines.append(f"secflow_dfa_cluster_dispatch_status{_labels(status=dispatch_status)} {dispatch_counts[dispatch_status]}")
     _append_ai_alias_metrics(
         lines,
-        prefix="secflow_dfa",
-        worker_count=local_running,
+        prefix="secflow_dfa_cluster",
+        worker_count=status_counts.get("running", 0),
         judge_count=judge_total,
         session_total=session_gauge,
         round_total=round_total,

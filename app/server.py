@@ -47,7 +47,7 @@ from sse_starlette.sse import EventSourceResponse
 
 from .config import build_task_config, get_service_yaml, load_service_config
 from .logging_utils import configure_container_logging
-from .metrics import observe_request as observe_metrics_request, render_metrics
+from .metrics import observe_request as observe_metrics_request, render_aggregate_metrics, render_local_metrics
 from .models import SwarmEvent, TaskResult, TaskStatus, make_id
 from .orchestrator import Orchestrator
 from .runtime_context import (
@@ -250,7 +250,12 @@ def _get_svc_config():
 @app.get("/metrics")
 @app.get("/api/app/dataflow-analyse/metrics", include_in_schema=False)
 async def metrics():
-    return PlainTextResponse(render_metrics(), media_type="text/plain; version=0.0.4; charset=utf-8")
+    return PlainTextResponse(render_local_metrics(), media_type="text/plain; version=0.0.4; charset=utf-8")
+
+
+@app.get("/api/app/dataflow-analyse/metrics/aggregate", include_in_schema=False)
+async def aggregate_metrics():
+    return PlainTextResponse(render_aggregate_metrics(), media_type="text/plain; version=0.0.4; charset=utf-8")
 
 
 # ─── 请求体 ──────────────────────────────────────────────────────────────────
