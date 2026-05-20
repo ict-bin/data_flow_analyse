@@ -40,6 +40,12 @@ _MIGRATIONS = [
     Migration(
         kind="column",
         table_name="secflow_app_dfa_tasks",
+        name="latest_abnormal_reason_json",
+        statement="ALTER TABLE secflow_app_dfa_tasks ADD COLUMN latest_abnormal_reason_json JSON NULL",
+    ),
+    Migration(
+        kind="column",
+        table_name="secflow_app_dfa_tasks",
         name="prompt_template_id",
         statement="ALTER TABLE secflow_app_dfa_tasks ADD COLUMN prompt_template_id VARCHAR(64) NULL",
     ),
