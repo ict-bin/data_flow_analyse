@@ -52,13 +52,13 @@ from .models import SwarmEvent, TaskResult, TaskStatus, make_id
 from .orchestrator import Orchestrator
 from .runtime_context import (
     DISPATCHER_ENABLED,
-    DISPATCH_POLL_INTERVAL_SECONDS,
     EXECUTOR_ENABLED,
     INSTANCE_ID,
     PUBLIC_API_ENABLED,
     REGISTRY_ENABLED,
     ROLE,
 )
+from .service.runtime_bootstrap import get_runtime_bootstrap
 from .service.task_service import get_task_service
 from .time_utils import now_local
 from .logging_utils import log_event
@@ -88,101 +88,10 @@ class TaskEntry:
 
 
 _tasks: dict[str, TaskEntry] = {}
-_dispatcher_task: asyncio.Task | None = None
-_dispatcher_stop = asyncio.Event()
-_startup_task: asyncio.Task | None = None
-_startup_ready = asyncio.Event()
-_startup_phase = "booting"
-_startup_error: str | None = None
 
 
 def _forbidden_for_role(feature: str) -> HTTPException:
     return HTTPException(status_code=503, detail=f"{feature} disabled for role={ROLE}")
-
-
-async def _bootstrap_management_plane(app: FastAPI) -> None:
-    global _dispatcher_task, _startup_phase, _startup_error
-
-    svc_yaml = get_service_yaml()
-    db_url = svc_yaml.database.url
-
-    try:
-        _startup_phase = "db_init"
-        log_event(logger, logging.INFO, "startup phase begin", event="startup_phase_begin", phase=_startup_phase)
-
-        from .db import init_db
-        await asyncio.wait_for(
-            asyncio.to_thread(
-                init_db,
-                db_url,
-                svc_yaml.database.pool_size,
-                svc_yaml.database.max_overflow,
-            ),
-            timeout=120,
-        )
-        logger.info("DB initialized: %s:%s/%s", svc_yaml.database.host, svc_yaml.database.port, svc_yaml.database.name)
-
-        if PUBLIC_API_ENABLED:
-            _startup_phase = "router_init"
-            log_event(logger, logging.INFO, "startup phase begin", event="startup_phase_begin", phase=_startup_phase)
-            from .api import router as mgmt_router
-            app.include_router(mgmt_router)
-
-        if REGISTRY_ENABLED:
-            _startup_phase = "registry_register"
-            log_event(logger, logging.INFO, "startup phase begin", event="startup_phase_begin", phase=_startup_phase)
-            from .service.registry_service import get_registry_service
-            _registry = get_registry_service()
-            await asyncio.wait_for(_registry.register(), timeout=15)
-            _registry.start()
-
-        if DISPATCHER_ENABLED:
-            _startup_phase = "dispatcher_start"
-            log_event(logger, logging.INFO, "startup phase begin", event="startup_phase_begin", phase=_startup_phase)
-
-            async def _dispatcher_loop() -> None:
-                svc = get_task_service()
-                while not _dispatcher_stop.is_set():
-                    try:
-                        claimed = await svc.dispatch_until_full()
-                        if claimed:
-                            log_event(
-                                logger,
-                                logging.INFO,
-                                "dispatcher claimed tasks",
-                                event="dispatcher_claim_batch",
-                                owner_id=INSTANCE_ID,
-                                claimed_count=claimed,
-                                current_running=svc.local_running_task_count(),
-                            )
-                    except Exception as exc:
-                        logger.warning("dispatcher loop failed on %s: %s", INSTANCE_ID, exc, exc_info=True)
-                    await asyncio.sleep(DISPATCH_POLL_INTERVAL_SECONDS)
-
-            _dispatcher_stop.clear()
-            _dispatcher_task = asyncio.create_task(_dispatcher_loop(), name="dfa_dispatcher")
-        _startup_phase = "ready"
-        _startup_ready.set()
-        log_event(
-            logger,
-            logging.INFO,
-            "startup ready",
-            event="startup_ready",
-            owner_id=INSTANCE_ID,
-            role=ROLE,
-            public_api_enabled=PUBLIC_API_ENABLED,
-            dispatcher_enabled=DISPATCHER_ENABLED,
-            executor_enabled=EXECUTOR_ENABLED,
-            registry_enabled=REGISTRY_ENABLED,
-        )
-        if DISPATCHER_ENABLED:
-            log_event(logger, logging.INFO, "dispatcher started", event="dispatcher_started", owner_id=INSTANCE_ID)
-    except Exception as exc:
-        _startup_phase = "error"
-        _startup_error = str(exc)
-        logger.exception("startup bootstrap failed: %s", exc)
-        log_event(logger, logging.ERROR, "startup bootstrap failed", event="startup_bootstrap_failed",
-                  phase=_startup_phase, error=str(exc))
 
 
 # ─── Lifespan ────────────────────────────────────────────────────────────────
@@ -190,34 +99,11 @@ async def _bootstrap_management_plane(app: FastAPI) -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # --- startup ---
-    global _startup_task, _startup_phase, _startup_error
-    _startup_phase = "booting"
-    _startup_error = None
-    _startup_ready.clear()
-    _dispatcher_stop.clear()
-    _startup_task = asyncio.create_task(_bootstrap_management_plane(app), name="dfa_startup")
+    await get_runtime_bootstrap().start(app)
 
     yield
     # --- shutdown ---
-    _dispatcher_stop.set()
-    if _startup_task is not None and not _startup_task.done():
-        _startup_task.cancel()
-        try:
-            await _startup_task
-        except asyncio.CancelledError:
-            pass
-    if _dispatcher_task is not None:
-        _dispatcher_task.cancel()
-        try:
-            await _dispatcher_task
-        except asyncio.CancelledError:
-            pass
-    log_event(logger, logging.INFO, "dispatcher stopped", event="dispatcher_stopped", owner_id=INSTANCE_ID)
-    try:
-        from .service.registry_service import get_registry_service
-        get_registry_service().stop()
-    except Exception:
-        pass
+    await get_runtime_bootstrap().stop()
 
 
 app = FastAPI(title="data_flow_analyse", version="2.0.0", lifespan=lifespan)
@@ -271,6 +157,7 @@ class AnalyseRequest(BaseModel):
 @app.get("/health")
 @app.get("/api/app/dataflow-analyse/health")
 async def health():
+    bootstrap = get_runtime_bootstrap().status()
     payload = {
         "status": "ok",
         "instance_id": INSTANCE_ID,
@@ -281,15 +168,18 @@ async def health():
         "registry_enabled": REGISTRY_ENABLED,
         "active": sum(1 for t in _tasks.values() if t.result is None),
         "completed": sum(1 for t in _tasks.values() if t.result is not None),
-        "dispatcher_running": bool(_dispatcher_task and not _dispatcher_task.done()),
+        "dispatcher_running": get_runtime_bootstrap().dispatcher_running(),
         "leased_tasks": get_task_service().local_running_task_count(),
-        "startup_phase": _startup_phase,
-        "startup_ready": _startup_ready.is_set(),
-        "startup_error": _startup_error,
+        "startup_phase": bootstrap["phase"],
+        "startup_ready": bootstrap["ready"],
+        "startup_error": bootstrap["error"],
+        "db_ready": bootstrap["db_ready"],
+        "management_api_ready": bootstrap["management_api_ready"],
+        "bootstrap_attempts": bootstrap["attempts"],
     }
-    if _startup_ready.is_set():
+    if bootstrap["ready"]:
         return payload
-    payload["status"] = "starting" if _startup_error is None else "error"
+    payload["status"] = "starting" if bootstrap["error"] is None else "error"
     return JSONResponse(status_code=503, content=payload)
 
 
