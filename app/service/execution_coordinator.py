@@ -39,7 +39,7 @@ def claim_one_runnable_task(db: Session, owner_id: str) -> ClaimedTask | None:
         db.query(AppDfaTask)
         .filter(
             AppDfaTask.is_deleted.is_(False),
-            AppDfaTask.status.in_(["pending", "running"]),
+            AppDfaTask.status == "pending",
             ((AppDfaTask.execution_lease_until.is_(None)) | (AppDfaTask.execution_lease_until < now)),
         )
         .order_by(AppDfaTask.created_at.asc(), AppDfaTask.id.asc())
@@ -52,7 +52,7 @@ def claim_one_runnable_task(db: Session, owner_id: str) -> ClaimedTask | None:
         .filter(
             AppDfaTask.id == candidate.id,
             AppDfaTask.is_deleted.is_(False),
-            AppDfaTask.status.in_(["pending", "running"]),
+            AppDfaTask.status == "pending",
             ((AppDfaTask.execution_lease_until.is_(None)) | (AppDfaTask.execution_lease_until < now)),
         )
         .update(

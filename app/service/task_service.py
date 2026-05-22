@@ -1079,7 +1079,10 @@ class TaskService:
         row.status = "cancelled"
         row.finished_at = now_local()
         row.control_version = int(row.control_version or 0) + 1
-        row.execution_lease_until = now_local()
+        row.execution_owner_id = None
+        row.execution_epoch = int(row.execution_epoch or 0) + 1
+        row.execution_lease_until = None
+        row.execution_heartbeat_at = None
         row.dispatch_status = None
         reason, changed = _sync_task_abnormal_reason(row)
         _record_abnormal_reason(row, reason, changed=changed)
@@ -1223,6 +1226,10 @@ class TaskService:
                       task_id=task_id, project_id=row.project_id, owner_id=INSTANCE_ID, epoch=epoch, control_version=control_version, status="running")
             db.expire(row)
             db.refresh(row)
+            if row.status == "cancelled" or not still_owner(db, task_id, INSTANCE_ID, epoch, control_version):
+                log_event(logger, logging.INFO, "task lost ownership before llm sync", event="task_not_owner_pre_llm_sync",
+                          task_id=task_id, owner_id=INSTANCE_ID, epoch=epoch, control_version=control_version, status=row.status)
+                return
             _write_input_manifest(row)
 
             _write_models_json_from_db(db)

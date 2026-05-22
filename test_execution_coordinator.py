@@ -77,6 +77,25 @@ class ExecutionCoordinatorTests(unittest.TestCase):
             db1.close()
             db2.close()
 
+    def test_claim_does_not_reacquire_running_task_with_expired_lease(self):
+        self._insert_task(
+            status="running",
+            execution_owner_id="pod-old",
+            execution_lease_until=now_local(),
+            execution_epoch=3,
+            control_version=2,
+            dispatch_status="running",
+        )
+        db = self._session()
+        try:
+            claimed = claim_one_runnable_task(db, "pod-new")
+            self.assertIsNone(claimed)
+            row = db.query(AppDfaTask).filter_by(task_id="dfa_test_1").first()
+            self.assertEqual(row.execution_owner_id, "pod-old")
+            self.assertEqual(row.status, "running")
+        finally:
+            db.close()
+
     def test_begin_and_commit_terminal_state_require_current_owner(self):
         self._insert_task()
         db = self._session()
