@@ -34,6 +34,8 @@ class AppDfaTask(Base):
     task_description: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
     input_path: Mapped[str] = mapped_column(String(1024), nullable=False)
+    module_input_path: Mapped[Optional[str]] = mapped_column(String(1024), nullable=True)
+    source_root_path: Mapped[Optional[str]] = mapped_column(String(1024), nullable=True)
     output_path: Mapped[Optional[str]] = mapped_column(String(1024), nullable=True)
 
     prompt_template_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)

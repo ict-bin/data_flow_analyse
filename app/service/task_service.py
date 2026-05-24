@@ -354,6 +354,46 @@ def _path_metadata(path_value: str | None) -> dict:
         }
 
 
+def _validate_fileserver_path(path_value: str, *, fs_root: str, field_name: str, must_exist: bool = True, must_be_dir: bool = False) -> str:
+    from fastapi import HTTPException as _HTTPException
+
+    raw = str(path_value or "").strip()
+    if not raw:
+        raise _HTTPException(400, f"{field_name} 不能为空")
+    normalized = os.path.realpath(os.path.abspath(raw))
+    normalized_fs = os.path.realpath(os.path.abspath(fs_root))
+    if not normalized.startswith(normalized_fs + os.sep) and normalized != normalized_fs:
+        raise _HTTPException(400, f"{field_name} 必须位于 {fs_root} 下")
+    if must_exist and not os.path.exists(normalized):
+        raise _HTTPException(400, f"{field_name} 不存在: {raw}")
+    if must_be_dir and os.path.exists(normalized) and not os.path.isdir(normalized):
+        raise _HTTPException(400, f"{field_name} 必须是目录: {raw}")
+    return normalized
+
+
+def _normalize_source_file_for_root(source_root_path: str, source_file: str) -> str:
+    from fastapi import HTTPException as _HTTPException
+
+    raw = str(source_file or "").strip().replace("\\", "/")
+    if not raw:
+        return ""
+    root = Path(os.path.realpath(os.path.abspath(source_root_path)))
+    marker = "/data/files/"
+    embedded_absolute = raw[raw.index(marker):] if marker in raw else None
+    candidate = Path(embedded_absolute or raw)
+    resolved = candidate.resolve() if candidate.is_absolute() else (root / candidate).resolve()
+    try:
+        relative = resolved.relative_to(root)
+    except Exception as exc:
+        raise _HTTPException(400, f"source_file 超出 source_root_path 范围: {source_file}") from exc
+    normalized = relative.as_posix().strip()
+    if not normalized or normalized == "." or any(part == ".." for part in relative.parts):
+        raise _HTTPException(400, f"source_file 非法: {source_file}")
+    if not resolved.is_file():
+        raise _HTTPException(400, f"source_file 对应文件不存在: {source_file}")
+    return normalized
+
+
 def _write_input_manifest(row: AppDfaTask) -> str | None:
     """Write task input metadata only; never copy original input contents."""
     path = _input_manifest_path(row)
@@ -373,6 +413,10 @@ def _write_input_manifest(row: AppDfaTask) -> str | None:
             "started_at": isoformat_local(row.started_at),
         },
         "input": _path_metadata(row.input_path),
+        "paths": {
+            "module_input_path": row.module_input_path or row.input_path,
+            "source_root_path": row.source_root_path or row.input_path,
+        },
         "prompt": {
             "template_id": row.prompt_template_id,
             "content_length": len(prompt),
@@ -382,6 +426,8 @@ def _write_input_manifest(row: AppDfaTask) -> str | None:
         "config": {
             "has_task_overrides": bool(row.task_config_json),
             "override_keys": sorted((row.task_config_json or {}).keys()),
+            "source_file": str((row.task_config_json or {}).get("source_file") or ""),
+            "definition_kind": str((row.task_config_json or {}).get("definition_kind") or ""),
         },
     }
     _write_json_atomic(path, payload)
@@ -955,7 +1001,8 @@ class TaskService:
         }
 
     def create_task(self, db: Session, *, project_id: str, task_name: str,
-                    input_path: str, output_path: Optional[str] = None,
+                    input_path: str, module_input_path: Optional[str] = None,
+                    source_root_path: Optional[str] = None, output_path: Optional[str] = None,
                     task_description: Optional[str] = None,
                     prompt_template_id: Optional[str] = None,
                     prompt_content: str, created_by: Optional[str] = None,
@@ -969,22 +1016,50 @@ class TaskService:
                     parent_stage_item_key: Optional[str] = None) -> dict:
         task_id = f"dfa_{uuid.uuid4().hex[:16]}"
         _fs_base = os.environ.get("FILESERVER_ROOT", "/data/files")
-        # Validate paths are under FILESERVER_ROOT to prevent path traversal
-        from fastapi import HTTPException as _HTTPException
-        _abs_input = os.path.realpath(os.path.abspath(input_path))
-        _abs_fs = os.path.realpath(os.path.abspath(_fs_base))
-        if not _abs_input.startswith(_abs_fs + os.sep) and _abs_input != _abs_fs:
-            raise _HTTPException(400, f"input_path 必须位于 {_fs_base} 下")
+        effective_module_input_path = module_input_path or input_path
+        normalized_module_input_path = _validate_fileserver_path(
+            effective_module_input_path,
+            fs_root=_fs_base,
+            field_name="module_input_path",
+            must_exist=True,
+            must_be_dir=True,
+        )
+        normalized_source_root_path = _validate_fileserver_path(
+            source_root_path or effective_module_input_path,
+            fs_root=_fs_base,
+            field_name="source_root_path",
+            must_exist=True,
+            must_be_dir=True,
+        )
+        normalized_task_config = dict(task_config_json or {})
+        if normalized_task_config.get("source_file"):
+            normalized_task_config["source_file"] = _normalize_source_file_for_root(
+                normalized_source_root_path,
+                str(normalized_task_config.get("source_file") or ""),
+            )
+        raw_definition_kind = str(normalized_task_config.get("definition_kind") or "").strip().lower()
+        if raw_definition_kind:
+            if raw_definition_kind not in {"definition", "declaration", "unknown"}:
+                from fastapi import HTTPException as _HTTPException
+
+                raise _HTTPException(400, f"definition_kind 非法: {raw_definition_kind}")
+            normalized_task_config["definition_kind"] = raw_definition_kind
         effective_output = output_path or f"{_fs_base}/{project_id}/app/secflow-app-dataflow-analyse"
-        _abs_output = os.path.realpath(os.path.abspath(effective_output))
-        if not _abs_output.startswith(_abs_fs + os.sep) and _abs_output != _abs_fs:
-            raise _HTTPException(400, f"output_path 必须位于 {_fs_base} 下")
+        normalized_output = _validate_fileserver_path(
+            effective_output,
+            fs_root=_fs_base,
+            field_name="output_path",
+            must_exist=False,
+            must_be_dir=False,
+        )
         row = AppDfaTask(
             task_id=task_id, project_id=project_id, task_name=task_name,
-            task_description=task_description, input_path=input_path,
-            output_path=effective_output, prompt_template_id=prompt_template_id,
+            task_description=task_description, input_path=normalized_module_input_path,
+            module_input_path=normalized_module_input_path,
+            source_root_path=normalized_source_root_path,
+            output_path=normalized_output, prompt_template_id=prompt_template_id,
             prompt_content=prompt_content, status="pending", created_by=created_by,
-            task_config_json=task_config_json,
+            task_config_json=normalized_task_config or None,
             task_origin_type=str(task_origin_type or "").strip() or "manual",
             parent_project_id=parent_project_id,
             parent_task_id=parent_task_id,
@@ -1263,7 +1338,7 @@ class TaskService:
             elif epoch_run_root is not None:
                 epoch_run_root.mkdir(parents=True, exist_ok=True)
 
-            cfg = build_task_config(svc, row.prompt_content, cwd=row.input_path)
+            cfg = build_task_config(svc, row.prompt_content, cwd=row.source_root_path or row.input_path)
             if tcfg.get("source_file"):
                 cfg.source_file = str(tcfg["source_file"])
             if tcfg.get("function_name"):
@@ -1456,6 +1531,8 @@ class TaskService:
                 AppDfaTask.task_name,
                 AppDfaTask.task_description,
                 AppDfaTask.input_path,
+                AppDfaTask.module_input_path,
+                AppDfaTask.source_root_path,
                 AppDfaTask.output_path,
                 AppDfaTask.prompt_template_id,
                 AppDfaTask.status,
@@ -1479,11 +1556,30 @@ class TaskService:
         def fmt(dt: datetime | None) -> str | None:
             return isoformat_local(dt)
         abnormal_reason = _task_abnormal_reason(row)
+        task_root = str(Path(row.output_path) / row.task_id) if row.output_path else None
+        run_root = str(Path(task_root) / "run") if task_root else None
+        workspace_root = str(Path(run_root) / "epochs") if run_root else None
         return {
             **_origin_payload(row),
             "task_id": row.task_id, "project_id": row.project_id,
             "task_name": row.task_name, "task_description": row.task_description,
-            "input_path": row.input_path, "output_path": row.output_path,
+            "input_path": row.input_path,
+            "module_input_path": row.module_input_path or row.input_path,
+            "source_root_path": row.source_root_path or row.input_path,
+            "output_path": row.output_path,
+            "task_root": task_root,
+            "run_root": run_root,
+            "workspace_root": workspace_root,
+            "input_summary": {
+                "module_input_path": row.module_input_path or row.input_path,
+                "source_root_path": row.source_root_path or row.input_path,
+            } if include_heavy else None,
+            "output_summary": {
+                "latest_workspace_root": workspace_root,
+                "result_path": str(Path(run_root) / "result.json") if run_root else None,
+                "dataflow_output_path": str(Path(task_root) / "output" / "dataflow") if task_root else None,
+            } if include_heavy else None,
+            "definition_kind": str((row.task_config_json or {}).get("definition_kind") or ""),
             "prompt_template_id": row.prompt_template_id,
             "prompt_content": row.prompt_content if include_heavy else None, "status": row.status,
             "error": row.error,

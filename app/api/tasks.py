@@ -28,6 +28,8 @@ class TaskCreateRequest(BaseModel):
     project_id: str
     task_name: str
     input_path: str
+    module_input_path: Optional[str] = None
+    source_root_path: Optional[str] = None
     output_path: Optional[str] = None
     task_description: Optional[str] = None
     prompt_template_id: Optional[str] = None
@@ -35,6 +37,7 @@ class TaskCreateRequest(BaseModel):
     source_file: Optional[str] = None
     function_name: Optional[str] = None
     line_hint: Optional[str] = None
+    definition_kind: Optional[str] = None
     taint_params: list[str] = []
     function_description: Optional[str] = None
     function_description_source: Optional[str] = None
@@ -394,6 +397,8 @@ async def create_task(body: TaskCreateRequest, db: Session = Depends(get_db)):
         task_config_json["function_name"] = body.function_name
     if body.line_hint:
         task_config_json["line_hint"] = body.line_hint
+    if body.definition_kind:
+        task_config_json["definition_kind"] = str(body.definition_kind).strip()
     if body.taint_params:
         task_config_json["taint_params"] = [str(value).strip() for value in body.taint_params if str(value).strip()]
     if body.function_description:
@@ -422,6 +427,8 @@ async def create_task(body: TaskCreateRequest, db: Session = Depends(get_db)):
         project_id=body.project_id,
         task_name=body.task_name,
         input_path=body.input_path,
+        module_input_path=body.module_input_path,
+        source_root_path=body.source_root_path,
         output_path=body.output_path,
         task_description=body.task_description,
         prompt_template_id=body.prompt_template_id,

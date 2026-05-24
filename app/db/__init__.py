@@ -100,6 +100,18 @@ _MIGRATIONS = [
     Migration(
         kind="column",
         table_name="secflow_app_dfa_tasks",
+        name="module_input_path",
+        statement="ALTER TABLE secflow_app_dfa_tasks ADD COLUMN module_input_path VARCHAR(1024) NULL",
+    ),
+    Migration(
+        kind="column",
+        table_name="secflow_app_dfa_tasks",
+        name="source_root_path",
+        statement="ALTER TABLE secflow_app_dfa_tasks ADD COLUMN source_root_path VARCHAR(1024) NULL",
+    ),
+    Migration(
+        kind="column",
+        table_name="secflow_app_dfa_tasks",
         name="execution_owner_id",
         statement="ALTER TABLE secflow_app_dfa_tasks ADD COLUMN execution_owner_id VARCHAR(128) NULL",
     ),

@@ -53,6 +53,33 @@
 
 ---
 
+## 上游输入契约
+
+DFA 不再根据 `input_path` 猜测源码根目录，统一按下面的双路径契约执行：
+
+- `module_input_path`
+  - 定义：模块输入目录
+  - 内容：允许包含 `files.list`、模块报告、模块拆分索引等
+  - 用途：保留模块级上下文与排障信息
+- `source_root_path`
+  - 定义：真实源码根目录
+  - 要求：`source_file` 必须能作为它的相对路径解析到真实文件
+  - 用途：函数体提取、源码读取、后续 callee 分析
+- `source_file`
+  - 定义：相对于 `source_root_path` 的规范化相对路径
+  - 约束：不能是绝对路径，不能包含越界后的 `..`
+- `definition_kind`
+  - 允许值：`definition | declaration | unknown`
+  - 当前仅 `definition` 允许进入函数体提取
+
+兼容语义：
+
+- `input_path` 仍保留在 API 与数据库中，但其语义固定等同于 `module_input_path`
+- worker 真正的运行根目录固定为 `source_root_path`
+- 若 `source_root_path + source_file` 无法解析到真实文件，任务应直接进入 `invalid_input` 或创建时被拒绝，而不是退化为“未提取到有效函数体”
+
+---
+
 ## 执行流程
 
 ### 单函数分析（一轮）
