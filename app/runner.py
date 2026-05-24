@@ -132,6 +132,33 @@ def _should_retry(
     return failures <= max_retries
 
 
+async def _sleep_with_cancel(delay: float, cancel_event: asyncio.Event | None) -> bool:
+    if delay <= 0:
+        return not (cancel_event and cancel_event.is_set())
+    if cancel_event is None:
+        await asyncio.sleep(delay)
+        return True
+    if cancel_event.is_set():
+        return False
+    sleep_task = asyncio.create_task(asyncio.sleep(delay))
+    cancel_task = asyncio.create_task(cancel_event.wait())
+    done, pending = await asyncio.wait(
+        {sleep_task, cancel_task},
+        return_when=asyncio.FIRST_COMPLETED,
+    )
+    for task in pending:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+    if cancel_task in done:
+        with contextlib.suppress(asyncio.CancelledError):
+            await sleep_task
+        return False
+    with contextlib.suppress(asyncio.CancelledError):
+        await cancel_task
+    return True
+
+
 def _cmd_preview(args: list[str]) -> str:
     """命令预览（截断过长参数）。"""
     parts = []
@@ -709,7 +736,11 @@ async def _run_with_pi_retry(
                         f"\n❌ pi 进程失败 (exit={getattr(exc, 'exit_code', '?')})，"
                         f"{delay:.0f}s 后重试 ({label})...\n"
                     )
-                await asyncio.sleep(delay)
+                if not await _sleep_with_cancel(delay, cancel_event):
+                    _log_warn(f"pi 进程重试等待被取消 [{label}]")
+                    r = AgentResult()
+                    r.error = f"cancelled during pi retry backoff: {exc}"
+                    return r
                 continue
             else:
                 _log_error(f"pi 进程重试耗尽 [{label}]: {exc}")
@@ -951,7 +982,9 @@ async def _run_with_api_retry(
                         f"\n⚠️ Query engine 连接失效，{delay:.0f}s 后重试 "
                         f"({label})...\n"
                     )
-                await asyncio.sleep(delay)
+                if not await _sleep_with_cancel(delay, cancel_event):
+                    result.error = (result.error or "") + " [cancelled during query-engine retry backoff]"
+                    return result
                 continue
             _log_error(
                 f"query engine 401 重试耗尽 "
@@ -984,7 +1017,9 @@ async def _run_with_api_retry(
                 )
                 if on_stream:
                     on_stream(f"\n⚠️ {kind}错误，{delay:.0f}s 后重试 ({label})...\n")
-                await asyncio.sleep(delay)
+                if not await _sleep_with_cancel(delay, cancel_event):
+                    result.error = (result.error or "") + " [cancelled during api retry backoff]"
+                    return result
                 continue
             else:
                 _log_error(
@@ -1009,7 +1044,9 @@ async def _run_with_api_retry(
                         f"管道错误 [{api_attempt}/{_fmt_max(max_retries)}], {delay:.0f}s 后重试: "
                         f"{(result.error or '')[:200]}"
                     )
-                    await asyncio.sleep(delay)
+                    if not await _sleep_with_cancel(delay, cancel_event):
+                        result.error = (result.error or "") + " [cancelled during pipe retry backoff]"
+                        return result
                     continue
             _log_warn(
                 f"pi 退出码 {result.exit_code} (有输出，不重试): {result.error[:200]}"

@@ -24,6 +24,52 @@ def _overflow_result() -> runner.AgentResult:
 
 
 class RunAgentPromptFileTests(unittest.TestCase):
+    def test_sleep_with_cancel_stops_early_when_cancelled(self):
+        async def scenario():
+            cancel_event = asyncio.Event()
+
+            async def trigger_cancel():
+                await asyncio.sleep(0.01)
+                cancel_event.set()
+
+            asyncio.create_task(trigger_cancel())
+            return await runner._sleep_with_cancel(5, cancel_event)
+
+        completed = asyncio.run(scenario())
+        self.assertFalse(completed)
+
+    def test_pi_retry_backoff_exits_when_cancelled(self):
+        async def scenario():
+            cancel_event = asyncio.Event()
+
+            async def trigger_cancel():
+                await asyncio.sleep(0.01)
+                cancel_event.set()
+
+            asyncio.create_task(trigger_cancel())
+            return await runner._run_with_pi_retry(
+                args=["/usr/bin/pi"],
+                cwd=".",
+                env=None,
+                prompt="hello",
+                post_skill_prompt=None,
+                cancel_event=cancel_event,
+                on_stream=None,
+                max_retries=0,
+                retry_delay=0,
+                pi_max_retries=-1,
+                pi_retry_delay=5,
+            )
+
+        with patch.object(
+            runner,
+            "_run_with_api_retry",
+            side_effect=runner._PiProcessError("exit_code=-9: killed"),
+        ):
+            result = asyncio.run(scenario())
+
+        self.assertIn("cancelled during pi retry backoff", result.error or "")
+
     def test_run_agent_uses_prompt_file_instead_of_raw_argv(self):
         captured = {}
 
