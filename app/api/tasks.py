@@ -9,10 +9,12 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from fastapi import Depends, HTTPException, Query
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
 from app.db import get_db
+from app.time_utils import isoformat_local
+from app.service.worker_snapshot import build_worker_cluster_snapshot
 from app.service.session_index import build_session_catalog
 from app.service.task_service import generate_prompt_from_path, get_task_service
 
@@ -121,6 +123,47 @@ class TaskSessionIndexResponse(BaseModel):
     edges: List[TaskSessionIndexEdgeResponse] = []
     groups: List[TaskSessionIndexGroupResponse] = []
     warnings: List[str] = []
+
+
+class WorkerActiveJobResponse(BaseModel):
+    task_id: str
+    task_name: str
+    status: str
+    parent_task_id: str | None = None
+    parent_task_type: str | None = None
+    task_origin_type: str | None = None
+    input_path: str
+    started_at: str | None = None
+    updated_at: str | None = None
+    dispatch_status: str | None = None
+    execution_owner_id: str | None = None
+    execution_lease_until: str | None = None
+    execution_heartbeat_at: str | None = None
+    mapped: bool = True
+    mapping_reason: str = "matched_execution_owner"
+
+
+class WorkerCapacityResponse(BaseModel):
+    worker_id: str
+    host_name: str
+    healthy: bool
+    max_concurrent_jobs: int
+    running_jobs: int = 0
+    available_slots: int = 0
+    source: str = "lease_registry"
+    last_heartbeat_at: str | None = None
+    active_jobs: list[WorkerActiveJobResponse] = Field(default_factory=list)
+    error: str | None = None
+
+
+class WorkerClusterCapacityResponse(BaseModel):
+    worker_count: int = 0
+    total_capacity: int = 0
+    running_jobs: int = 0
+    queued_jobs: int = 0
+    available_slots: int = 0
+    updated_at: str | None = None
+    workers: list[WorkerCapacityResponse] = Field(default_factory=list)
 
 
 def _get_task_row(db: Session, task_id: str):
@@ -414,6 +457,56 @@ async def list_tasks(
         parent_stage_item_id=parent_stage_item_id,
         sort_by=sort_by,
         sort_order=sort_order,
+    )
+
+
+@router.get("/workers/cluster-capacity", response_model=WorkerClusterCapacityResponse)
+async def get_worker_cluster_capacity(
+    project_id: str = Query(...),
+    db: Session = Depends(get_db),
+):
+    snapshot = build_worker_cluster_snapshot(db, project_id=project_id)
+    return WorkerClusterCapacityResponse(
+        worker_count=snapshot.worker_count,
+        total_capacity=snapshot.total_capacity,
+        running_jobs=snapshot.running_jobs,
+        queued_jobs=snapshot.queued_jobs,
+        available_slots=snapshot.available_slots,
+        updated_at=isoformat_local(snapshot.updated_at),
+        workers=[
+            WorkerCapacityResponse(
+                worker_id=worker.worker_id,
+                host_name=worker.host_name,
+                healthy=worker.healthy,
+                max_concurrent_jobs=worker.max_concurrent_jobs,
+                running_jobs=worker.running_jobs,
+                available_slots=worker.available_slots,
+                source=worker.source,
+                last_heartbeat_at=isoformat_local(worker.last_heartbeat_at),
+                error=worker.error,
+                active_jobs=[
+                    WorkerActiveJobResponse(
+                        task_id=job.task_id,
+                        task_name=job.task_name,
+                        status=job.status,
+                        parent_task_id=job.parent_task_id,
+                        parent_task_type=job.parent_task_type,
+                        task_origin_type=job.task_origin_type,
+                        input_path=job.input_path,
+                        started_at=isoformat_local(job.started_at),
+                        updated_at=isoformat_local(job.updated_at),
+                        dispatch_status=job.dispatch_status,
+                        execution_owner_id=job.execution_owner_id,
+                        execution_lease_until=isoformat_local(job.execution_lease_until),
+                        execution_heartbeat_at=isoformat_local(job.execution_heartbeat_at),
+                        mapped=job.mapped,
+                        mapping_reason=job.mapping_reason,
+                    )
+                    for job in worker.active_jobs
+                ],
+            )
+            for worker in snapshot.workers
+        ],
     )
 
 

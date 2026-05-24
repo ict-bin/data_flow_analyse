@@ -22,6 +22,7 @@ from .runtime_context import (
     ROLE,
 )
 from .service.task_service import get_task_service
+from .service.worker_snapshot import build_worker_cluster_snapshot
 
 _REQUEST_LOCK = threading.Lock()
 _REQUEST_TOTAL = defaultdict(int)
@@ -145,11 +146,13 @@ def _render_cluster_task_metrics() -> list[str]:
 
     db_up = 0
     rows: list[AppDfaTask] = []
+    worker_snapshot = None
     try:
         db_gen = get_db()
         db: Session = next(db_gen)
         try:
             rows = db.query(AppDfaTask).filter(AppDfaTask.is_deleted.is_(False)).all()
+            worker_snapshot = build_worker_cluster_snapshot(db)
             db_up = 1
         finally:
             try:
@@ -419,6 +422,7 @@ def _render_cluster_task_metrics() -> list[str]:
     ])
     for dispatch_status in sorted(dispatch_counts):
         lines.append(f"secflow_dfa_cluster_dispatch_status{_labels(status=dispatch_status)} {dispatch_counts[dispatch_status]}")
+    lines.extend(_render_cluster_worker_detail_metrics(worker_snapshot))
     _append_ai_alias_metrics(
         lines,
         prefix="secflow_dfa_cluster",
@@ -442,6 +446,52 @@ def _render_cluster_task_metrics() -> list[str]:
         worker_duration_seconds=execution_sum,
         judge_duration_seconds=judge_duration_sum,
     )
+    return lines
+
+
+def _render_cluster_worker_detail_metrics(worker_snapshot) -> list[str]:
+    if worker_snapshot is None:
+        return []
+    lines = [
+        "# HELP secflow_dfa_cluster_worker_runtime Per-worker runtime snapshot derived from lease registry.",
+        "# TYPE secflow_dfa_cluster_worker_runtime gauge",
+        "# HELP secflow_dfa_cluster_worker_active_jobs Per-worker active job counts by task status.",
+        "# TYPE secflow_dfa_cluster_worker_active_jobs gauge",
+        "# HELP secflow_dfa_cluster_worker_last_heartbeat_timestamp_seconds Per-worker last heartbeat UNIX timestamp.",
+        "# TYPE secflow_dfa_cluster_worker_last_heartbeat_timestamp_seconds gauge",
+    ]
+    for worker in worker_snapshot.workers:
+        base_labels = {
+            "worker_id": worker.worker_id,
+            "host_name": worker.host_name or worker.worker_id,
+            "healthy": "true" if worker.healthy else "false",
+            "source": worker.source or "lease_registry",
+        }
+        lines.append(
+            f"secflow_dfa_cluster_worker_runtime{_labels(**base_labels, kind='capacity')} {worker.max_concurrent_jobs}"
+        )
+        lines.append(
+            f"secflow_dfa_cluster_worker_runtime{_labels(**base_labels, kind='running_jobs')} {worker.running_jobs}"
+        )
+        lines.append(
+            f"secflow_dfa_cluster_worker_runtime{_labels(**base_labels, kind='available_slots')} {worker.available_slots}"
+        )
+        heartbeat_ts = worker.last_heartbeat_at.timestamp() if worker.last_heartbeat_at else 0.0
+        lines.append(
+            f"secflow_dfa_cluster_worker_last_heartbeat_timestamp_seconds{_labels(worker_id=worker.worker_id, host_name=worker.host_name or worker.worker_id)} {_fmt(heartbeat_ts)}"
+        )
+        status_counts: dict[str, int] = defaultdict(int)
+        for job in worker.active_jobs:
+            status_counts[str(job.status or "unknown")] += 1
+        if not status_counts:
+            lines.append(
+                f"secflow_dfa_cluster_worker_active_jobs{_labels(worker_id=worker.worker_id, host_name=worker.host_name or worker.worker_id, status='none')} 0"
+            )
+        else:
+            for status, count in sorted(status_counts.items()):
+                lines.append(
+                    f"secflow_dfa_cluster_worker_active_jobs{_labels(worker_id=worker.worker_id, host_name=worker.host_name or worker.worker_id, status=status)} {count}"
+                )
     return lines
 
 
