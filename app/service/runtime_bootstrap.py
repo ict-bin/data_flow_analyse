@@ -18,6 +18,7 @@ from app.runtime_context import (
     PUBLIC_API_ENABLED,
     REGISTRY_ENABLED,
     ROLE,
+    WORKER_SLOT_REGISTRY_ENABLED,
 )
 from app.service.task_service import get_task_service
 from app.logging_utils import log_event
@@ -46,6 +47,7 @@ class RuntimeBootstrap:
         self._status = RuntimeBootstrapStatus()
         self._router_installed = False
         self._dispatcher_task: asyncio.Task | None = None
+        self._worker_slot_task: asyncio.Task | None = None
 
     async def start(self, app: FastAPI) -> None:
         if self._task and not self._task.done():
@@ -70,6 +72,13 @@ class RuntimeBootstrap:
             except asyncio.CancelledError:
                 pass
         self._dispatcher_task = None
+        if self._worker_slot_task and not self._worker_slot_task.done():
+            self._worker_slot_task.cancel()
+            try:
+                await self._worker_slot_task
+            except asyncio.CancelledError:
+                pass
+        self._worker_slot_task = None
         try:
             from app.service.registry_service import get_registry_service
 
@@ -110,6 +119,11 @@ class RuntimeBootstrap:
                     made_progress = self._attempt_component_start(
                         "dispatcher_start",
                         self._start_dispatcher,
+                    ) or made_progress
+                if WORKER_SLOT_REGISTRY_ENABLED and self._worker_slot_task is None:
+                    made_progress = self._attempt_component_start(
+                        "worker_slot_start",
+                        self._start_worker_slot_registry,
                     ) or made_progress
 
                 if self._all_required_components_ready():
@@ -239,6 +253,35 @@ class RuntimeBootstrap:
         self._dispatcher_task = asyncio.create_task(_dispatcher_loop(), name="dfa_dispatcher")
         self._status.dispatcher_ready = True
         log_event(logger, logging.INFO, "dispatcher started", event="dispatcher_started", owner_id=INSTANCE_ID)
+
+    def _start_worker_slot_registry(self) -> None:
+        async def _worker_slot_loop() -> None:
+            from app.db import get_db
+            from app.runtime_context import MAX_LOCAL_RUNNING_TASKS, POD_IP, POD_NAME, WORKER_ID, WORKER_SLOT_HEARTBEAT_SECONDS
+            from app.service.worker_slot_service import get_worker_slot_service
+
+            while not self._stop_event.is_set():
+                db_gen = get_db()
+                db = next(db_gen)
+                try:
+                    get_worker_slot_service().upsert_heartbeat(
+                        db,
+                        worker_id=WORKER_ID,
+                        pod_name=POD_NAME,
+                        pod_ip=POD_IP or None,
+                        max_concurrent_tasks=MAX_LOCAL_RUNNING_TASKS,
+                        status="running",
+                    )
+                except Exception as exc:
+                    logger.warning("worker slot heartbeat failed on %s: %s", INSTANCE_ID, exc, exc_info=True)
+                finally:
+                    try:
+                        next(db_gen)
+                    except StopIteration:
+                        pass
+                await asyncio.sleep(max(5, int(WORKER_SLOT_HEARTBEAT_SECONDS)))
+
+        self._worker_slot_task = asyncio.create_task(_worker_slot_loop(), name="dfa_worker_slot_registry")
 
     def _all_required_components_ready(self) -> bool:
         if not self._status.db_ready:

@@ -8,7 +8,7 @@ from sqlalchemy.orm import sessionmaker
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from app.db.models import AppDfaTask, Base
+from app.db.models import AppDfaTask, AppDfaWorkerSlot, Base
 from app.metrics import render_aggregate_metrics
 from app.time_utils import now_local
 
@@ -40,12 +40,29 @@ class MetricsWorkerDetailTests(unittest.TestCase):
         finally:
             db.close()
 
+    def _insert_worker(self, **kwargs):
+        db = self.Session()
+        try:
+            row = AppDfaWorkerSlot(
+                worker_id=kwargs.get("worker_id", "pod-a"),
+                pod_name=kwargs.get("pod_name", "pod-a"),
+                pod_ip=kwargs.get("pod_ip"),
+                max_concurrent_tasks=kwargs.get("max_concurrent_tasks", 2),
+                last_seen_status="running",
+                last_heartbeat_at=kwargs.get("last_heartbeat_at", now_local()),
+            )
+            db.add(row)
+            db.commit()
+        finally:
+            db.close()
+
     def test_aggregate_metrics_export_worker_detail_samples(self):
         now = now_local()
+        self._insert_worker(worker_id="pod-a", pod_name="pod-a", max_concurrent_tasks=2, last_heartbeat_at=now)
         self._insert_task(
             task_id="dfa_running",
             status="running",
-            execution_owner_id="pod-a:abcd1234",
+            execution_owner_id="pod-a",
             execution_lease_until=now,
             execution_heartbeat_at=now,
             dispatch_status="running",
@@ -53,7 +70,7 @@ class MetricsWorkerDetailTests(unittest.TestCase):
         self._insert_task(
             task_id="dfa_pending",
             status="pending",
-            execution_owner_id="pod-a:abcd1234",
+            execution_owner_id="pod-a",
             execution_lease_until=now,
             execution_heartbeat_at=now,
             dispatch_status="leased",
@@ -68,13 +85,16 @@ class MetricsWorkerDetailTests(unittest.TestCase):
             finally:
                 db.close()
 
-        with patch("app.db.get_db", fake_get_db), patch("app.service.worker_snapshot.MAX_LOCAL_RUNNING_TASKS", 2):
+        with patch("app.db.get_db", fake_get_db):
             rendered = render_aggregate_metrics()
 
-        self.assertIn('secflow_dfa_cluster_worker_runtime{worker_id="pod-a:abcd1234",host_name="pod-a",healthy="true",source="lease_registry",kind="capacity"} 2', rendered)
-        self.assertIn('secflow_dfa_cluster_worker_runtime{worker_id="pod-a:abcd1234",host_name="pod-a",healthy="true",source="lease_registry",kind="running_jobs"} 1', rendered)
-        self.assertIn('secflow_dfa_cluster_worker_active_jobs{worker_id="pod-a:abcd1234",host_name="pod-a",status="pending"} 1', rendered)
-        self.assertIn('secflow_dfa_cluster_worker_active_jobs{worker_id="pod-a:abcd1234",host_name="pod-a",status="running"} 1', rendered)
+        self.assertIn('secflow_dfa_cluster_worker_runtime{worker_id="pod-a",host_name="pod-a",healthy="true",source="worker_registry",kind="capacity"} 2', rendered)
+        self.assertIn('secflow_dfa_cluster_worker_runtime{worker_id="pod-a",host_name="pod-a",healthy="true",source="worker_registry",kind="running_jobs"} 1', rendered)
+        self.assertIn('secflow_dfa_cluster_worker_slots{kind="capacity"} 2', rendered)
+        self.assertIn('secflow_dfa_cluster_worker_slots{kind="busy"} 1', rendered)
+        self.assertIn('secflow_dfa_cluster_worker_slots{kind="free"} 1', rendered)
+        self.assertIn('secflow_dfa_cluster_worker_active_jobs{worker_id="pod-a",host_name="pod-a",status="pending"} 1', rendered)
+        self.assertIn('secflow_dfa_cluster_worker_active_jobs{worker_id="pod-a",host_name="pod-a",status="running"} 1', rendered)
 
 
 if __name__ == "__main__":

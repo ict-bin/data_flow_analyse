@@ -146,6 +146,8 @@ class WorkerActiveJobResponse(BaseModel):
 class WorkerCapacityResponse(BaseModel):
     worker_id: str
     host_name: str
+    pod_name: str | None = None
+    pod_ip: str | None = None
     healthy: bool
     max_concurrent_jobs: int
     running_jobs: int = 0
@@ -158,6 +160,8 @@ class WorkerCapacityResponse(BaseModel):
 
 class WorkerClusterCapacityResponse(BaseModel):
     worker_count: int = 0
+    healthy_workers: int = 0
+    stale_workers: int = 0
     total_capacity: int = 0
     running_jobs: int = 0
     queued_jobs: int = 0
@@ -468,6 +472,8 @@ async def get_worker_cluster_capacity(
     snapshot = build_worker_cluster_snapshot(db, project_id=project_id)
     return WorkerClusterCapacityResponse(
         worker_count=snapshot.worker_count,
+        healthy_workers=snapshot.healthy_workers,
+        stale_workers=snapshot.stale_workers,
         total_capacity=snapshot.total_capacity,
         running_jobs=snapshot.running_jobs,
         queued_jobs=snapshot.queued_jobs,
@@ -477,6 +483,8 @@ async def get_worker_cluster_capacity(
             WorkerCapacityResponse(
                 worker_id=worker.worker_id,
                 host_name=worker.host_name,
+                pod_name=worker.pod_name,
+                pod_ip=worker.pod_ip,
                 healthy=worker.healthy,
                 max_concurrent_jobs=worker.max_concurrent_jobs,
                 running_jobs=worker.running_jobs,

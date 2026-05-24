@@ -27,7 +27,7 @@ from app.db.models import AppDfaTask
 from app.logging_utils import log_event
 from app.models import SwarmEvent, TaskStatus
 from app.orchestrator import Orchestrator
-from app.runtime_context import HEARTBEAT_INTERVAL_SECONDS, INSTANCE_ID, MAX_LOCAL_RUNNING_TASKS
+from app.runtime_context import HEARTBEAT_INTERVAL_SECONDS, WORKER_ID, MAX_LOCAL_RUNNING_TASKS
 from app.service.execution_coordinator import begin_execution_if_owner, claim_one_runnable_task, commit_terminal_state_if_owner, load_execution_snapshot, release_lease, renew_lease, still_owner
 from app.time_utils import isoformat_local, now_local
 
@@ -768,14 +768,14 @@ class TaskService:
         db_gen = get_db()
         db: Session = next(db_gen)
         try:
-            claimed = claim_one_runnable_task(db, INSTANCE_ID)
+            claimed = claim_one_runnable_task(db, WORKER_ID)
             if claimed is None:
                 from app.metrics import observe_local_event
 
                 observe_local_event("dispatch_claim", "empty")
                 return None
             if claimed.task_id in _running_tasks and not _running_tasks[claimed.task_id].done():
-                release_lease(db, claimed.task_id, INSTANCE_ID, claimed.epoch)
+                release_lease(db, claimed.task_id, WORKER_ID, claimed.epoch)
                 from app.metrics import observe_local_event
 
                 observe_local_event("dispatch_claim", "duplicate_local")
@@ -785,7 +785,7 @@ class TaskService:
                     "claimed task already running locally, released duplicate lease",
                     event="task_lease_released_duplicate_local",
                     task_id=claimed.task_id,
-                    owner_id=INSTANCE_ID,
+                    owner_id=WORKER_ID,
                     epoch=claimed.epoch,
                     control_version=claimed.control_version,
                 )
@@ -804,7 +804,7 @@ class TaskService:
                 "task leased by dispatcher",
                 event="task_leased",
                 task_id=claimed.task_id,
-                owner_id=INSTANCE_ID,
+                owner_id=WORKER_ID,
                 epoch=claimed.epoch,
                 control_version=claimed.control_version,
             )
@@ -1128,8 +1128,8 @@ class TaskService:
                 _hb_gen = _get_db()
                 _hb_db: Session = next(_hb_gen)
                 try:
-                    ok = renew_lease(_hb_db, task_id, INSTANCE_ID, epoch)
-                    if not ok or not still_owner(_hb_db, task_id, INSTANCE_ID, epoch, control_version):
+                    ok = renew_lease(_hb_db, task_id, WORKER_ID, epoch)
+                    if not ok or not still_owner(_hb_db, task_id, WORKER_ID, epoch, control_version):
                         observe_local_event("lease_renew", "failed")
                         log_event(
                             logger,
@@ -1137,7 +1137,7 @@ class TaskService:
                             "lease lost during heartbeat, aborting task",
                             event="task_lease_lost",
                             task_id=task_id,
-                            owner_id=INSTANCE_ID,
+                            owner_id=WORKER_ID,
                             epoch=epoch,
                             control_version=control_version,
                         )
@@ -1169,7 +1169,7 @@ class TaskService:
                                   "data": dict(event.data)})
             n = len(event_buffer)
             if n == 1 or n % 3 == 0:
-                _flush_stages(task_id, _baseline_events + event_buffer, INSTANCE_ID, epoch, control_version)
+                _flush_stages(task_id, _baseline_events + event_buffer, WORKER_ID, epoch, control_version)
             guard_counter += 1
             if guard_counter % 10 == 0:
                 try:
@@ -1177,14 +1177,14 @@ class TaskService:
                     _guard_gen = _get_db()
                     _guard_db: Session = next(_guard_gen)
                     try:
-                        if not still_owner(_guard_db, task_id, INSTANCE_ID, epoch, control_version):
+                        if not still_owner(_guard_db, task_id, WORKER_ID, epoch, control_version):
                             log_event(
                                 logger,
                                 logging.WARNING,
                                 "control-plane ownership changed during event streaming",
                                 event="task_control_guard_abort",
                                 task_id=task_id,
-                                owner_id=INSTANCE_ID,
+                                owner_id=WORKER_ID,
                                 epoch=epoch,
                                 control_version=control_version,
                             )
@@ -1204,31 +1204,31 @@ class TaskService:
             row = db.query(AppDfaTask).filter_by(task_id=task_id).first()
             if not row or row.status == "cancelled":
                 log_event(logger, logging.INFO, "task skipped before execution", event="task_skip_pre_execute",
-                          task_id=task_id, owner_id=INSTANCE_ID, epoch=epoch, control_version=control_version, status=row.status if row else "missing")
+                          task_id=task_id, owner_id=WORKER_ID, epoch=epoch, control_version=control_version, status=row.status if row else "missing")
                 return
-            if not still_owner(db, task_id, INSTANCE_ID, epoch, control_version):
+            if not still_owner(db, task_id, WORKER_ID, epoch, control_version):
                 log_event(logger, logging.INFO, "task lost ownership before execution", event="task_not_owner_pre_execute",
-                          task_id=task_id, owner_id=INSTANCE_ID, epoch=epoch, control_version=control_version)
+                          task_id=task_id, owner_id=WORKER_ID, epoch=epoch, control_version=control_version)
                 return
 
             started_at = row.started_at or now_local()
-            if not begin_execution_if_owner(db, task_id, INSTANCE_ID, epoch, control_version, started_at=started_at):
+            if not begin_execution_if_owner(db, task_id, WORKER_ID, epoch, control_version, started_at=started_at):
                 from app.metrics import observe_local_event
 
                 observe_local_event("task_started", "rejected")
                 log_event(logger, logging.INFO, "failed to enter running state as owner", event="task_begin_execution_rejected",
-                          task_id=task_id, owner_id=INSTANCE_ID, epoch=epoch, control_version=control_version)
+                          task_id=task_id, owner_id=WORKER_ID, epoch=epoch, control_version=control_version)
                 return
             from app.metrics import observe_local_event
 
             observe_local_event("task_started", "success")
             log_event(logger, logging.INFO, "task execution started", event="task_execution_started",
-                      task_id=task_id, project_id=row.project_id, owner_id=INSTANCE_ID, epoch=epoch, control_version=control_version, status="running")
+                      task_id=task_id, project_id=row.project_id, owner_id=WORKER_ID, epoch=epoch, control_version=control_version, status="running")
             db.expire(row)
             db.refresh(row)
-            if row.status == "cancelled" or not still_owner(db, task_id, INSTANCE_ID, epoch, control_version):
+            if row.status == "cancelled" or not still_owner(db, task_id, WORKER_ID, epoch, control_version):
                 log_event(logger, logging.INFO, "task lost ownership before llm sync", event="task_not_owner_pre_llm_sync",
-                          task_id=task_id, owner_id=INSTANCE_ID, epoch=epoch, control_version=control_version, status=row.status)
+                          task_id=task_id, owner_id=WORKER_ID, epoch=epoch, control_version=control_version, status=row.status)
                 return
             _write_input_manifest(row)
 
@@ -1306,15 +1306,15 @@ class TaskService:
             stop_heartbeat.set()
             await heartbeat_task
 
-            _flush_stages(task_id, _baseline_events + event_buffer, INSTANCE_ID, epoch, control_version)
+            _flush_stages(task_id, _baseline_events + event_buffer, WORKER_ID, epoch, control_version)
             db.expire(row); db.refresh(row)
             if row.status == "cancelled":
                 log_event(logger, logging.INFO, "task stopped after control-plane cancel", event="task_cancelled_during_execution",
-                          task_id=task_id, owner_id=INSTANCE_ID, epoch=epoch, control_version=control_version, status=row.status)
+                          task_id=task_id, owner_id=WORKER_ID, epoch=epoch, control_version=control_version, status=row.status)
                 return
-            if not still_owner(db, task_id, INSTANCE_ID, epoch, control_version):
+            if not still_owner(db, task_id, WORKER_ID, epoch, control_version):
                 log_event(logger, logging.INFO, "task lost ownership before terminal commit", event="task_not_owner_pre_commit",
-                          task_id=task_id, owner_id=INSTANCE_ID, epoch=epoch, control_version=control_version)
+                          task_id=task_id, owner_id=WORKER_ID, epoch=epoch, control_version=control_version)
                 return
 
             finished_at = now_local()
@@ -1331,7 +1331,7 @@ class TaskService:
             if not commit_terminal_state_if_owner(
                 db,
                 task_id,
-                INSTANCE_ID,
+                WORKER_ID,
                 epoch,
                 control_version,
                 status=result.status.value if result else "error",
@@ -1344,7 +1344,7 @@ class TaskService:
 
                 observe_local_event("task_finished", "commit_rejected")
                 log_event(logger, logging.WARNING, "terminal commit rejected for stale owner", event="task_terminal_commit_rejected",
-                          task_id=task_id, owner_id=INSTANCE_ID, epoch=epoch, control_version=control_version)
+                          task_id=task_id, owner_id=WORKER_ID, epoch=epoch, control_version=control_version)
                 return
             refreshed = db.query(AppDfaTask).filter_by(task_id=task_id).first()
             if refreshed is not None:
@@ -1356,7 +1356,7 @@ class TaskService:
             terminal_status = result.status.value if result else "error"
             observe_local_event("task_finished", terminal_status)
             log_event(logger, logging.INFO, "terminal state committed", event="task_terminal_committed",
-                      task_id=task_id, owner_id=INSTANCE_ID, epoch=epoch, control_version=control_version,
+                      task_id=task_id, owner_id=WORKER_ID, epoch=epoch, control_version=control_version,
                       status=terminal_status)
 
         except asyncio.CancelledError:
@@ -1364,23 +1364,23 @@ class TaskService:
 
             observe_local_event("task_finished", "cancelled")
             log_event(logger, logging.INFO, "task coroutine cancelled", event="task_coroutine_cancelled",
-                      task_id=task_id, owner_id=INSTANCE_ID, epoch=epoch, control_version=control_version)
+                      task_id=task_id, owner_id=WORKER_ID, epoch=epoch, control_version=control_version)
             pass
         except Exception as exc:
             from app.metrics import observe_local_event
 
             observe_local_event("task_finished", "exception")
             log_event(logger, logging.ERROR, "task execution failed",
-                      event="task_error", task_id=task_id, owner_id=INSTANCE_ID, epoch=epoch, control_version=control_version, error=str(exc))
+                      event="task_error", task_id=task_id, owner_id=WORKER_ID, epoch=epoch, control_version=control_version, error=str(exc))
             try:
                 db.rollback()
                 r = db.query(AppDfaTask).filter_by(task_id=task_id).first()
-                if r and r.status == "running" and still_owner(db, task_id, INSTANCE_ID, epoch, control_version):
+                if r and r.status == "running" and still_owner(db, task_id, WORKER_ID, epoch, control_version):
                     _persist_terminal_failure(r, str(exc), status="error")
                     commit_terminal_state_if_owner(
                         db,
                         task_id,
-                        INSTANCE_ID,
+                        WORKER_ID,
                         epoch,
                         control_version,
                         status="error",
@@ -1395,7 +1395,7 @@ class TaskService:
                         _record_abnormal_reason(refreshed, reason, changed=changed)
                         db.commit()
                     log_event(logger, logging.ERROR, "error terminal state committed", event="task_error_committed",
-                              task_id=task_id, owner_id=INSTANCE_ID, epoch=epoch, control_version=control_version, status="error")
+                              task_id=task_id, owner_id=WORKER_ID, epoch=epoch, control_version=control_version, status="error")
             except Exception:
                 pass
         finally:
@@ -1407,13 +1407,13 @@ class TaskService:
                 except asyncio.CancelledError:
                     pass
             try:
-                released = release_lease(db, task_id, INSTANCE_ID, epoch)
+                released = release_lease(db, task_id, WORKER_ID, epoch)
                 if released:
                     from app.metrics import observe_local_event
 
                     observe_local_event("lease_release", "success")
                     log_event(logger, logging.INFO, "lease released", event="task_lease_released",
-                              task_id=task_id, owner_id=INSTANCE_ID, epoch=epoch, control_version=control_version)
+                              task_id=task_id, owner_id=WORKER_ID, epoch=epoch, control_version=control_version)
                 else:
                     from app.metrics import observe_local_event
 

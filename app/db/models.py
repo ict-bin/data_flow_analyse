@@ -95,3 +95,16 @@ class AppDfaProjectConfig(Base):
     project_id: Mapped[str] = mapped_column(String(100), nullable=False, unique=True, index=True)
     config_json: Mapped[Optional[Dict[str, Any]]] = mapped_column(JSON, nullable=True)
     updated_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=now_local, onupdate=now_local)
+
+
+class AppDfaWorkerSlot(Base):
+    """Worker slot registry for live DFA worker pods."""
+    __tablename__ = "secflow_app_dfa_worker_slots"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    worker_id: Mapped[str] = mapped_column(String(128), nullable=False, unique=True, index=True)
+    pod_name: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    pod_ip: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    max_concurrent_tasks: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    last_seen_status: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
+    last_heartbeat_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=now_local, index=True)

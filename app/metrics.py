@@ -268,11 +268,15 @@ def _render_cluster_task_metrics() -> list[str]:
     executor_running = 1 if EXECUTOR_ENABLED else 0
     configured_workers = max(0, int(CLUSTER_EXPECTED_WORKERS))
     configured_capacity_per_worker = max(0, int(CLUSTER_EXPECTED_WORKER_CAPACITY))
-    configured_slots = configured_workers * configured_capacity_per_worker
-    busy_slots = max(0, status_counts.get("running", 0))
-    free_slots = max(0, configured_slots - busy_slots) if configured_slots > 0 else 0
     observed_active_worker_count = len(observed_active_owners)
     observed_live_heartbeat_worker_count = len(observed_live_heartbeat_owners)
+    actual_worker_count = worker_snapshot.worker_count if worker_snapshot is not None else 0
+    actual_healthy_worker_count = worker_snapshot.healthy_workers if worker_snapshot is not None else 0
+    actual_stale_worker_count = worker_snapshot.stale_workers if worker_snapshot is not None else 0
+    actual_capacity_per_worker = max((worker.max_concurrent_jobs for worker in worker_snapshot.workers), default=0) if worker_snapshot is not None else 0
+    configured_slots = worker_snapshot.total_capacity if worker_snapshot is not None else configured_workers * configured_capacity_per_worker
+    busy_slots = worker_snapshot.running_jobs if worker_snapshot is not None else max(0, status_counts.get("running", 0))
+    free_slots = worker_snapshot.available_slots if worker_snapshot is not None else max(0, configured_slots - busy_slots) if configured_slots > 0 else 0
     heartbeat_stale = max(0, status_counts.get("running", 0) - heartbeat_live)
     slot_utilization_ratio = (busy_slots / configured_slots) if configured_slots > 0 else 0.0
     observed_worker_coverage_ratio = (observed_active_worker_count / configured_workers) if configured_workers > 0 else 0.0
@@ -300,6 +304,9 @@ def _render_cluster_task_metrics() -> list[str]:
         "# HELP secflow_dfa_cluster_workers Worker counts by state.",
         "# TYPE secflow_dfa_cluster_workers gauge",
         f'secflow_dfa_cluster_workers{{state="configured"}} {configured_workers}',
+        f'secflow_dfa_cluster_workers{{state="actual"}} {actual_worker_count}',
+        f'secflow_dfa_cluster_workers{{state="healthy"}} {actual_healthy_worker_count}',
+        f'secflow_dfa_cluster_workers{{state="stale"}} {actual_stale_worker_count}',
         f'secflow_dfa_cluster_workers{{state="observed_active_owner"}} {observed_active_worker_count}',
         f'secflow_dfa_cluster_workers{{state="observed_live_heartbeat_owner"}} {observed_live_heartbeat_worker_count}',
         "# HELP secflow_dfa_cluster_worker_slots Worker slot counts by kind.",
@@ -309,7 +316,7 @@ def _render_cluster_task_metrics() -> list[str]:
         f'secflow_dfa_cluster_worker_slots{{kind="free"}} {free_slots}',
         "# HELP secflow_dfa_cluster_worker_capacity_per_pod Configured per-worker task capacity.",
         "# TYPE secflow_dfa_cluster_worker_capacity_per_pod gauge",
-        f"secflow_dfa_cluster_worker_capacity_per_pod {configured_capacity_per_worker}",
+        f"secflow_dfa_cluster_worker_capacity_per_pod {actual_capacity_per_worker or configured_capacity_per_worker}",
         "# HELP secflow_dfa_cluster_worker_slot_utilization_ratio Busy slot ratio over configured capacity.",
         "# TYPE secflow_dfa_cluster_worker_slot_utilization_ratio gauge",
         f"secflow_dfa_cluster_worker_slot_utilization_ratio {_fmt(slot_utilization_ratio)}",

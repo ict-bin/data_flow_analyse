@@ -17,6 +17,10 @@ def ensure_local(dt: datetime | None) -> datetime | None:
     return dt.astimezone(UTC_PLUS_8).replace(tzinfo=None)
 
 
+def add_seconds_local(dt: datetime, seconds: int) -> datetime:
+    return ensure_local(dt + timedelta(seconds=seconds)) or dt
+
+
 def isoformat_local(dt: datetime | None) -> str | None:
     local_dt = ensure_local(dt)
     if local_dt is None:

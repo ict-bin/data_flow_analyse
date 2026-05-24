@@ -26,6 +26,12 @@ class Migration:
 
 _MIGRATIONS = [
     Migration(
+        kind="index",
+        table_name="secflow_app_dfa_worker_slots",
+        name="ix_dfa_worker_slots_heartbeat",
+        statement="CREATE INDEX ix_dfa_worker_slots_heartbeat ON secflow_app_dfa_worker_slots (last_heartbeat_at)",
+    ),
+    Migration(
         kind="column",
         table_name="secflow_app_dfa_tasks",
         name="task_config_json",
@@ -162,6 +168,8 @@ _MIGRATIONS = [
 
 def _migration_exists(engine, migration: Migration) -> bool:
     inspector = inspect(engine)
+    if migration.table_name == "secflow_app_dfa_worker_slots" and "secflow_app_dfa_worker_slots" not in inspector.get_table_names():
+        return False
     if migration.kind == "column":
         return migration.name in {col["name"] for col in inspector.get_columns(migration.table_name)}
     return migration.name in {idx["name"] for idx in inspector.get_indexes(migration.table_name)}
