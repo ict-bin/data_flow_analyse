@@ -173,6 +173,41 @@ class WorkerClusterCapacityResponse(BaseModel):
     workers: list[WorkerCapacityResponse] = Field(default_factory=list)
 
 
+class TaskTimelineEventResponse(BaseModel):
+    id: str
+    task_id: str
+    project_id: str
+    source: str
+    level: str
+    event_type: str
+    status: str | None = None
+    worker_id: str | None = None
+    execution_owner_id: str | None = None
+    execution_epoch: int | None = None
+    control_version: int | None = None
+    dispatch_status: str | None = None
+    function_name: str | None = None
+    source_file: str | None = None
+    line_hint: str | None = None
+    parent_task_id: str | None = None
+    parent_stage_item_id: str | None = None
+    message: str
+    payload: Dict[str, Any] = Field(default_factory=dict)
+    created_at: str | None = None
+
+
+class TaskTimelineResponse(BaseModel):
+    task_id: str
+    events: list[TaskTimelineEventResponse] = Field(default_factory=list)
+
+
+class ActionResponse(BaseModel):
+    status: str = "ok"
+    task_id: str
+    message: str
+    deleted_event_count: int = 0
+
+
 def _get_task_row(db: Session, task_id: str):
     from app.db.models import AppDfaTask
 
@@ -653,12 +688,6 @@ async def get_task_evaluation(task_id: str, db: Session = Depends(get_db)):
 async def cancel_task(task_id: str, db: Session = Depends(get_db)):
     return get_task_service().cancel_task(db, task_id)
 
-
-@router.delete("/tasks/{task_id}", status_code=204)
-async def delete_task(task_id: str, db: Session = Depends(get_db)):
-    get_task_service().delete_task(db, task_id)
-
-
 @router.post("/tasks/{task_id}/restart", status_code=201)
 async def restart_task(task_id: str, db: Session = Depends(get_db)):
     """Clone an existing task and start it immediately."""
@@ -679,6 +708,25 @@ async def delete_task(
 ):
     """软删除任务记录，可选删除输出目录文件。"""
     get_task_service().delete_task(db, task_id, delete_files=delete_files)
+
+
+@router.get("/tasks/{task_id}/timeline", response_model=TaskTimelineResponse)
+async def get_task_timeline(task_id: str, db: Session = Depends(get_db)):
+    return get_task_service().get_task_timeline(db, task_id)
+
+
+@router.delete("/tasks/{task_id}/timeline", response_model=ActionResponse)
+async def clear_task_timeline(task_id: str, db: Session = Depends(get_db)):
+    deleted_event_count = get_task_service().clear_task_timeline(db, task_id)
+    db.commit()
+    return ActionResponse(status="ok", task_id=task_id, message="任务时间线已清空", deleted_event_count=deleted_event_count)
+
+
+@router.delete("/tasks/{task_id}/timeline/{event_id}", response_model=ActionResponse)
+async def delete_task_timeline_event(task_id: str, event_id: str, db: Session = Depends(get_db)):
+    deleted_event_count = get_task_service().delete_task_timeline_event(db, task_id, event_id)
+    db.commit()
+    return ActionResponse(status="ok", task_id=task_id, message="事件已删除", deleted_event_count=deleted_event_count)
 
 
 @router.get("/tasks/{task_id}/logs")

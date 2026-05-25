@@ -18,13 +18,52 @@ _SessionLocal = None
 
 @dataclass(frozen=True)
 class Migration:
-    kind: Literal["column", "index"]
+    kind: Literal["column", "index", "table"]
     table_name: str
     name: str
     statement: str
 
 
 _MIGRATIONS = [
+    Migration(
+        kind="table",
+        table_name="secflow_app_dfa_task_events",
+        name="secflow_app_dfa_task_events",
+        statement="""
+        CREATE TABLE secflow_app_dfa_task_events (
+            id VARCHAR(32) NOT NULL PRIMARY KEY,
+            task_id VARCHAR(64) NOT NULL,
+            project_id VARCHAR(100) NOT NULL,
+            source VARCHAR(32) NOT NULL DEFAULT 'dfa',
+            level VARCHAR(16) NOT NULL DEFAULT 'info',
+            event_type VARCHAR(64) NOT NULL,
+            status VARCHAR(32) NULL,
+            worker_id VARCHAR(128) NULL,
+            execution_owner_id VARCHAR(128) NULL,
+            execution_epoch INT NULL,
+            control_version INT NULL,
+            dispatch_status VARCHAR(32) NULL,
+            function_name VARCHAR(255) NULL,
+            source_file VARCHAR(1024) NULL,
+            line_hint VARCHAR(64) NULL,
+            parent_task_id VARCHAR(64) NULL,
+            parent_stage_item_id VARCHAR(64) NULL,
+            message TEXT NOT NULL,
+            payload_json TEXT NULL,
+            dedupe_key VARCHAR(255) NOT NULL,
+            created_at DATETIME NOT NULL,
+            UNIQUE KEY uq_secflow_app_dfa_task_events_dedupe_key (dedupe_key),
+            KEY ix_dfa_task_events_task_id (task_id),
+            KEY ix_dfa_task_events_project_id (project_id),
+            KEY ix_dfa_task_events_event_type (event_type),
+            KEY ix_dfa_task_events_created_at (created_at),
+            KEY ix_dfa_task_events_worker_id (worker_id),
+            KEY ix_dfa_task_events_execution_owner_id (execution_owner_id),
+            KEY ix_dfa_task_events_parent_task_id (parent_task_id),
+            KEY ix_dfa_task_events_parent_stage_item_id (parent_stage_item_id)
+        )
+        """,
+    ),
     Migration(
         kind="index",
         table_name="secflow_app_dfa_worker_slots",
@@ -180,7 +219,12 @@ _MIGRATIONS = [
 
 def _migration_exists(engine, migration: Migration) -> bool:
     inspector = inspect(engine)
-    if migration.table_name == "secflow_app_dfa_worker_slots" and "secflow_app_dfa_worker_slots" not in inspector.get_table_names():
+    table_names = inspector.get_table_names()
+    if migration.kind == "table":
+        return migration.table_name in table_names
+    if migration.table_name == "secflow_app_dfa_worker_slots" and "secflow_app_dfa_worker_slots" not in table_names:
+        return False
+    if migration.table_name == "secflow_app_dfa_task_events" and "secflow_app_dfa_task_events" not in table_names:
         return False
     if migration.kind == "column":
         return migration.name in {col["name"] for col in inspector.get_columns(migration.table_name)}

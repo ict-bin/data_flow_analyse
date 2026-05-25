@@ -23,7 +23,7 @@ from sqlalchemy.orm import Session, load_only
 from sqlalchemy.orm.attributes import flag_modified
 
 from app.config import build_task_config, load_service_config
-from app.db.models import AppDfaTask
+from app.db.models import AppDfaTask, AppDfaTaskEvent
 from app.logging_utils import log_event
 from app.models import SwarmEvent, TaskStatus
 from app.orchestrator import Orchestrator
@@ -37,6 +37,8 @@ SERVICE_CONFIG_PATH = os.environ.get("SERVICE_CONFIG", "/app/config.json")
 ENTRY_CONTEXT_MAX_CHARS = 32000
 ENTRY_CONTEXT_MAX_TAINTS = 64
 ENTRY_CONTEXT_MAX_DESC_CHARS = 2240
+TASK_EVENT_SOURCE_DFA = "dfa"
+TASK_EVENT_RENEW_INTERVAL_SECONDS = max(60, HEARTBEAT_INTERVAL_SECONDS * 6)
 
 # Running asyncio tasks keyed by task_id so we can cancel them
 _running_tasks: dict[str, asyncio.Task] = {}
@@ -49,6 +51,162 @@ _TASK_LIST_SORT_COLUMNS = {
     "status": AppDfaTask.status,
     "task_name": AppDfaTask.task_name,
 }
+
+
+def _fit_event_message(raw: object, *, limit: int = 400) -> str:
+    text = str(raw or "").strip()
+    if len(text) <= limit:
+        return text
+    return f"{text[: limit - 1]}…"
+
+
+def _event_payload_preview_value(value: object, *, limit: int = 240) -> object:
+    if isinstance(value, str):
+        return value if len(value) <= limit else f"{value[: limit - 1]}…"
+    if isinstance(value, list):
+        return [_event_payload_preview_value(item, limit=80) for item in value[:10]]
+    if isinstance(value, dict):
+        compact: dict[str, object] = {}
+        for index, (key, item) in enumerate(value.items()):
+            if index >= 12:
+                break
+            compact[str(key)] = _event_payload_preview_value(item, limit=120)
+        return compact
+    if isinstance(value, (int, float, bool)) or value is None:
+        return value
+    return _fit_event_message(value, limit=limit)
+
+
+def _compact_event_payload(payload: dict[str, object] | None) -> dict[str, object]:
+    compact: dict[str, object] = {}
+    for key, value in (payload or {}).items():
+        if isinstance(value, (str, int, float, bool)) or value is None:
+            compact[key] = _event_payload_preview_value(value)
+        elif isinstance(value, list):
+            compact[f"{key}_count"] = len(value)
+            compact[key] = _event_payload_preview_value(value)
+        elif isinstance(value, dict):
+            compact[key] = _event_payload_preview_value(value)
+        else:
+            compact[key] = _fit_event_message(value)
+    return compact
+
+
+def _task_event_dedupe_key(
+    task_id: str,
+    event_type: str,
+    status: str | None,
+    message: str,
+    *,
+    epoch: int | None = None,
+    function_name: str | None = None,
+    dispatch_status: str | None = None,
+    line_hint: str | None = None,
+) -> str:
+    parts = [
+        task_id,
+        event_type,
+        str(status or ""),
+        str(epoch or ""),
+        str(function_name or ""),
+        str(dispatch_status or ""),
+        str(line_hint or ""),
+        hashlib.sha1(message.encode("utf-8")).hexdigest()[:12],
+    ]
+    return "::".join(parts)[:255]
+
+
+def _build_task_event_response(event: AppDfaTaskEvent) -> dict[str, object]:
+    return {
+        "id": event.id,
+        "task_id": event.task_id,
+        "project_id": event.project_id,
+        "source": event.source,
+        "level": event.level,
+        "event_type": event.event_type,
+        "status": event.status,
+        "worker_id": event.worker_id,
+        "execution_owner_id": event.execution_owner_id,
+        "execution_epoch": event.execution_epoch,
+        "control_version": event.control_version,
+        "dispatch_status": event.dispatch_status,
+        "function_name": event.function_name,
+        "source_file": event.source_file,
+        "line_hint": event.line_hint,
+        "parent_task_id": event.parent_task_id,
+        "parent_stage_item_id": event.parent_stage_item_id,
+        "message": event.message,
+        "payload": event.payload,
+        "created_at": isoformat_local(event.created_at),
+    }
+
+
+def _record_task_event(
+    db: Session,
+    *,
+    row: AppDfaTask,
+    event_type: str,
+    message: str,
+    source: str = TASK_EVENT_SOURCE_DFA,
+    level: str = "info",
+    status: str | None = None,
+    payload: dict[str, object] | None = None,
+    worker_id: str | None = None,
+    execution_owner_id: str | None = None,
+    execution_epoch: int | None = None,
+    control_version: int | None = None,
+    dispatch_status: str | None = None,
+    function_name: str | None = None,
+    source_file: str | None = None,
+    line_hint: str | None = None,
+    dedupe_key: str | None = None,
+) -> AppDfaTaskEvent | None:
+    normalized_message = _fit_event_message(message, limit=1000)
+    normalized_status = str(status or row.status or "").strip() or None
+    normalized_worker_id = str(worker_id or row.execution_owner_id or "").strip() or None
+    normalized_owner_id = str(execution_owner_id or row.execution_owner_id or "").strip() or None
+    normalized_dispatch_status = str(dispatch_status or row.dispatch_status or "").strip() or None
+    normalized_function_name = str(function_name or (row.task_config_json or {}).get("function_name") or "").strip() or None
+    normalized_source_file = str(source_file or (row.task_config_json or {}).get("source_file") or "").strip() or None
+    normalized_line_hint = str(line_hint or (row.task_config_json or {}).get("line_hint") or "").strip() or None
+    event_dedupe_key = dedupe_key or _task_event_dedupe_key(
+        row.task_id,
+        event_type,
+        normalized_status,
+        normalized_message,
+        epoch=execution_epoch or int(row.execution_epoch or 0),
+        function_name=normalized_function_name,
+        dispatch_status=normalized_dispatch_status,
+        line_hint=normalized_line_hint,
+    )
+    existing = db.query(AppDfaTaskEvent).filter(AppDfaTaskEvent.dedupe_key == event_dedupe_key).first()
+    if existing is not None:
+        return existing
+    event = AppDfaTaskEvent(
+        id=uuid.uuid4().hex[:32],
+        task_id=row.task_id,
+        project_id=row.project_id,
+        source=source,
+        level=level,
+        event_type=event_type,
+        status=normalized_status,
+        worker_id=normalized_worker_id,
+        execution_owner_id=normalized_owner_id,
+        execution_epoch=int(execution_epoch) if execution_epoch is not None else int(row.execution_epoch or 0),
+        control_version=int(control_version) if control_version is not None else int(row.control_version or 0),
+        dispatch_status=normalized_dispatch_status,
+        function_name=normalized_function_name,
+        source_file=normalized_source_file,
+        line_hint=normalized_line_hint,
+        parent_task_id=row.parent_task_id,
+        parent_stage_item_id=row.parent_stage_item_id,
+        message=normalized_message,
+        dedupe_key=event_dedupe_key,
+    )
+    event.payload = _compact_event_payload(payload or {})
+    db.add(event)
+    db.flush()
+    return event
 
 
 def _active_local_task(task_id: str) -> asyncio.Task | None:
@@ -175,6 +333,27 @@ def _record_abnormal_reason(row: AppDfaTask, reason: dict | None, *, changed: bo
     events.append(_abnormal_reason_event(reason))
     row.stages_json = {**payload, "events": events, "final": bool(payload.get("final", False))}
     flag_modified(row, "stages_json")
+
+
+def _record_abnormal_reason_timeline(db: Session, row: AppDfaTask, reason: dict | None, *, changed: bool) -> None:
+    if not changed or not isinstance(reason, dict):
+        return
+    _record_task_event(
+        db,
+        row=row,
+        event_type="abnormal_reason_recorded",
+        message=str(reason.get("title") or "任务异常结束"),
+        level="warning" if str(reason.get("status") or "") == "cancelled" else "error",
+        status=str(reason.get("status") or row.status or ""),
+        payload={"reason": reason},
+        dedupe_key=_task_event_dedupe_key(
+            row.task_id,
+            "abnormal_reason_recorded",
+            str(reason.get("status") or row.status or ""),
+            str(reason.get("message") or reason.get("title") or ""),
+            epoch=int(row.execution_epoch or 0),
+        ),
+    )
 
 
 def _task_root(row: AppDfaTask) -> Path | None:
@@ -861,6 +1040,27 @@ class TaskService:
                 epoch=claimed.epoch,
                 control_version=claimed.control_version,
             )
+            claimed_row = db.query(AppDfaTask).filter_by(task_id=claimed.task_id).first()
+            if claimed_row is not None:
+                _record_task_event(
+                    db,
+                    row=claimed_row,
+                    event_type="task_leased",
+                    message="任务已被 worker 领取租约",
+                    status=claimed_row.status,
+                    execution_epoch=claimed.epoch,
+                    control_version=claimed.control_version,
+                    dispatch_status=claimed.dispatch_status,
+                    worker_id=WORKER_ID,
+                    execution_owner_id=WORKER_ID,
+                    payload={
+                        "owner_id": WORKER_ID,
+                        "epoch": claimed.epoch,
+                        "control_version": claimed.control_version,
+                        "dispatch_status": claimed.dispatch_status,
+                    },
+                )
+                db.commit()
             return claimed.task_id
         finally:
             try:
@@ -1007,6 +1207,40 @@ class TaskService:
             },
         }
 
+    def get_task_timeline(self, db: Session, task_id: str) -> dict:
+        row = self._get_or_404(db, task_id)
+        events = (
+            db.query(AppDfaTaskEvent)
+            .filter(AppDfaTaskEvent.task_id == row.task_id)
+            .order_by(AppDfaTaskEvent.created_at.desc())
+            .all()
+        )
+        return {
+            "task_id": row.task_id,
+            "events": [_build_task_event_response(event) for event in events],
+        }
+
+    def clear_task_timeline(self, db: Session, task_id: str) -> int:
+        row = self._get_or_404(db, task_id)
+        deleted = (
+            db.query(AppDfaTaskEvent)
+            .filter(AppDfaTaskEvent.task_id == row.task_id)
+            .delete(synchronize_session=False)
+        )
+        return int(deleted or 0)
+
+    def delete_task_timeline_event(self, db: Session, task_id: str, event_id: str) -> int:
+        row = self._get_or_404(db, task_id)
+        deleted = (
+            db.query(AppDfaTaskEvent)
+            .filter(
+                AppDfaTaskEvent.task_id == row.task_id,
+                AppDfaTaskEvent.id == event_id,
+            )
+            .delete(synchronize_session=False)
+        )
+        return int(deleted or 0)
+
     def create_task(self, db: Session, *, project_id: str, task_name: str,
                     input_path: str, module_input_path: Optional[str] = None,
                     source_root_path: Optional[str] = None, output_path: Optional[str] = None,
@@ -1082,6 +1316,24 @@ class TaskService:
             dispatch_status="pending",
         )
         db.add(row); db.commit(); db.refresh(row)
+        _record_task_event(
+            db,
+            row=row,
+            event_type="task_created",
+            message="数据流分析任务已创建",
+            status=row.status,
+            dispatch_status=row.dispatch_status,
+            payload={
+                "task_name": row.task_name,
+                "input_path": row.input_path,
+                "module_input_path": row.module_input_path,
+                "source_root_path": row.source_root_path,
+                "task_origin_type": row.task_origin_type,
+                "parent_task_id": row.parent_task_id,
+                "parent_stage_item_id": row.parent_stage_item_id,
+            },
+        )
+        db.commit(); db.refresh(row)
         log_event(logger, logging.INFO, "task created",
                   event="task_created", task_id=task_id, project_id=project_id)
         return self._row_to_dict(row)
@@ -1107,6 +1359,17 @@ class TaskService:
         row.dispatch_status = "pending"
         flag_modified(row, "task_config_json")
         flag_modified(row, "latest_abnormal_reason_json")
+        db.commit(); db.refresh(row)
+        _record_task_event(
+            db,
+            row=row,
+            event_type="task_retried",
+            message="任务已原地重置并重新执行",
+            status=row.status,
+            control_version=int(row.control_version or 0),
+            dispatch_status=row.dispatch_status,
+            payload={"control_version": int(row.control_version or 0)},
+        )
         db.commit(); db.refresh(row)
         at = _running_tasks.get(task_id)
         if at and not at.done():
@@ -1144,6 +1407,21 @@ class TaskService:
         flag_modified(row, "task_config_json")
         flag_modified(row, "latest_abnormal_reason_json")
         db.commit(); db.refresh(row)
+        _record_task_event(
+            db,
+            row=row,
+            event_type="task_resumed",
+            message="任务已从断点恢复执行",
+            status=row.status,
+            control_version=int(row.control_version or 0),
+            dispatch_status=row.dispatch_status,
+            payload={
+                "control_version": int(row.control_version or 0),
+                "resume_workspace": resume_workspace,
+                "start_stage": 3,
+            },
+        )
+        db.commit(); db.refresh(row)
         at = _running_tasks.get(task_id)
         if at and not at.done():
             at.cancel()
@@ -1168,6 +1446,20 @@ class TaskService:
         row.dispatch_status = None
         reason, changed = _sync_task_abnormal_reason(row)
         _record_abnormal_reason(row, reason, changed=changed)
+        _record_abnormal_reason_timeline(db, row, reason, changed=changed)
+        _record_task_event(
+            db,
+            row=row,
+            event_type="task_cancelled",
+            message="任务已被控制面取消",
+            level="warning",
+            status=row.status,
+            control_version=int(row.control_version or 0),
+            payload={
+                "local_task_active": local_task is not None,
+                "control_version": int(row.control_version or 0),
+            },
+        )
         db.commit(); db.refresh(row)
         log_event(logger, logging.INFO, "task cancelled by control plane", event="task_cancel_requested",
                   task_id=task_id, project_id=row.project_id, control_version=row.control_version, status=row.status,
@@ -1208,6 +1500,7 @@ class TaskService:
         async def _heartbeat_loop(orch: Orchestrator) -> None:
             from app.db import get_db as _get_db
             from app.metrics import observe_local_event
+            last_timeline_renew_at = 0.0
             while not stop_heartbeat.is_set():
                 await asyncio.sleep(HEARTBEAT_INTERVAL_SECONDS)
                 _hb_gen = _get_db()
@@ -1229,8 +1522,47 @@ class TaskService:
                         if orch._cancel_event is not None:
                             orch._cancel_event.set()
                         stop_heartbeat.set()
+                        lost_row = _hb_db.query(AppDfaTask).filter_by(task_id=task_id).first()
+                        if lost_row is not None:
+                            _record_task_event(
+                                _hb_db,
+                                row=lost_row,
+                                event_type="task_lease_lost",
+                                message="任务心跳续租失败，租约已丢失",
+                                level="warning",
+                                status=lost_row.status,
+                                worker_id=WORKER_ID,
+                                execution_owner_id=WORKER_ID,
+                                execution_epoch=epoch,
+                                control_version=control_version,
+                                payload={"owner_id": WORKER_ID, "epoch": epoch, "control_version": control_version},
+                            )
+                            _hb_db.commit()
                         return
                     observe_local_event("lease_renew", "success")
+                    current_ts = _time.time()
+                    if current_ts - last_timeline_renew_at >= TASK_EVENT_RENEW_INTERVAL_SECONDS:
+                        lease_row = _hb_db.query(AppDfaTask).filter_by(task_id=task_id).first()
+                        if lease_row is not None:
+                            _record_task_event(
+                                _hb_db,
+                                row=lease_row,
+                                event_type="task_lease_renewed",
+                                message="任务租约续约成功",
+                                status=lease_row.status,
+                                worker_id=WORKER_ID,
+                                execution_owner_id=WORKER_ID,
+                                execution_epoch=epoch,
+                                control_version=control_version,
+                                payload={
+                                    "owner_id": WORKER_ID,
+                                    "epoch": epoch,
+                                    "control_version": control_version,
+                                    "lease_until": isoformat_local(lease_row.execution_lease_until),
+                                },
+                            )
+                            _hb_db.commit()
+                            last_timeline_renew_at = current_ts
                 finally:
                     try:
                         next(_hb_gen)
@@ -1252,6 +1584,65 @@ class TaskService:
             nonlocal guard_counter
             event_buffer.append({"ts": _time.time(), "type": event.type,
                                   "data": dict(event.data)})
+            try:
+                event_db_gen = get_db()
+                event_db: Session = next(event_db_gen)
+                try:
+                    event_row = event_db.query(AppDfaTask).filter_by(task_id=task_id).first()
+                    if event_row is not None:
+                        event_data = dict(event.data or {})
+                        event_type = str(event.type or "").strip() or "runtime_event"
+                        mapped_event_type = {
+                            "task_start": "root_analysis_started",
+                            "trace_callees": "callee_discovered",
+                            "round_start": "round_started",
+                            "round_end": "round_finished",
+                            "judge_done": "judge_completed",
+                            "task_end": "result_materialized",
+                            "error": "task_runtime_error",
+                        }.get(event_type, event_type)
+                        if event_type == "trace_start":
+                            depth = int(event_data.get("depth") or 0)
+                            max_depth = int((event_row.task_config_json or {}).get("max_trace_depth") or 0)
+                            if max_depth > 0 and depth >= max_depth:
+                                mapped_event_type = "depth_limit_reached"
+                            else:
+                                mapped_event_type = "trace_started"
+                        message = {
+                            "root_analysis_started": "开始执行根函数分析",
+                            "trace_started": "开始追踪函数",
+                            "callee_discovered": "发现新的调用函数",
+                            "round_started": "新一轮分析开始",
+                            "round_finished": "分析轮次结束",
+                            "judge_completed": "Judge 评估完成",
+                            "depth_limit_reached": "追踪达到最大深度限制",
+                            "result_materialized": "任务结果已产出",
+                            "task_runtime_error": str(event_data.get("error") or "分析过程中出现错误"),
+                        }.get(mapped_event_type, f"运行事件: {mapped_event_type}")
+                        _record_task_event(
+                            event_db,
+                            row=event_row,
+                            event_type=mapped_event_type,
+                            message=message,
+                            level="error" if mapped_event_type == "task_runtime_error" else "info",
+                            status=event_row.status,
+                            worker_id=WORKER_ID,
+                            execution_owner_id=WORKER_ID,
+                            execution_epoch=epoch,
+                            control_version=control_version,
+                            function_name=str(event_data.get("function") or event_data.get("task") or ""),
+                            source_file=str(event_data.get("source_path") or event_data.get("source_file") or ""),
+                            line_hint=str(event_data.get("line") or event_data.get("line_hint") or ""),
+                            payload=event_data,
+                        )
+                        event_db.commit()
+                finally:
+                    try:
+                        next(event_db_gen)
+                    except StopIteration:
+                        pass
+            except Exception:
+                logger.debug("failed to persist DFA task runtime event", exc_info=True)
             n = len(event_buffer)
             if n == 1 or n % 3 == 0:
                 _flush_stages(task_id, _baseline_events + event_buffer, WORKER_ID, epoch, control_version)
@@ -1273,6 +1664,22 @@ class TaskService:
                                 epoch=epoch,
                                 control_version=control_version,
                             )
+                            guard_row = _guard_db.query(AppDfaTask).filter_by(task_id=task_id).first()
+                            if guard_row is not None:
+                                _record_task_event(
+                                    _guard_db,
+                                    row=guard_row,
+                                    event_type="task_control_guard_abort",
+                                    message="控制面检测到执行权漂移，终止当前任务",
+                                    level="warning",
+                                    status=guard_row.status,
+                                    worker_id=WORKER_ID,
+                                    execution_owner_id=WORKER_ID,
+                                    execution_epoch=epoch,
+                                    control_version=control_version,
+                                    payload={"owner_id": WORKER_ID, "epoch": epoch, "control_version": control_version},
+                                )
+                                _guard_db.commit()
                             stop_heartbeat.set()
                             orch = orch_holder.get("orch")
                             if orch and orch._cancel_event is not None:
@@ -1305,6 +1712,27 @@ class TaskService:
                           task_id=task_id, owner_id=WORKER_ID, epoch=epoch, control_version=control_version)
                 return
             from app.metrics import observe_local_event
+            started_row = db.query(AppDfaTask).filter_by(task_id=task_id).first()
+            if started_row is not None:
+                _record_task_event(
+                    db,
+                    row=started_row,
+                    event_type="task_started",
+                    message="任务已开始执行",
+                    status=started_row.status,
+                    worker_id=WORKER_ID,
+                    execution_owner_id=WORKER_ID,
+                    execution_epoch=epoch,
+                    control_version=control_version,
+                    dispatch_status=started_row.dispatch_status,
+                    payload={
+                        "owner_id": WORKER_ID,
+                        "epoch": epoch,
+                        "control_version": control_version,
+                        "started_at": isoformat_local(started_at),
+                    },
+                )
+                db.commit()
 
             observe_local_event("task_started", "success")
             log_event(logger, logging.INFO, "task execution started", event="task_execution_started",
@@ -1435,6 +1863,31 @@ class TaskService:
             if refreshed is not None:
                 reason, changed = _sync_task_abnormal_reason(refreshed)
                 _record_abnormal_reason(refreshed, reason, changed=changed)
+                _record_abnormal_reason_timeline(db, refreshed, reason, changed=changed)
+                terminal_status = result.status.value if result else "error"
+                _record_task_event(
+                    db,
+                    row=refreshed,
+                    event_type={
+                        "passed": "task_passed",
+                        "failed": "task_failed",
+                        "error": "task_error",
+                        "completed_limited": "task_completed_limited",
+                        "cancelled": "task_cancelled",
+                    }.get(terminal_status, "task_finished"),
+                    message=f"任务执行结束，状态={terminal_status}",
+                    level="error" if terminal_status in {"failed", "error"} else "info",
+                    status=terminal_status,
+                    worker_id=WORKER_ID,
+                    execution_owner_id=WORKER_ID,
+                    execution_epoch=epoch,
+                    control_version=control_version,
+                    payload={
+                        "completion_reason": result.completion_reason if result else None,
+                        "round_count": len(result.rounds) if result else 0,
+                        "error": result.error if result else None,
+                    },
+                )
                 db.commit()
             from app.metrics import observe_local_event
 
@@ -1478,6 +1931,20 @@ class TaskService:
                     if refreshed is not None:
                         reason, changed = _sync_task_abnormal_reason(refreshed)
                         _record_abnormal_reason(refreshed, reason, changed=changed)
+                        _record_abnormal_reason_timeline(db, refreshed, reason, changed=changed)
+                        _record_task_event(
+                            db,
+                            row=refreshed,
+                            event_type="task_error",
+                            message="任务因异常退出并已写入错误终态",
+                            level="error",
+                            status="error",
+                            worker_id=WORKER_ID,
+                            execution_owner_id=WORKER_ID,
+                            execution_epoch=epoch,
+                            control_version=control_version,
+                            payload={"error": str(exc)},
+                        )
                         db.commit()
                     log_event(logger, logging.ERROR, "error terminal state committed", event="task_error_committed",
                               task_id=task_id, owner_id=WORKER_ID, epoch=epoch, control_version=control_version, status="error")
@@ -1499,6 +1966,21 @@ class TaskService:
                     observe_local_event("lease_release", "success")
                     log_event(logger, logging.INFO, "lease released", event="task_lease_released",
                               task_id=task_id, owner_id=WORKER_ID, epoch=epoch, control_version=control_version)
+                    released_row = db.query(AppDfaTask).filter_by(task_id=task_id).first()
+                    if released_row is not None:
+                        _record_task_event(
+                            db,
+                            row=released_row,
+                            event_type="task_lease_released",
+                            message="任务租约已释放",
+                            status=released_row.status,
+                            worker_id=WORKER_ID,
+                            execution_owner_id=WORKER_ID,
+                            execution_epoch=epoch,
+                            control_version=control_version,
+                            payload={"owner_id": WORKER_ID, "epoch": epoch, "control_version": control_version},
+                        )
+                        db.commit()
                 else:
                     from app.metrics import observe_local_event
 

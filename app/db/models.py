@@ -5,7 +5,9 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
-from sqlalchemy import Boolean, DateTime, Integer, String, Text
+import json
+
+from sqlalchemy import Boolean, DateTime, Integer, String, Text, UniqueConstraint
 from sqlalchemy.dialects.mysql import JSON
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
@@ -64,6 +66,51 @@ class AppDfaTask(Base):
     dispatch_status: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
 
     is_deleted: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+
+
+class AppDfaTaskEvent(Base):
+    """Database-backed task timeline event for DFA task execution tracing."""
+
+    __tablename__ = "secflow_app_dfa_task_events"
+    __table_args__ = (
+        UniqueConstraint("dedupe_key", name="uq_secflow_app_dfa_task_events_dedupe_key"),
+    )
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    task_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    project_id: Mapped[str] = mapped_column(String(100), nullable=False, index=True)
+    source: Mapped[str] = mapped_column(String(32), nullable=False, default="dfa", index=True)
+    level: Mapped[str] = mapped_column(String(16), nullable=False, default="info", index=True)
+    event_type: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    status: Mapped[Optional[str]] = mapped_column(String(32), nullable=True, index=True)
+    worker_id: Mapped[Optional[str]] = mapped_column(String(128), nullable=True, index=True)
+    execution_owner_id: Mapped[Optional[str]] = mapped_column(String(128), nullable=True, index=True)
+    execution_epoch: Mapped[Optional[int]] = mapped_column(Integer, nullable=True, index=True)
+    control_version: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    dispatch_status: Mapped[Optional[str]] = mapped_column(String(32), nullable=True, index=True)
+    function_name: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    source_file: Mapped[Optional[str]] = mapped_column(String(1024), nullable=True)
+    line_hint: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    parent_task_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True, index=True)
+    parent_stage_item_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True, index=True)
+    message: Mapped[str] = mapped_column(Text, nullable=False)
+    payload_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    dedupe_key: Mapped[str] = mapped_column(String(255), nullable=False, unique=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=now_local, index=True)
+
+    @property
+    def payload(self) -> dict[str, Any]:
+        if not self.payload_json:
+            return {}
+        try:
+            loaded = json.loads(self.payload_json)
+            return loaded if isinstance(loaded, dict) else {}
+        except Exception:
+            return {}
+
+    @payload.setter
+    def payload(self, value: dict[str, Any] | None) -> None:
+        self.payload_json = json.dumps(value or {}, ensure_ascii=False)
 
 
 class AppDfaPromptTemplate(Base):
