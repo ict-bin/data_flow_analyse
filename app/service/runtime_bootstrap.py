@@ -5,11 +5,13 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import time
 from dataclasses import asdict, dataclass
 from typing import Optional
 
 from fastapi import FastAPI
 
+from app.agent_process import cleanup_orphan_pi_processes
 from app.config import get_service_yaml
 from app.runtime_context import (
     DISPATCHER_ENABLED,
@@ -259,11 +261,17 @@ class RuntimeBootstrap:
             from app.db import get_db
             from app.runtime_context import MAX_LOCAL_RUNNING_TASKS, POD_IP, POD_NAME, WORKER_ID, WORKER_SLOT_HEARTBEAT_SECONDS
             from app.service.worker_slot_service import get_worker_slot_service
+            orphan_sweep_seconds = max(10, int(os.environ.get("DFA_ORPHAN_PI_SWEEP_SECONDS", "30")))
+            last_orphan_sweep = 0.0
 
             while not self._stop_event.is_set():
                 db_gen = get_db()
                 db = next(db_gen)
                 try:
+                    now_ts = time.time()
+                    if now_ts - last_orphan_sweep >= orphan_sweep_seconds:
+                        cleanup_orphan_pi_processes(logger.warning, label="dfa_worker_registry")
+                        last_orphan_sweep = now_ts
                     get_worker_slot_service().upsert_heartbeat(
                         db,
                         worker_id=WORKER_ID,

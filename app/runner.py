@@ -28,6 +28,7 @@ import tempfile
 from pathlib import Path
 from typing import Callable, Optional
 
+from .agent_process import AgentProcessHandle, find_pi_command, process_group_id
 from .models import TokenUsage
 
 logger = logging.getLogger("dfa.runner")
@@ -250,27 +251,11 @@ def _format_context_overflow_failure(
 
 
 def _find_pi_command() -> list[str]:
-    pi_bin = os.environ.get("PI_BIN")
-    if pi_bin and os.path.isfile(pi_bin):
-        return [pi_bin]
-    pi_path = shutil.which("pi")
-    if pi_path:
-        return [pi_path]
-    npx = shutil.which("npx")
-    if npx:
-        return [npx, "pi"]
-    raise FileNotFoundError(
-        "找不到 'pi'。请安装: npm install -g @mariozechner/pi-coding-agent"
-    )
+    return find_pi_command()
 
 
 def _proc_group_id(proc: asyncio.subprocess.Process) -> int | None:
-    try:
-        return os.getpgid(proc.pid)
-    except ProcessLookupError:
-        return None
-    except Exception:
-        return None
+    return process_group_id(proc)
 
 
 async def _terminate_pi_process_tree(
@@ -839,15 +824,17 @@ async def _run_with_api_retry(
         result = AgentResult()
 
         # ── 拉起子进程（OSError 由外层 catch）──
-        proc = await asyncio.create_subprocess_exec(
+        handle = await AgentProcessHandle.spawn(
             *args,
             cwd=cwd,
             env=env,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
-            stdin=asyncio.subprocess.PIPE,  # RPC: 通过 stdin 发送 prompt
-            start_new_session=True,
+            stdin=asyncio.subprocess.PIPE,
+            logger=_log_warn,
+            label=process_label,
         )
+        proc = handle.proc
         _log_info(
             f"started pi process [{process_label}] pid={proc.pid} pgid={_proc_group_id(proc)} cwd={cwd}"
         )
@@ -857,11 +844,7 @@ async def _run_with_api_retry(
 
             async def _cancel_monitor():
                 await cancel_event.wait()
-                await _terminate_pi_process_tree(
-                    proc,
-                    label=process_label,
-                    reason="cancel_event",
-                )
+                await handle.terminate_tree(reason="cancel_event")
 
             cancel_task = asyncio.create_task(_cancel_monitor())
 
@@ -963,31 +946,19 @@ async def _run_with_api_retry(
                 result.exit_code = proc.returncode or 0
             except asyncio.TimeoutError:
                 _log_warn("pi 进程未在 15s 内退出，强制终止")
-                await _terminate_pi_process_tree(
-                    proc,
-                    label=process_label,
-                    reason="exit_timeout",
-                )
+                await handle.terminate_tree(reason="exit_timeout")
                 result.exit_code = -1
 
         except asyncio.CancelledError:
             _log_warn("agent run cancelled, terminating pi process")
-            await _terminate_pi_process_tree(
-                proc,
-                label=process_label,
-                reason="task_cancelled",
-            )
+            await handle.terminate_tree(reason="task_cancelled")
             raise
         except Exception as e:
             # 管道断裂、进程被杀等
             _log_warn(f"pi 进程读取异常: {e}")
             result.error = f"pi process read error: {e}"
             result.exit_code = -1
-            await _terminate_pi_process_tree(
-                proc,
-                label=process_label,
-                reason=f"read_exception:{type(e).__name__}",
-            )
+            await handle.terminate_tree(reason=f"read_exception:{type(e).__name__}")
 
         finally:
             if cancel_task:
@@ -996,14 +967,11 @@ async def _run_with_api_retry(
                     await cancel_task
                 except asyncio.CancelledError:
                     pass
-            if proc.returncode is None:
-                await _terminate_pi_process_tree(
-                    proc,
-                    label=process_label,
-                    reason="finally_cleanup",
-                    term_timeout=2.0,
-                    kill_timeout=2.0,
-                )
+            await handle.terminate_tree(
+                reason="finally_cleanup",
+                term_timeout=2.0,
+                kill_timeout=2.0,
+            )
 
         # ── 提取输出 ──
         for msg in reversed(result.messages):
