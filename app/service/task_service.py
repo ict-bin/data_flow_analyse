@@ -51,6 +51,13 @@ _TASK_LIST_SORT_COLUMNS = {
 }
 
 
+def _active_local_task(task_id: str) -> asyncio.Task | None:
+    local_task = _running_tasks.get(task_id)
+    if local_task is None or local_task.done():
+        return None
+    return local_task
+
+
 def _abnormal_evidence(key: str, label: str, value: object) -> dict | None:
     text = str(value or "").strip()
     if not text:
@@ -1148,9 +1155,9 @@ class TaskService:
         row = self._get_or_404(db, task_id)
         if row.status in ("passed", "failed", "error", "cancelled"):
             return self._row_to_dict(row)
-        at = _running_tasks.get(task_id)
-        if at and not at.done():
-            at.cancel()
+        local_task = _active_local_task(task_id)
+        if local_task is not None:
+            local_task.cancel()
         row.status = "cancelled"
         row.finished_at = now_local()
         row.control_version = int(row.control_version or 0) + 1
@@ -1163,7 +1170,8 @@ class TaskService:
         _record_abnormal_reason(row, reason, changed=changed)
         db.commit(); db.refresh(row)
         log_event(logger, logging.INFO, "task cancelled by control plane", event="task_cancel_requested",
-                  task_id=task_id, project_id=row.project_id, control_version=row.control_version, status=row.status)
+                  task_id=task_id, project_id=row.project_id, control_version=row.control_version, status=row.status,
+                  local_task_active=local_task is not None)
         return self._row_to_dict(row)
 
     def delete_task(self, db: Session, task_id: str, *, delete_files: bool = True) -> None:
@@ -1171,8 +1179,10 @@ class TaskService:
         from fastapi import HTTPException
         row = self._get_or_404(db, task_id)
         lease_live = bool(row.execution_owner_id and row.execution_lease_until and row.execution_lease_until >= now_local())
-        if row.status == "running" or lease_live:
-            raise HTTPException(status_code=409, detail="任务正在运行，请先取消后再删除")
+        local_task = _active_local_task(task_id)
+        if row.status == "running" or lease_live or local_task is not None:
+            detail = "任务仍在本地执行清理中，请稍后再删除" if local_task is not None else "任务正在运行，请先取消后再删除"
+            raise HTTPException(status_code=409, detail=detail)
         if delete_files and row.output_path:
             task_dir = os.path.join(row.output_path, task_id)
             if os.path.isdir(task_dir):

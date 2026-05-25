@@ -22,6 +22,7 @@ import json
 import logging
 import os
 import re
+import signal
 import shutil
 import tempfile
 from pathlib import Path
@@ -261,6 +262,68 @@ def _find_pi_command() -> list[str]:
     raise FileNotFoundError(
         "找不到 'pi'。请安装: npm install -g @mariozechner/pi-coding-agent"
     )
+
+
+def _proc_group_id(proc: asyncio.subprocess.Process) -> int | None:
+    try:
+        return os.getpgid(proc.pid)
+    except ProcessLookupError:
+        return None
+    except Exception:
+        return None
+
+
+async def _terminate_pi_process_tree(
+    proc: asyncio.subprocess.Process,
+    *,
+    label: str,
+    reason: str,
+    term_timeout: float = 5.0,
+    kill_timeout: float = 5.0,
+) -> None:
+    """Terminate the whole pi process group so child/orphan processes do not leak."""
+    if proc.returncode is not None:
+        with contextlib.suppress(Exception):
+            await asyncio.wait_for(proc.wait(), timeout=1.0)
+        return
+
+    pgid = _proc_group_id(proc)
+    if pgid is not None:
+        _log_warn(
+            f"terminating pi process group [{label}] reason={reason} pid={proc.pid} pgid={pgid}"
+        )
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(pgid, signal.SIGTERM)
+    else:
+        _log_warn(
+            f"terminating pi process [{label}] reason={reason} pid={proc.pid} pgid=unavailable"
+        )
+        with contextlib.suppress(ProcessLookupError):
+            proc.terminate()
+
+    try:
+        await asyncio.wait_for(proc.wait(), timeout=term_timeout)
+        return
+    except asyncio.TimeoutError:
+        pass
+    except ProcessLookupError:
+        return
+
+    if pgid is not None:
+        _log_warn(
+            f"force killing pi process group [{label}] reason={reason} pid={proc.pid} pgid={pgid}"
+        )
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(pgid, signal.SIGKILL)
+    else:
+        _log_warn(
+            f"force killing pi process [{label}] reason={reason} pid={proc.pid} pgid=unavailable"
+        )
+        with contextlib.suppress(ProcessLookupError):
+            proc.kill()
+
+    with contextlib.suppress(Exception):
+        await asyncio.wait_for(proc.wait(), timeout=kill_timeout)
 
 
 def _build_args(
@@ -768,8 +831,11 @@ async def _run_with_api_retry(
     """内层循环：启动 pi 子进程，处理 API 级错误重试。"""
     api_attempt = 0
     query_engine_401_failures = 0
+    process_launch_attempt = 0
 
     while True:
+        process_launch_attempt += 1
+        process_label = f"launch-{process_launch_attempt}"
         result = AgentResult()
 
         # ── 拉起子进程（OSError 由外层 catch）──
@@ -780,6 +846,10 @@ async def _run_with_api_retry(
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             stdin=asyncio.subprocess.PIPE,  # RPC: 通过 stdin 发送 prompt
+            start_new_session=True,
+        )
+        _log_info(
+            f"started pi process [{process_label}] pid={proc.pid} pgid={_proc_group_id(proc)} cwd={cwd}"
         )
 
         cancel_task = None
@@ -787,10 +857,11 @@ async def _run_with_api_retry(
 
             async def _cancel_monitor():
                 await cancel_event.wait()
-                try:
-                    proc.terminate()
-                except ProcessLookupError:
-                    pass
+                await _terminate_pi_process_tree(
+                    proc,
+                    label=process_label,
+                    reason="cancel_event",
+                )
 
             cancel_task = asyncio.create_task(_cancel_monitor())
 
@@ -892,46 +963,31 @@ async def _run_with_api_retry(
                 result.exit_code = proc.returncode or 0
             except asyncio.TimeoutError:
                 _log_warn("pi 进程未在 15s 内退出，强制终止")
-                proc.kill()
-                await proc.wait()
+                await _terminate_pi_process_tree(
+                    proc,
+                    label=process_label,
+                    reason="exit_timeout",
+                )
                 result.exit_code = -1
 
         except asyncio.CancelledError:
             _log_warn("agent run cancelled, terminating pi process")
-            with contextlib.suppress(Exception):
-                proc.terminate()
-            try:
-                await asyncio.wait_for(proc.wait(), timeout=5)
-            except Exception:
-                with contextlib.suppress(Exception):
-                    proc.kill()
-                with contextlib.suppress(Exception):
-                    await proc.wait()
-            raise
-
-        except asyncio.CancelledError:
-            try:
-                proc.terminate()
-                await asyncio.wait_for(proc.wait(), timeout=5)
-            except Exception:
-                try:
-                    proc.kill()
-                except Exception:
-                    pass
+            await _terminate_pi_process_tree(
+                proc,
+                label=process_label,
+                reason="task_cancelled",
+            )
             raise
         except Exception as e:
             # 管道断裂、进程被杀等
             _log_warn(f"pi 进程读取异常: {e}")
             result.error = f"pi process read error: {e}"
             result.exit_code = -1
-            try:
-                proc.terminate()
-                await asyncio.wait_for(proc.wait(), timeout=5)
-            except Exception:
-                try:
-                    proc.kill()
-                except Exception:
-                    pass
+            await _terminate_pi_process_tree(
+                proc,
+                label=process_label,
+                reason=f"read_exception:{type(e).__name__}",
+            )
 
         finally:
             if cancel_task:
@@ -940,6 +996,14 @@ async def _run_with_api_retry(
                     await cancel_task
                 except asyncio.CancelledError:
                     pass
+            if proc.returncode is None:
+                await _terminate_pi_process_tree(
+                    proc,
+                    label=process_label,
+                    reason="finally_cleanup",
+                    term_timeout=2.0,
+                    kill_timeout=2.0,
+                )
 
         # ── 提取输出 ──
         for msg in reversed(result.messages):
