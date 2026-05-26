@@ -1,5 +1,6 @@
 import sys
 import unittest
+from datetime import timedelta
 from pathlib import Path
 
 from sqlalchemy import create_engine
@@ -77,7 +78,7 @@ class ExecutionCoordinatorTests(unittest.TestCase):
             db1.close()
             db2.close()
 
-    def test_claim_does_not_reacquire_running_task_with_expired_lease(self):
+    def test_claim_reacquires_running_task_with_expired_lease(self):
         self._insert_task(
             status="running",
             execution_owner_id="pod-old",
@@ -89,10 +90,34 @@ class ExecutionCoordinatorTests(unittest.TestCase):
         db = self._session()
         try:
             claimed = claim_one_runnable_task(db, "pod-new")
+            self.assertIsNotNone(claimed)
+            self.assertEqual(claimed.epoch, 4)
+            row = db.query(AppDfaTask).filter_by(task_id="dfa_test_1").first()
+            self.assertEqual(row.execution_owner_id, "pod-new")
+            self.assertEqual(row.status, "pending")
+            self.assertEqual(row.dispatch_status, "leased")
+            self.assertEqual(row.execution_epoch, 4)
+        finally:
+            db.close()
+
+    def test_claim_does_not_reacquire_running_task_with_live_lease(self):
+        future = now_local() + timedelta(hours=1)
+        self._insert_task(
+            status="running",
+            execution_owner_id="pod-old",
+            execution_lease_until=future,
+            execution_epoch=3,
+            control_version=2,
+            dispatch_status="running",
+        )
+        db = self._session()
+        try:
+            claimed = claim_one_runnable_task(db, "pod-new")
             self.assertIsNone(claimed)
             row = db.query(AppDfaTask).filter_by(task_id="dfa_test_1").first()
             self.assertEqual(row.execution_owner_id, "pod-old")
             self.assertEqual(row.status, "running")
+            self.assertEqual(row.execution_epoch, 3)
         finally:
             db.close()
 

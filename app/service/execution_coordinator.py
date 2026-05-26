@@ -39,30 +39,38 @@ def claim_one_runnable_task(db: Session, owner_id: str) -> ClaimedTask | None:
         db.query(AppDfaTask)
         .filter(
             AppDfaTask.is_deleted.is_(False),
-            AppDfaTask.status == "pending",
+            AppDfaTask.status.in_(["pending", "running"]),
             ((AppDfaTask.execution_lease_until.is_(None)) | (AppDfaTask.execution_lease_until < now)),
         )
-        .order_by(AppDfaTask.created_at.asc(), AppDfaTask.id.asc())
+        .order_by(AppDfaTask.status.asc(), AppDfaTask.created_at.asc(), AppDfaTask.id.asc())
         .first()
     )
     if candidate is None:
         return None
+
+    expected_status = str(candidate.status or "pending")
+    update_fields = {
+        AppDfaTask.execution_owner_id: owner_id,
+        AppDfaTask.execution_lease_until: _lease_deadline(),
+        AppDfaTask.execution_heartbeat_at: now,
+        AppDfaTask.execution_epoch: int(candidate.execution_epoch or 0) + 1,
+        AppDfaTask.dispatch_status: "leased",
+    }
+    if expected_status == "running":
+        # Reclaimed tasks lost their worker lease during rollout/crash; make them
+        # re-enter the normal dispatch path instead of staying in stale running.
+        update_fields[AppDfaTask.status] = "pending"
+
     updated = (
         db.query(AppDfaTask)
         .filter(
             AppDfaTask.id == candidate.id,
             AppDfaTask.is_deleted.is_(False),
-            AppDfaTask.status == "pending",
+            AppDfaTask.status == expected_status,
             ((AppDfaTask.execution_lease_until.is_(None)) | (AppDfaTask.execution_lease_until < now)),
         )
         .update(
-            {
-                AppDfaTask.execution_owner_id: owner_id,
-                AppDfaTask.execution_lease_until: _lease_deadline(),
-                AppDfaTask.execution_heartbeat_at: now,
-                AppDfaTask.execution_epoch: int(candidate.execution_epoch or 0) + 1,
-                AppDfaTask.dispatch_status: "leased",
-            },
+            update_fields,
             synchronize_session=False,
         )
     )
