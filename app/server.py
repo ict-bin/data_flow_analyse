@@ -45,6 +45,7 @@ from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel, Field
 from sse_starlette.sse import EventSourceResponse
 
+from .build_info import build_service_meta
 from .config import build_task_config, get_service_yaml, load_service_config
 from .logging_utils import configure_container_logging
 from .metrics import observe_request as observe_metrics_request, render_aggregate_metrics, render_local_metrics
@@ -160,6 +161,7 @@ async def health():
     bootstrap = get_runtime_bootstrap().status()
     payload = {
         "status": "ok",
+        **build_service_meta(),
         "instance_id": INSTANCE_ID,
         "role": ROLE,
         "public_api_enabled": PUBLIC_API_ENABLED,
