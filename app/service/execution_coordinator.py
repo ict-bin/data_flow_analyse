@@ -15,6 +15,7 @@ class ClaimedTask:
     task_id: str
     epoch: int
     control_version: int
+    dispatch_status: str | None = None
 
 
 @dataclass
@@ -84,6 +85,7 @@ def claim_one_runnable_task(db: Session, owner_id: str) -> ClaimedTask | None:
         task_id=refreshed.task_id,
         epoch=int(refreshed.execution_epoch or 0),
         control_version=int(refreshed.control_version or 0),
+        dispatch_status=refreshed.dispatch_status,
     )
 
 
