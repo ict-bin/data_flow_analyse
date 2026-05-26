@@ -610,6 +610,11 @@ async def run_agent(
         return await _dr(prompt, cwd=cwd, session_file=session_file,
                          post_skill_prompt=post_skill_prompt,
                          on_stream=on_stream)
+    if cancel_event and cancel_event.is_set():
+        r = AgentResult()
+        r.error = "cancelled"
+        r.exit_code = -1
+        return r
     try:
         pi_cmd = _find_pi_command()
     except FileNotFoundError as e:

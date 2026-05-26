@@ -557,6 +557,13 @@ class PerTaintWorkflow:
         self.worker_tools = cfg.workers.agents[0].tools or cfg.workers.default_tools
         self.judge_tools = cfg.judges.agents[0].tools or cfg.judges.default_tools
 
+    def _is_cancelled(self) -> bool:
+        return bool(self.cancel_event and self.cancel_event.is_set())
+
+    def _raise_if_cancelled(self) -> None:
+        if self._is_cancelled():
+            raise asyncio.CancelledError("taint workflow cancelled")
+
     def _emit(self, etype: str, **data):
         if self.on_event:
             try:
@@ -658,6 +665,7 @@ class PerTaintWorkflow:
         _taint_sem = asyncio.Semaphore(_taint_concurrency)
 
         for rnd in range(1, max_rounds + 1):
+            self._raise_if_cancelled()
             round_started_at = _utc_now_iso()
             round_started_ts = time.time()
             rnd_dir = self.out_dir / f"round_{rnd:03d}"
@@ -678,6 +686,7 @@ class PerTaintWorkflow:
             # ── Phase 2: 并行 taint sessions（受 _taint_sem 并发限制）──────────
             async def run_taint(param: str) -> tuple[str, object]:
                 async with _taint_sem:
+                    self._raise_if_cancelled()
                     fb = taint_feedbacks.get(param, "")
                     prompt = _build_taint_prompt(
                         param, self.func_name,
@@ -694,6 +703,7 @@ class PerTaintWorkflow:
                         post_skill_prompt=post_skill,
                         **self._agent_kwargs(self.taint_sess[param])
                     )
+                    self._raise_if_cancelled()
                     self._emit("worker_done",
                                worker_id=f"worker-taint-{_safe_param(param)}",
                                output=res.output[:200],
@@ -704,6 +714,7 @@ class PerTaintWorkflow:
             taint_results_raw = await asyncio.gather(*[
                 run_taint(p) for p in self.taint_params
             ])
+            self._raise_if_cancelled()
             taint_results: dict[str, object] = dict(taint_results_raw)
             for _taint_result in taint_results.values():
                 total_tokens += _taint_result.token_usage
@@ -732,6 +743,7 @@ class PerTaintWorkflow:
                 post_skill_prompt=summary_post,
                 **self._agent_kwargs(self.summary_sess)
             )
+            self._raise_if_cancelled()
             self._emit("worker_done", worker_id="worker-summary",
                        output=summary_result.output[:200],
                        tokens_in=summary_result.token_usage.input,
@@ -781,6 +793,7 @@ class PerTaintWorkflow:
                 prompt=eval_prompt,
                 **self._agent_kwargs(judge_session_file, is_judge=True)
             )
+            self._raise_if_cancelled()
             self._emit("judge_done", judge_id="judge-0",
                        output=judge_result.output[:200],
                        tokens_in=judge_result.token_usage.input,
@@ -912,6 +925,17 @@ class PerTaintWorkflow:
                     ),
                 )
 
+        if self._is_cancelled():
+            return self._make_result(
+                "",
+                summary_result if 'summary_result' in dir() else None,
+                passed=False,
+                rounds=round_results,
+                total_tokens=total_tokens,
+                completion_reason="cancelled",
+                status_override=TaskStatus.ERROR,
+                final_output_override="# 数据流分析已取消\n",
+            )
         if round_results:
             round_results[-1].completion_reason = "failed"
         return self._make_result(

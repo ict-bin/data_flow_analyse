@@ -30,6 +30,7 @@ from app.orchestrator import Orchestrator
 from app.runtime_context import HEARTBEAT_INTERVAL_SECONDS, WORKER_ID, MAX_LOCAL_RUNNING_TASKS
 from app.service.execution_coordinator import begin_execution_if_owner, claim_one_runnable_task, commit_terminal_state_if_owner, load_execution_snapshot, release_lease, renew_lease, still_owner
 from app.time_utils import isoformat_local, now_local
+from app.agent_process import cleanup_orphan_pi_processes
 
 logger = logging.getLogger("dfa.task_service")
 
@@ -1952,6 +1953,10 @@ class TaskService:
                 pass
         finally:
             stop_heartbeat.set()
+            try:
+                cleanup_orphan_pi_processes(logger.warning, label=f"task_finally:{task_id}")
+            except Exception:
+                logger.warning("failed to cleanup orphan pi processes for %s", task_id, exc_info=True)
             if heartbeat_task is not None and not heartbeat_task.done():
                 heartbeat_task.cancel()
                 try:

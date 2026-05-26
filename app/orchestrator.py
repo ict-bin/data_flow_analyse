@@ -124,6 +124,13 @@ class Orchestrator(JudgeMixin):
         except Exception:
             pass
 
+    def _is_cancelled(self) -> bool:
+        return bool(self._cancel_event and self._cancel_event.is_set())
+
+    def _raise_if_cancelled(self) -> None:
+        if self._is_cancelled():
+            raise asyncio.CancelledError("orchestrator cancelled")
+
     async def execute(
         self,
         task_id: str | None = None,
@@ -211,7 +218,7 @@ class Orchestrator(JudgeMixin):
             feedback_for_workers = ""
 
             for rnd_num in (range(1, cfg.max_rounds + 1) if cfg.max_rounds >= 0 else __import__('itertools').count(1)):
-                if self._cancel_event.is_set():
+                if self._is_cancelled():
                     break
 
                 self._emit("round_start", task_id, round=rnd_num,
@@ -241,6 +248,7 @@ class Orchestrator(JudgeMixin):
                 # write-dataflow skill 已安装到 ~/.pi/agent/skills/（支持该机制的模型可自动发现）
                 # GLM-5 不支持 /skill: 命令，阶段4指令已直接内嵌入 Worker system prompt
                 for i, acfg in enumerate(cfg.workers.agents):
+                    self._raise_if_cancelled()
                     wid = f"worker-{i}"
                     self._emit("worker_start", task_id, worker_id=wid,
                                model=acfg.model, round=rnd_num,
@@ -285,10 +293,13 @@ class Orchestrator(JudgeMixin):
                             "worker_stream", task_id, worker_id=wid, delta=d),
                     })
 
+                self._raise_if_cancelled()
                 w_raw = await run_agents_parallel(w_tasks, concurrency=cfg.worker_count)
+                self._raise_if_cancelled()
 
                 round_workers: list[WorkerResult] = []
                 for i, wr in enumerate(w_raw):
+                    self._raise_if_cancelled()
                     wid = f"worker-{i}"
                     output = _extract_result(wr.output)
                     result.total_tokens += wr.token_usage
@@ -372,7 +383,9 @@ class Orchestrator(JudgeMixin):
                     _run_one_judge(j_idx, j_acfg)
                     for j_idx, j_acfg in enumerate(cfg.judges.agents)
                 ]
+                self._raise_if_cancelled()
                 round_judges: list[JudgeRoundResult] = list(await asyncio.gather(*judge_tasks_async))
+                self._raise_if_cancelled()
 
                 # 汇总事件 + token
                 for j_idx, j_result in enumerate(round_judges):
@@ -460,6 +473,10 @@ class Orchestrator(JudgeMixin):
                         result.completion_reason = "max_rounds_exceeded"
                     break
 
+        except asyncio.CancelledError:
+            result.status = TaskStatus.ERROR
+            result.error = "cancelled"
+            self._emit("error", task_id, error="cancelled")
         except Exception as e:
             result.status = TaskStatus.ERROR
             result.error = str(e)
@@ -605,6 +622,7 @@ class Orchestrator(JudgeMixin):
                          cfg.model_copy(deep=True), root_task_id, 0, tainted_context))
 
         async def process_item(item: tuple) -> None:
+            self._raise_if_cancelled()
             func_name, src_file, line_hint, task_cfg, tid, dep, taint_ctx = item
 
             # 通知 CLI: 新函数开始
@@ -649,6 +667,7 @@ class Orchestrator(JudgeMixin):
                         result = None
 
             if result is None:
+                self._raise_if_cancelled()
                 # 执行：使用 PerTaintWorkflow 实现多 session 并行污点分析
                 _taint_match = re.search(r'外部输入参数.*?为[:：]\s*([^\n]+)',
                                         task_cfg.task or "")
@@ -680,6 +699,7 @@ class Orchestrator(JudgeMixin):
                     cancel_event=self._cancel_event,
                 )
                 result = await workflow.run()
+                self._raise_if_cancelled()
 
             _relativize_round_artifacts(result, out_dir, root_out_dir)
 
@@ -790,6 +810,7 @@ class Orchestrator(JudgeMixin):
                                callees=[c.function_name for c in valid], depth=dep)
 
                 for callee in valid[:MAX_CALLEES_PER_LEVEL]:
+                    self._raise_if_cancelled()
                     sub_file = callee.file or src_file
                     sub_cfg = task_cfg.model_copy(deep=True)
                     sub_cfg.function_name = callee.function_name
@@ -813,17 +834,23 @@ class Orchestrator(JudgeMixin):
                         # fallback: 调用点行号（粗略）
                         sub_line_hint = callee.line if callee.line.startswith("L") else (
                             "L" + callee.line.lstrip("L") if callee.line else "")
+                    if self._is_cancelled():
+                        break
                     await queue.put((callee.function_name, sub_file, sub_line_hint, sub_cfg,
                                      sub_tid, dep + 1, tainted_ctx_str))
 
         async def worker(wid: int) -> None:
             while True:
+                if self._is_cancelled() and queue.empty():
+                    break
                 item = await queue.get()
                 if item is None:      # sentinel → 退出
                     queue.task_done()
                     break
                 try:
                     await process_item(item)
+                except asyncio.CancelledError:
+                    return
                 except Exception as e:
                     tid = item[3] if len(item) > 3 else "?"
                     self._emit("error", tid, error=str(e))
@@ -835,6 +862,11 @@ class Orchestrator(JudgeMixin):
 
         # 等待所有任务处理完毕
         await queue.join()
+        if self._is_cancelled():
+            for task in workers:
+                task.cancel()
+            await asyncio.gather(*workers, return_exceptions=True)
+            raise asyncio.CancelledError("recursive orchestration cancelled")
 
         # 发送终止 sentinel
         for _ in range(n_workers):
@@ -868,6 +900,7 @@ class Orchestrator(JudgeMixin):
             )
             # 2. 尝试 LLM merge 增强 — 失败时保留程序化报告，不阻断流程
             try:
+                self._raise_if_cancelled()
                 merged = await self._run_merge_agent(
                     root_function=cfg.function_name,
                     dataflow_files=sub_dataflow_files,

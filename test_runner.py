@@ -111,6 +111,27 @@ class RunAgentPromptFileTests(unittest.TestCase):
 
         self.assertIn("cancelled during pi retry backoff", result.error or "")
 
+    def test_run_agent_returns_before_spawn_when_cancelled(self):
+        async def scenario():
+            cancel_event = asyncio.Event()
+            cancel_event.set()
+            return await runner.run_agent(
+                "hello",
+                model="test-model",
+                tools=["read"],
+                cwd=".",
+                cancel_event=cancel_event,
+            )
+
+        with patch.object(runner, "_find_pi_command") as find_pi_command:
+            with patch.object(runner, "_run_with_pi_retry") as run_with_pi_retry:
+                result = asyncio.run(scenario())
+
+        find_pi_command.assert_not_called()
+        run_with_pi_retry.assert_not_called()
+        self.assertEqual(result.error, "cancelled")
+        self.assertEqual(result.exit_code, -1)
+
     def test_run_agent_uses_prompt_file_instead_of_raw_argv(self):
         captured = {}
 
