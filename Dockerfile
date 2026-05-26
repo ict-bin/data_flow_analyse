@@ -28,7 +28,7 @@ COPY tools/             ./tools/
 COPY skills/            ./skills/
 COPY config.example.json .env.example ./
 COPY requirements.txt ./
-RUN printf '{\"build_version\":\"%s\"}\n' "$SECFLOW_BUILD_VERSION" > /opt/data_flow_analyse/build_meta.json
+RUN printf '{"build_version":"%s"}\n' "$SECFLOW_BUILD_VERSION" > /opt/data_flow_analyse/build_meta.json
 RUN pip install --no-cache-dir --break-system-packages -r requirements.txt -q
 RUN find . -name '*.sh' -exec sed -i 's/\r$//' {} + && chmod +x scripts/*.sh 2>/dev/null || true
 # 安装工具：extract_func / gen_dataflow / gen_tainted_list 供 Worker 直接调用
