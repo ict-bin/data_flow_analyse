@@ -57,6 +57,7 @@ def render_local_metrics() -> str:
         lines.append("secflow_dfa_up 1")
         lines.extend(_render_request_metrics())
         lines.extend(_render_local_runtime_metrics())
+        lines.extend(_render_agent_observability_metrics())
     except Exception:
         lines.append("secflow_dfa_up 0")
     return "\n".join(lines) + "\n"
@@ -69,12 +70,28 @@ def render_aggregate_metrics() -> str:
     ]
     try:
         started = time.perf_counter()
+        from .api.tasks import _LAST_AGENT_AGGREGATE_META
         lines.append("secflow_dfa_metrics_aggregate_up 1")
         lines.extend(_render_cluster_task_metrics())
         lines.extend([
             "# HELP secflow_dfa_metrics_aggregate_partial Aggregate metrics returned a partial response.",
             "# TYPE secflow_dfa_metrics_aggregate_partial gauge",
-            "secflow_dfa_metrics_aggregate_partial 0",
+            f"secflow_dfa_metrics_aggregate_partial {1 if _LAST_AGENT_AGGREGATE_META.get('partial') else 0}",
+            "# HELP secflow_dfa_agent_aggregate_sources Aggregate agent fanout successful source count.",
+            "# TYPE secflow_dfa_agent_aggregate_sources gauge",
+            f"secflow_dfa_agent_aggregate_sources {int(_LAST_AGENT_AGGREGATE_META.get('sources') or 0)}",
+            "# HELP secflow_dfa_agent_aggregate_fanout_errors_total Aggregate agent fanout error count.",
+            "# TYPE secflow_dfa_agent_aggregate_fanout_errors_total gauge",
+            f"secflow_dfa_agent_aggregate_fanout_errors_total {int(_LAST_AGENT_AGGREGATE_META.get('fanout_errors') or 0)}",
+            "# HELP secflow_dfa_agent_aggregate_duration_seconds Aggregate agent fanout duration in seconds.",
+            "# TYPE secflow_dfa_agent_aggregate_duration_seconds gauge",
+            f"secflow_dfa_agent_aggregate_duration_seconds {_fmt(float(_LAST_AGENT_AGGREGATE_META.get('duration_seconds') or 0.0))}",
+            "# HELP secflow_dfa_agent_aggregate_cache_hits_total Aggregate agent snapshot cache hit count.",
+            "# TYPE secflow_dfa_agent_aggregate_cache_hits_total counter",
+            f"secflow_dfa_agent_aggregate_cache_hits_total {int(_LAST_AGENT_AGGREGATE_META.get('cache_hits') or 0)}",
+            "# HELP secflow_dfa_agent_aggregate_cache_misses_total Aggregate agent snapshot cache miss count.",
+            "# TYPE secflow_dfa_agent_aggregate_cache_misses_total counter",
+            f"secflow_dfa_agent_aggregate_cache_misses_total {int(_LAST_AGENT_AGGREGATE_META.get('cache_misses') or 0)}",
             "# HELP secflow_dfa_metrics_aggregate_duration_seconds Aggregate metrics render duration in seconds.",
             "# TYPE secflow_dfa_metrics_aggregate_duration_seconds gauge",
             f"secflow_dfa_metrics_aggregate_duration_seconds {_fmt(time.perf_counter() - started)}",
@@ -587,6 +604,76 @@ def _labels(**labels: Any) -> str:
 
 def _fmt(value: float) -> str:
     return f"{float(value):.6f}"
+
+
+def _render_agent_observability_metrics() -> list[str]:
+    from .db import get_db
+    from .service.agent_observability import get_agent_observability_service
+
+    try:
+        db_gen = get_db()
+        db: Session = next(db_gen)
+        try:
+            snapshot = get_agent_observability_service().build_snapshot(db)
+        finally:
+            try:
+                next(db_gen)
+            except StopIteration:
+                pass
+    except Exception:
+        return []
+
+    processes = list(snapshot.get("processes") or [])
+    sessions = list(snapshot.get("sessions") or [])
+    tasks = list(snapshot.get("tasks") or [])
+    lines = [
+        "# HELP secflow_dfa_agent_process_total Agent process total grouped by owner state, pod and role.",
+        "# TYPE secflow_dfa_agent_process_total gauge",
+        "# HELP secflow_dfa_agent_orphan_process_total Confirmed orphan agent process total by pod.",
+        "# TYPE secflow_dfa_agent_orphan_process_total gauge",
+        "# HELP secflow_dfa_agent_killable_orphan_process_total Killable orphan agent process total by pod.",
+        "# TYPE secflow_dfa_agent_killable_orphan_process_total gauge",
+        "# HELP secflow_dfa_agent_session_total Agent session total grouped by state, pod and role.",
+        "# TYPE secflow_dfa_agent_session_total gauge",
+        "# HELP secflow_dfa_agent_orphan_session_total Orphan agent session total by pod.",
+        "# TYPE secflow_dfa_agent_orphan_session_total gauge",
+        "# HELP secflow_dfa_agent_task_ownership_total Agent task ownership total by status.",
+        "# TYPE secflow_dfa_agent_task_ownership_total gauge",
+    ]
+    process_counts: dict[tuple[str, str, str], int] = defaultdict(int)
+    session_counts: dict[tuple[str, str, str], int] = defaultdict(int)
+    orphan_by_pod: dict[str, int] = defaultdict(int)
+    killable_by_pod: dict[str, int] = defaultdict(int)
+    orphan_sessions_by_pod: dict[str, int] = defaultdict(int)
+    ownership_counts: dict[str, int] = defaultdict(int)
+    for item in processes:
+        key = (str(item.get("owner_kind") or "unknown"), str(item.get("pod_name") or "unknown"), str(item.get("role_kind") or "unknown"))
+        process_counts[key] += 1
+        if str(item.get("owner_kind") or "") == "orphan":
+            orphan_by_pod[str(item.get("pod_name") or "unknown")] += 1
+            if bool(item.get("kill_allowed")):
+                killable_by_pod[str(item.get("pod_name") or "unknown")] += 1
+    for item in sessions:
+        session_state = "orphan" if bool(item.get("orphan_session")) else ("live" if bool(item.get("live")) else "history")
+        key = (session_state, str(item.get("pod_name") or "unknown"), str(item.get("role_kind") or "unknown"))
+        session_counts[key] += 1
+        if bool(item.get("orphan_session")):
+            orphan_sessions_by_pod[str(item.get("pod_name") or "unknown")] += 1
+    for item in tasks:
+        ownership_counts[str(item.get("ownership_status") or "unknown")] += 1
+    for (state, pod, role_kind), value in sorted(process_counts.items()):
+        lines.append(f"secflow_dfa_agent_process_total{_labels(state=state, pod=pod, role_kind=role_kind)} {value}")
+    for pod, value in sorted(orphan_by_pod.items()):
+        lines.append(f"secflow_dfa_agent_orphan_process_total{_labels(pod=pod)} {value}")
+    for pod, value in sorted(killable_by_pod.items()):
+        lines.append(f"secflow_dfa_agent_killable_orphan_process_total{_labels(pod=pod)} {value}")
+    for (state, pod, role_kind), value in sorted(session_counts.items()):
+        lines.append(f"secflow_dfa_agent_session_total{_labels(state=state, pod=pod, role_kind=role_kind)} {value}")
+    for pod, value in sorted(orphan_sessions_by_pod.items()):
+        lines.append(f"secflow_dfa_agent_orphan_session_total{_labels(pod=pod)} {value}")
+    for ownership_status, value in sorted(ownership_counts.items()):
+        lines.append(f"secflow_dfa_agent_task_ownership_total{_labels(ownership_status=ownership_status)} {value}")
+    return lines
 
 
 def _append_ai_alias_metrics(
