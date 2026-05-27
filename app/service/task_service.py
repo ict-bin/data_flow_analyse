@@ -29,6 +29,7 @@ from app.models import SwarmEvent, TaskStatus
 from app.orchestrator import Orchestrator
 from app.runtime_context import HEARTBEAT_INTERVAL_SECONDS, WORKER_ID, MAX_LOCAL_RUNNING_TASKS
 from app.service.execution_coordinator import begin_execution_if_owner, claim_one_runnable_task, commit_terminal_state_if_owner, load_execution_snapshot, release_lease, renew_lease, still_owner
+from app.service.session_index import build_session_catalog
 from app.time_utils import isoformat_local, now_local
 from app.agent_process import cleanup_orphan_pi_processes
 
@@ -421,6 +422,94 @@ def _write_json_atomic(path: Path, payload: dict) -> None:
         except FileNotFoundError:
             pass
         raise
+
+
+def _safe_session_file(root: Path, relative_path: str) -> Path:
+    rel = Path(relative_path)
+    if rel.is_absolute() or ".." in rel.parts:
+        from fastapi import HTTPException
+        raise HTTPException(400, "非法会话路径")
+    run_root = (root / "run").resolve()
+    target = (run_root / rel).resolve()
+    try:
+        target.relative_to(run_root)
+    except ValueError:
+        from fastapi import HTTPException
+        raise HTTPException(400, "非法会话路径")
+    if target.suffix != ".jsonl":
+        from fastapi import HTTPException
+        raise HTTPException(400, "仅支持 jsonl 会话文件")
+    return target
+
+
+def _parse_session_file(path: Path) -> dict[str, object]:
+    events: list[dict[str, object]] = []
+    warnings: list[str] = []
+    session_meta: dict[str, object] | None = None
+    if not path.exists() or not path.is_file():
+        from fastapi import HTTPException
+        raise HTTPException(404, "会话文件不存在")
+    lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    for index, raw in enumerate(lines, start=1):
+        line = raw.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except Exception:
+            warnings.append(f"第 {index} 行 JSON 解析失败")
+            events.append({"type": "raw", "event_index": index, "line": index, "raw_line": line[:500], "summary": line[:200]})
+            continue
+        if isinstance(obj, dict) and obj.get("type") == "session":
+            session_meta = obj
+            continue
+        if not isinstance(obj, dict):
+            warnings.append(f"第 {index} 行不是 JSON 对象")
+            continue
+        obj.setdefault("event_index", index)
+        obj.setdefault("line", index)
+        obj.setdefault("raw_line", line)
+        events.append(obj)
+    return {
+        "events": events,
+        "warnings": warnings,
+        "session_meta": session_meta,
+        "line_count": len(lines),
+    }
+
+
+def _build_task_session_catalog(row: AppDfaTask) -> dict[str, object]:
+    root = _task_root(row)
+    run_root = root / "run" if str(root) else Path()
+    if not run_root.exists():
+        return {
+            "task_id": row.task_id,
+            "status": row.status,
+            "sessions_root": str(run_root / "sessions"),
+            "index_path": str(run_root / "sessions" / "index.json"),
+            "generated_at": None,
+            "items": [],
+            "index": {
+                "version": 1,
+                "generated_at": None,
+                "task_id": row.task_id,
+                "task_status": row.status,
+                "sessions_root": str(run_root / "sessions"),
+                "summary": {},
+                "nodes": [],
+                "edges": [],
+                "groups": [],
+                "warnings": [],
+            },
+        }
+    result_json = _load_task_result_json(row)
+    return build_session_catalog(
+        task_id=row.task_id,
+        row_status=row.status,
+        run_root=run_root,
+        result_json=result_json,
+        write_json_atomic=_write_json_atomic,
+    )
 
 
 def _load_task_result_json(row: AppDfaTask) -> dict | None:
@@ -1077,6 +1166,38 @@ class TaskService:
                 break
             claimed += 1
         return claimed
+
+    def list_task_sessions(self, db: Session, task_id: str) -> list[dict[str, object]]:
+        row = self._get_or_404(db, task_id)
+        return list(_build_task_session_catalog(row).get("items", []))
+
+    def get_task_session_index(self, db: Session, task_id: str) -> dict[str, object]:
+        row = self._get_or_404(db, task_id)
+        catalog = _build_task_session_catalog(row)
+        return {
+            "task_id": catalog.get("task_id") or row.task_id,
+            "status": catalog.get("status") or row.status,
+            "sessions_root": catalog.get("sessions_root"),
+            "index_path": catalog.get("index_path"),
+            "generated_at": catalog.get("generated_at"),
+            **(catalog.get("index") or {}),
+        }
+
+    def get_task_session_file(self, db: Session, task_id: str, relative_path: str) -> dict[str, object]:
+        row = self._get_or_404(db, task_id)
+        root = _task_root(row)
+        if root is None:
+            from fastapi import HTTPException
+            raise HTTPException(404, "会话目录不存在")
+        target = _safe_session_file(root, relative_path)
+        parsed = _parse_session_file(target)
+        return {
+            "path": str(relative_path),
+            "session_meta": parsed["session_meta"],
+            "events": parsed["events"],
+            "warnings": parsed["warnings"],
+            "line_count": parsed["line_count"],
+        }
 
     def get_task_evaluation(self, db: Session, task_id: str) -> dict:
         row = self._get_or_404(db, task_id)
