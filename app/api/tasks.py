@@ -755,7 +755,7 @@ def _build_task_session_catalog(row) -> Dict[str, Any]:
 
 
 @router.post("/tasks", status_code=201)
-async def create_task(body: TaskCreateRequest, db: Session = Depends(get_db)):
+def create_task(body: TaskCreateRequest, db: Session = Depends(get_db)):
     prompt = body.prompt_content
     if not prompt or not prompt.strip():
         prompt = generate_prompt_from_path(body.input_path)
@@ -815,7 +815,7 @@ async def create_task(body: TaskCreateRequest, db: Session = Depends(get_db)):
 
 
 @router.get("/tasks")
-async def list_tasks(
+def list_tasks(
     project_id: str = Query(...),
     page: int = Query(1, ge=1),
     per_page: int = Query(100, ge=1, le=1000),
@@ -842,7 +842,7 @@ async def list_tasks(
 
 
 @router.get("/workers/cluster-capacity", response_model=WorkerClusterCapacityResponse)
-async def get_worker_cluster_capacity(
+def get_worker_cluster_capacity(
     project_id: str = Query(...),
     db: Session = Depends(get_db),
 ):
@@ -1390,17 +1390,17 @@ async def kill_all_agent_aggregate_orphans(
 
 
 @router.get("/tasks/{task_id}")
-async def get_task(task_id: str, db: Session = Depends(get_db)):
+def get_task(task_id: str, db: Session = Depends(get_db)):
     return get_task_service().get_task(db, task_id)
 
 
 @router.get("/tasks/{task_id}/execution")
-async def get_task_execution(task_id: str, db: Session = Depends(get_db)):
+def get_task_execution(task_id: str, db: Session = Depends(get_db)):
     return get_task_service().get_task_execution(db, task_id)
 
 
 @router.get("/tasks/{task_id}/result")
-async def get_task_result(task_id: str, db: Session = Depends(get_db)):
+def get_task_result(task_id: str, db: Session = Depends(get_db)):
     row = _get_task_row(db, task_id)
     root = _task_root(row)
     warnings: List[str] = []
@@ -1460,13 +1460,13 @@ async def get_task_result(task_id: str, db: Session = Depends(get_db)):
 
 
 @router.get("/tasks/{task_id}/sessions")
-async def list_task_sessions(task_id: str, db: Session = Depends(get_db)):
+def list_task_sessions(task_id: str, db: Session = Depends(get_db)):
     row = _get_task_row(db, task_id)
     catalog = _build_task_session_catalog(row)
     return {"task_id": task_id, "items": catalog.get("items", []), "current_epoch": None}
 
 @router.get("/tasks/{task_id}/sessions/index", response_model=TaskSessionIndexResponse)
-async def get_task_session_index(task_id: str, db: Session = Depends(get_db)):
+def get_task_session_index(task_id: str, db: Session = Depends(get_db)):
     row = _get_task_row(db, task_id)
     catalog = _build_task_session_catalog(row)
     return {
@@ -1480,7 +1480,7 @@ async def get_task_session_index(task_id: str, db: Session = Depends(get_db)):
 
 
 @router.get("/tasks/{task_id}/sessions/file")
-async def get_task_session_file(task_id: str, path: str = Query(...), db: Session = Depends(get_db)):
+def get_task_session_file(task_id: str, path: str = Query(...), db: Session = Depends(get_db)):
     row = _get_task_row(db, task_id)
     root = _task_root(row)
     target = _safe_session_file(root, path)
@@ -1509,28 +1509,28 @@ async def get_task_session_file(task_id: str, path: str = Query(...), db: Sessio
 
 
 @router.get("/tasks/{task_id}/evaluation")
-async def get_task_evaluation(task_id: str, db: Session = Depends(get_db)):
+def get_task_evaluation(task_id: str, db: Session = Depends(get_db)):
     return get_task_service().get_task_evaluation(db, task_id)
 
 
 @router.post("/tasks/{task_id}/cancel")
-async def cancel_task(task_id: str, db: Session = Depends(get_db)):
+def cancel_task(task_id: str, db: Session = Depends(get_db)):
     return get_task_service().cancel_task(db, task_id)
 
 @router.post("/tasks/{task_id}/restart", status_code=201)
-async def restart_task(task_id: str, db: Session = Depends(get_db)):
+def restart_task(task_id: str, db: Session = Depends(get_db)):
     """Clone an existing task and start it immediately."""
     return get_task_service().restart_task(db, task_id)
 
 
 @router.post("/tasks/{task_id}/resume", status_code=201)
-async def resume_task(task_id: str, db: Session = Depends(get_db)):
+def resume_task(task_id: str, db: Session = Depends(get_db)):
     """从断点续跑：跳过已完成的函数，继续分析未完成部分。"""
     return get_task_service().resume_task(db, task_id)
 
 
 @router.delete("/tasks/{task_id}", status_code=204)
-async def delete_task(
+def delete_task(
     task_id: str,
     delete_files: bool = True,
     db: Session = Depends(get_db),
@@ -1540,26 +1540,26 @@ async def delete_task(
 
 
 @router.get("/tasks/{task_id}/timeline", response_model=TaskTimelineResponse)
-async def get_task_timeline(task_id: str, db: Session = Depends(get_db)):
+def get_task_timeline(task_id: str, db: Session = Depends(get_db)):
     return get_task_service().get_task_timeline(db, task_id)
 
 
 @router.delete("/tasks/{task_id}/timeline", response_model=ActionResponse)
-async def clear_task_timeline(task_id: str, db: Session = Depends(get_db)):
+def clear_task_timeline(task_id: str, db: Session = Depends(get_db)):
     deleted_event_count = get_task_service().clear_task_timeline(db, task_id)
     db.commit()
     return ActionResponse(status="ok", task_id=task_id, message="任务时间线已清空", deleted_event_count=deleted_event_count)
 
 
 @router.delete("/tasks/{task_id}/timeline/{event_id}", response_model=ActionResponse)
-async def delete_task_timeline_event(task_id: str, event_id: str, db: Session = Depends(get_db)):
+def delete_task_timeline_event(task_id: str, event_id: str, db: Session = Depends(get_db)):
     deleted_event_count = get_task_service().delete_task_timeline_event(db, task_id, event_id)
     db.commit()
     return ActionResponse(status="ok", task_id=task_id, message="事件已删除", deleted_event_count=deleted_event_count)
 
 
 @router.get("/tasks/{task_id}/logs")
-async def get_task_logs(task_id: str, db: Session = Depends(get_db)):
+def get_task_logs(task_id: str, db: Session = Depends(get_db)):
     """获取任务的实时阶段事件（stages_json）。"""
     from app.db.models import AppDfaTask
     row = db.query(AppDfaTask).filter(
@@ -1574,6 +1574,6 @@ async def get_task_logs(task_id: str, db: Session = Depends(get_db)):
 
 
 @router.post("/generate-prompt")
-async def generate_prompt(body: GeneratePromptRequest):
+def generate_prompt(body: GeneratePromptRequest):
     """Auto-generate a data flow analysis prompt from an input path."""
     return {"prompt": generate_prompt_from_path(body.input_path)}
