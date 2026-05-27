@@ -6,6 +6,7 @@ from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+import re
 
 from sqlalchemy.orm import Session
 
@@ -25,20 +26,51 @@ from .service.task_service import get_task_service
 from .service.worker_snapshot import build_worker_cluster_snapshot
 
 _REQUEST_LOCK = threading.Lock()
-_REQUEST_TOTAL = defaultdict(int)
-_REQUEST_DURATION = defaultdict(lambda: {"count": 0, "sum": 0.0})
+_HTTP_REQUEST_TOTAL = defaultdict(int)
+_HTTP_REQUEST_DURATION = defaultdict(lambda: {"count": 0, "sum": 0.0, "buckets": [0] * 13})
+_HTTP_REQUEST_INFLIGHT = defaultdict(int)
 _LOCAL_EVENT_LOCK = threading.Lock()
 _LOCAL_EVENT_TOTAL = defaultdict(int)
 _TERMINAL_STATUSES = {"passed", "failed", "error", "cancelled"}
+_HTTP_DURATION_BUCKETS = (0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0)
+_PATH_ID_SEGMENT_RE = re.compile(r"/(?:\d+|[0-9a-f]{8,}|[0-9a-f]{8}-[0-9a-f-]{27,})(?=/|$)", re.IGNORECASE)
 
 
-def observe_request(method: str, path: str, status_code: int, duration_seconds: float) -> None:
-    key = (method.upper(), path or "/", str(int(status_code)))
+def normalize_http_route(path: str | None) -> str:
+    raw = str(path or "/").strip() or "/"
+    return _PATH_ID_SEGMENT_RE.sub("/{id}", raw)
+
+
+def http_status_class(status_code: int | str | None) -> str:
+    try:
+        code = int(status_code or 500)
+    except (TypeError, ValueError):
+        code = 500
+    if code < 0:
+        return "cancelled"
+    return f"{code // 100}xx"
+
+
+def observe_http_request_inflight(method: str, route: str, delta: int) -> None:
+    key = (str(method or "GET").upper(), normalize_http_route(route))
     with _REQUEST_LOCK:
-        _REQUEST_TOTAL[key] += 1
-        bucket = _REQUEST_DURATION[key]
-        bucket["count"] += 1
-        bucket["sum"] += max(0.0, float(duration_seconds))
+        _HTTP_REQUEST_INFLIGHT[key] += int(delta)
+        if _HTTP_REQUEST_INFLIGHT[key] < 0:
+            _HTTP_REQUEST_INFLIGHT[key] = 0
+
+
+def observe_http_request(method: str, path: str, status_code: int, duration_seconds: float) -> None:
+    normalized_route = normalize_http_route(path)
+    http_key = (method.upper(), normalized_route, http_status_class(status_code), str(int(status_code)))
+    duration_key = (method.upper(), normalized_route)
+    with _REQUEST_LOCK:
+        _HTTP_REQUEST_TOTAL[http_key] += 1
+        duration_bucket = _HTTP_REQUEST_DURATION[duration_key]
+        duration_bucket["count"] += 1
+        duration_bucket["sum"] += max(0.0, float(duration_seconds))
+        for index, upper_bound in enumerate(_HTTP_DURATION_BUCKETS):
+            if duration_seconds <= upper_bound:
+                duration_bucket["buckets"][index] += 1
 
 
 def observe_local_event(event: str, result: str = "success") -> None:
@@ -103,21 +135,41 @@ def render_aggregate_metrics() -> str:
 
 def _render_request_metrics() -> list[str]:
     lines = [
-        "# HELP secflow_dfa_api_requests_total Total API requests observed by this process.",
-        "# TYPE secflow_dfa_api_requests_total counter",
-        "# HELP secflow_dfa_api_request_duration_seconds API request duration in seconds.",
-        "# TYPE secflow_dfa_api_request_duration_seconds summary",
+        "# HELP secflow_dfa_http_requests_total Total normalized HTTP requests observed by this process.",
+        "# TYPE secflow_dfa_http_requests_total counter",
+        "# HELP secflow_dfa_http_request_duration_seconds Normalized HTTP request duration in seconds.",
+        "# TYPE secflow_dfa_http_request_duration_seconds histogram",
+        "# HELP secflow_dfa_http_request_inflight Current inflight HTTP requests.",
+        "# TYPE secflow_dfa_http_request_inflight gauge",
     ]
     with _REQUEST_LOCK:
-        totals = dict(_REQUEST_TOTAL)
-        durations = {key: dict(value) for key, value in _REQUEST_DURATION.items()}
-    for key in sorted(set(totals) | set(durations)):
-        method, path, status = key
-        labels = _labels(method=method, path=path, status=status)
-        lines.append(f"secflow_dfa_api_requests_total{labels} {totals.get(key, 0)}")
-        duration = durations.get(key, {"count": 0, "sum": 0.0})
-        lines.append(f"secflow_dfa_api_request_duration_seconds_count{labels} {int(duration['count'])}")
-        lines.append(f"secflow_dfa_api_request_duration_seconds_sum{labels} {_fmt(duration['sum'])}")
+        http_totals = dict(_HTTP_REQUEST_TOTAL)
+        http_durations = {
+            key: {"count": value["count"], "sum": value["sum"], "buckets": list(value["buckets"])}
+            for key, value in _HTTP_REQUEST_DURATION.items()
+        }
+        http_inflight = dict(_HTTP_REQUEST_INFLIGHT)
+    for key in sorted(http_totals):
+        method, route, status_class, status_code = key
+        lines.append(
+            f"secflow_dfa_http_requests_total"
+            f"{_labels(method=method, route=route, status_class=status_class, status_code=status_code)} {http_totals[key]}"
+        )
+    for key in sorted(http_durations):
+        method, route = key
+        labels = _labels(method=method, route=route)
+        cumulative = 0
+        for index, upper_bound in enumerate(_HTTP_DURATION_BUCKETS):
+            cumulative += int(http_durations[key]["buckets"][index])
+            lines.append(
+                f"secflow_dfa_http_request_duration_seconds_bucket"
+                f"{_labels(method=method, route=route, le=_fmt(upper_bound))} {cumulative}"
+            )
+        lines.append(f"secflow_dfa_http_request_duration_seconds_sum{labels} {_fmt(http_durations[key]['sum'])}")
+        lines.append(f"secflow_dfa_http_request_duration_seconds_count{labels} {int(http_durations[key]['count'])}")
+    for key in sorted(http_inflight):
+        method, route = key
+        lines.append(f"secflow_dfa_http_request_inflight{_labels(method=method, route=route)} {int(http_inflight[key])}")
     return lines
 
 
