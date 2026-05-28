@@ -2,10 +2,11 @@ import sys
 import tempfile
 import unittest
 import os
+import asyncio
 from pathlib import Path
 from types import SimpleNamespace
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
@@ -223,6 +224,58 @@ class TaskTimelineTests(unittest.TestCase):
         finally:
             db.close()
 
+    def test_delete_task_records_task_deleted_event_before_soft_delete(self):
+        task_id = self._create_task()
+        task_dir = self.output_dir / task_id
+        task_dir.mkdir(parents=True, exist_ok=True)
+        (task_dir / "marker.txt").write_text("ok", encoding="utf-8")
+        db = self._session()
+        try:
+            row = db.query(AppDfaTask).filter_by(task_id=task_id).first()
+            row.status = "failed"
+            row.control_version = 7
+            db.commit()
+
+            self.service.delete_task(db, task_id, delete_files=True)
+
+            deleted_row = db.query(AppDfaTask).filter_by(task_id=task_id).first()
+            self.assertTrue(bool(deleted_row.is_deleted))
+            deleted_event = db.query(AppDfaTaskEvent).filter_by(task_id=task_id, event_type="task_deleted").first()
+            self.assertIsNotNone(deleted_event)
+            self.assertEqual("failed", deleted_event.status)
+            self.assertTrue(bool(deleted_event.payload.get("delete_files")))
+            self.assertTrue(bool(deleted_event.payload.get("files_deleted")))
+            self.assertEqual(str(task_dir), deleted_event.payload.get("task_dir"))
+            self.assertEqual("failed", deleted_event.payload.get("status_before_delete"))
+        finally:
+            db.close()
+
+    def test_delete_task_rejected_records_warning_without_soft_delete(self):
+        task_id = self._create_task()
+        db = self._session()
+        try:
+            row = db.query(AppDfaTask).filter_by(task_id=task_id).first()
+            row.status = "running"
+            row.execution_owner_id = "worker-a"
+            row.execution_lease_until = task_service_module.now_local()
+            row.dispatch_status = "running"
+            db.commit()
+
+            with self.assertRaises(HTTPException) as ctx:
+                self.service.delete_task(db, task_id, delete_files=False)
+
+            self.assertEqual(409, ctx.exception.status_code)
+            refreshed = db.query(AppDfaTask).filter_by(task_id=task_id).first()
+            self.assertFalse(bool(refreshed.is_deleted))
+            rejected_event = db.query(AppDfaTaskEvent).filter_by(task_id=task_id, event_type="task_delete_rejected").first()
+            self.assertIsNotNone(rejected_event)
+            self.assertEqual("warning", rejected_event.level)
+            self.assertFalse(bool(rejected_event.payload.get("delete_files")))
+            self.assertIn("lease_live", rejected_event.payload)
+            self.assertFalse(bool(rejected_event.payload.get("local_task_active")))
+        finally:
+            db.close()
+
     def test_record_task_event_deduplicates_same_event(self):
         task_id = self._create_task()
         db = self._session()
@@ -310,6 +363,7 @@ class TaskTimelineTests(unittest.TestCase):
         db = self._session()
         try:
             self.assertEqual(1, db.query(AppDfaTaskEvent).filter_by(task_id=task_id).count())
+            self.assertEqual(0, db.query(AppDfaTaskEvent).filter_by(task_id=task_id, event_type="timeline_event_deleted").count())
         finally:
             db.close()
 
@@ -343,8 +397,125 @@ class TaskTimelineTests(unittest.TestCase):
         db = self._session()
         try:
             self.assertEqual(0, db.query(AppDfaTaskEvent).filter_by(task_id=task_id).count())
+            self.assertEqual(0, db.query(AppDfaTaskEvent).filter_by(task_id=task_id, event_type="timeline_cleared").count())
         finally:
             db.close()
+
+    def test_delete_task_api_records_task_deleted_event(self):
+        task_id = self._create_task()
+        task_dir = self.output_dir / task_id
+        task_dir.mkdir(parents=True, exist_ok=True)
+        (task_dir / "marker.txt").write_text("ok", encoding="utf-8")
+
+        with self._build_client() as client:
+            response = client.delete(f"/api/app/dataflow-analyse/tasks/{task_id}")
+
+        self.assertEqual(204, response.status_code)
+        db = self._session()
+        try:
+            row = db.query(AppDfaTask).filter_by(task_id=task_id).first()
+            self.assertTrue(bool(row.is_deleted))
+            deleted_event = db.query(AppDfaTaskEvent).filter_by(task_id=task_id, event_type="task_deleted").first()
+            self.assertIsNotNone(deleted_event)
+            self.assertTrue(bool(deleted_event.payload.get("delete_files")))
+            self.assertEqual(str(task_dir), deleted_event.payload.get("task_dir"))
+        finally:
+            db.close()
+
+    def test_delete_task_api_rejects_running_task_and_records_warning(self):
+        task_id = self._create_task()
+        db = self._session()
+        try:
+            row = db.query(AppDfaTask).filter_by(task_id=task_id).first()
+            row.status = "running"
+            row.execution_owner_id = "worker-a"
+            row.dispatch_status = "running"
+            db.commit()
+        finally:
+            db.close()
+
+        with self._build_client() as client:
+            response = client.delete(f"/api/app/dataflow-analyse/tasks/{task_id}")
+
+        self.assertEqual(409, response.status_code)
+        db = self._session()
+        try:
+            row = db.query(AppDfaTask).filter_by(task_id=task_id).first()
+            self.assertFalse(bool(row.is_deleted))
+            rejected_event = db.query(AppDfaTaskEvent).filter_by(task_id=task_id, event_type="task_delete_rejected").first()
+            self.assertIsNotNone(rejected_event)
+            self.assertEqual("warning", rejected_event.level)
+        finally:
+            db.close()
+
+    def test_execute_task_pre_execution_rejections_record_timeline_events(self):
+        task_id = self._create_task()
+        db = self._session()
+        try:
+            row = db.query(AppDfaTask).filter_by(task_id=task_id).first()
+            row.status = "pending"
+            row.execution_owner_id = "worker-x"
+            row.execution_epoch = 1
+            row.control_version = 2
+            row.dispatch_status = "leased"
+            db.commit()
+        finally:
+            db.close()
+
+        previous_get_db = sys.modules["app.db"].get_db
+        previous_still_owner = task_service_module.still_owner
+        previous_begin = task_service_module.begin_execution_if_owner
+        previous_cleanup = task_service_module.cleanup_orphan_pi_processes
+        previous_release = task_service_module.release_lease
+        try:
+            def _fake_get_db():
+                db = self._session()
+                try:
+                    yield db
+                finally:
+                    db.close()
+
+            sys.modules["app.db"].get_db = _fake_get_db
+            task_service_module.cleanup_orphan_pi_processes = lambda *args, **kwargs: 0
+            task_service_module.release_lease = lambda db, task_id, owner_id, epoch: False
+
+            task_service_module.still_owner = lambda db, task_id, owner_id, epoch, control_version: False
+            asyncio.run(self.service._execute_task(task_id, 1, 2))
+
+            db = self._session()
+            try:
+                event = db.query(AppDfaTaskEvent).filter_by(task_id=task_id, event_type="task_not_owner_pre_execute").first()
+                self.assertIsNotNone(event)
+            finally:
+                db.close()
+
+            db = self._session()
+            try:
+                row = db.query(AppDfaTask).filter_by(task_id=task_id).first()
+                row.execution_owner_id = None
+                row.execution_epoch = 0
+                row.control_version = 0
+                row.dispatch_status = "pending"
+                db.commit()
+            finally:
+                db.close()
+
+            task_service_module.still_owner = lambda db, task_id, owner_id, epoch, control_version: True
+            task_service_module.begin_execution_if_owner = lambda db, task_id, owner_id, epoch, control_version, started_at=None: False
+            asyncio.run(self.service._execute_task(task_id, 1, 0))
+
+            db = self._session()
+            try:
+                event = db.query(AppDfaTaskEvent).filter_by(task_id=task_id, event_type="task_begin_execution_rejected").first()
+                self.assertIsNotNone(event)
+            finally:
+                db.close()
+        finally:
+            sys.modules["app.db"].get_db = previous_get_db
+            task_service_module.still_owner = previous_still_owner
+            task_service_module.begin_execution_if_owner = previous_begin
+            task_service_module.cleanup_orphan_pi_processes = previous_cleanup
+            task_service_module.release_lease = previous_release
 
 
 if __name__ == "__main__":

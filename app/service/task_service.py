@@ -1596,15 +1596,54 @@ class TaskService:
         local_task = _active_local_task(task_id)
         if row.status == "running" or lease_live or local_task is not None:
             detail = "任务仍在本地执行清理中，请稍后再删除" if local_task is not None else "任务正在运行，请先取消后再删除"
+            _record_task_event(
+                db,
+                row=row,
+                event_type="task_delete_rejected",
+                message=detail,
+                level="warning",
+                status=row.status,
+                control_version=int(row.control_version or 0),
+                dispatch_status=row.dispatch_status,
+                payload={
+                    "delete_files": bool(delete_files),
+                    "lease_live": lease_live,
+                    "local_task_active": local_task is not None,
+                },
+            )
+            db.commit()
             raise HTTPException(status_code=409, detail=detail)
+        task_dir = None
+        files_deleted = False
+        files_delete_error: str | None = None
         if delete_files and row.output_path:
             task_dir = os.path.join(row.output_path, task_id)
             if os.path.isdir(task_dir):
                 try:
                     shutil.rmtree(task_dir)
+                    files_deleted = True
                     logger.info("delete_task: removed task dir %s", task_dir)
                 except Exception as _e:
+                    files_delete_error = str(_e)
                     logger.warning("delete_task: failed to remove %s: %s", task_dir, _e)
+        _record_task_event(
+            db,
+            row=row,
+            event_type="task_deleted",
+            message="任务已被软删除",
+            level="warning",
+            status=row.status,
+            control_version=int(row.control_version or 0),
+            dispatch_status=row.dispatch_status,
+            payload={
+                "delete_files": bool(delete_files),
+                "files_deleted": files_deleted,
+                "files_delete_error": files_delete_error,
+                "task_dir": task_dir,
+                "control_version": int(row.control_version or 0),
+                "status_before_delete": row.status,
+            },
+        )
         row.is_deleted = True
         db.commit()
 
@@ -1819,10 +1858,41 @@ class TaskService:
             if not row or row.status == "cancelled":
                 log_event(logger, logging.INFO, "task skipped before execution", event="task_skip_pre_execute",
                           task_id=task_id, owner_id=WORKER_ID, epoch=epoch, control_version=control_version, status=row.status if row else "missing")
+                if row is not None:
+                    _record_task_event(
+                        db,
+                        row=row,
+                        event_type="task_skip_pre_execute",
+                        message="任务在执行前被跳过",
+                        level="warning",
+                        status=row.status,
+                        worker_id=WORKER_ID,
+                        execution_owner_id=WORKER_ID,
+                        execution_epoch=epoch,
+                        control_version=control_version,
+                        dispatch_status=row.dispatch_status,
+                        payload={"reason": "cancelled_before_execute"},
+                    )
+                    db.commit()
                 return
             if not still_owner(db, task_id, WORKER_ID, epoch, control_version):
                 log_event(logger, logging.INFO, "task lost ownership before execution", event="task_not_owner_pre_execute",
                           task_id=task_id, owner_id=WORKER_ID, epoch=epoch, control_version=control_version)
+                _record_task_event(
+                    db,
+                    row=row,
+                    event_type="task_not_owner_pre_execute",
+                    message="任务在执行前已失去执行权",
+                    level="warning",
+                    status=row.status,
+                    worker_id=WORKER_ID,
+                    execution_owner_id=WORKER_ID,
+                    execution_epoch=epoch,
+                    control_version=control_version,
+                    dispatch_status=row.dispatch_status,
+                    payload={"owner_id": WORKER_ID, "epoch": epoch, "control_version": control_version},
+                )
+                db.commit()
                 return
 
             started_at = row.started_at or now_local()
@@ -1832,6 +1902,23 @@ class TaskService:
                 observe_local_event("task_started", "rejected")
                 log_event(logger, logging.INFO, "failed to enter running state as owner", event="task_begin_execution_rejected",
                           task_id=task_id, owner_id=WORKER_ID, epoch=epoch, control_version=control_version)
+                rejected_row = db.query(AppDfaTask).filter_by(task_id=task_id).first()
+                if rejected_row is not None:
+                    _record_task_event(
+                        db,
+                        row=rejected_row,
+                        event_type="task_begin_execution_rejected",
+                        message="任务获取执行态失败，未能进入 running",
+                        level="warning",
+                        status=rejected_row.status,
+                        worker_id=WORKER_ID,
+                        execution_owner_id=WORKER_ID,
+                        execution_epoch=epoch,
+                        control_version=control_version,
+                        dispatch_status=rejected_row.dispatch_status,
+                        payload={"owner_id": WORKER_ID, "epoch": epoch, "control_version": control_version},
+                    )
+                    db.commit()
                 return
             from app.metrics import observe_local_event
             started_row = db.query(AppDfaTask).filter_by(task_id=task_id).first()
@@ -1864,6 +1951,21 @@ class TaskService:
             if row.status == "cancelled" or not still_owner(db, task_id, WORKER_ID, epoch, control_version):
                 log_event(logger, logging.INFO, "task lost ownership before llm sync", event="task_not_owner_pre_llm_sync",
                           task_id=task_id, owner_id=WORKER_ID, epoch=epoch, control_version=control_version, status=row.status)
+                _record_task_event(
+                    db,
+                    row=row,
+                    event_type="task_not_owner_pre_llm_sync",
+                    message="任务在模型执行前失去执行权",
+                    level="warning",
+                    status=row.status,
+                    worker_id=WORKER_ID,
+                    execution_owner_id=WORKER_ID,
+                    execution_epoch=epoch,
+                    control_version=control_version,
+                    dispatch_status=row.dispatch_status,
+                    payload={"owner_id": WORKER_ID, "epoch": epoch, "control_version": control_version},
+                )
+                db.commit()
                 return
             _write_input_manifest(row)
 
@@ -1950,6 +2052,21 @@ class TaskService:
             if not still_owner(db, task_id, WORKER_ID, epoch, control_version):
                 log_event(logger, logging.INFO, "task lost ownership before terminal commit", event="task_not_owner_pre_commit",
                           task_id=task_id, owner_id=WORKER_ID, epoch=epoch, control_version=control_version)
+                _record_task_event(
+                    db,
+                    row=row,
+                    event_type="task_not_owner_pre_commit",
+                    message="任务在写入终态前失去执行权",
+                    level="warning",
+                    status=row.status,
+                    worker_id=WORKER_ID,
+                    execution_owner_id=WORKER_ID,
+                    execution_epoch=epoch,
+                    control_version=control_version,
+                    dispatch_status=row.dispatch_status,
+                    payload={"owner_id": WORKER_ID, "epoch": epoch, "control_version": control_version},
+                )
+                db.commit()
                 return
 
             finished_at = now_local()
@@ -1980,6 +2097,23 @@ class TaskService:
                 observe_local_event("task_finished", "commit_rejected")
                 log_event(logger, logging.WARNING, "terminal commit rejected for stale owner", event="task_terminal_commit_rejected",
                           task_id=task_id, owner_id=WORKER_ID, epoch=epoch, control_version=control_version)
+                rejected_row = db.query(AppDfaTask).filter_by(task_id=task_id).first()
+                if rejected_row is not None:
+                    _record_task_event(
+                        db,
+                        row=rejected_row,
+                        event_type="task_terminal_commit_rejected",
+                        message="任务终态提交被拒绝，执行权已过期",
+                        level="warning",
+                        status=rejected_row.status,
+                        worker_id=WORKER_ID,
+                        execution_owner_id=WORKER_ID,
+                        execution_epoch=epoch,
+                        control_version=control_version,
+                        dispatch_status=rejected_row.dispatch_status,
+                        payload={"owner_id": WORKER_ID, "epoch": epoch, "control_version": control_version},
+                    )
+                    db.commit()
                 return
             refreshed = db.query(AppDfaTask).filter_by(task_id=task_id).first()
             if refreshed is not None:
@@ -2025,6 +2159,26 @@ class TaskService:
             observe_local_event("task_finished", "cancelled")
             log_event(logger, logging.INFO, "task coroutine cancelled", event="task_coroutine_cancelled",
                       task_id=task_id, owner_id=WORKER_ID, epoch=epoch, control_version=control_version)
+            try:
+                cancelled_row = db.query(AppDfaTask).filter_by(task_id=task_id).first()
+                if cancelled_row is not None:
+                    _record_task_event(
+                        db,
+                        row=cancelled_row,
+                        event_type="task_coroutine_cancelled",
+                        message="任务协程已取消",
+                        level="warning",
+                        status=cancelled_row.status,
+                        worker_id=WORKER_ID,
+                        execution_owner_id=WORKER_ID,
+                        execution_epoch=epoch,
+                        control_version=control_version,
+                        dispatch_status=cancelled_row.dispatch_status,
+                        payload={"owner_id": WORKER_ID, "epoch": epoch, "control_version": control_version},
+                    )
+                    db.commit()
+            except Exception:
+                db.rollback()
             pass
         except Exception as exc:
             from app.metrics import observe_local_event
