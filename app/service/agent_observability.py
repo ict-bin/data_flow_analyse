@@ -128,7 +128,8 @@ class AgentObservabilityService:
                     else:
                         owner_kind = "unknown"
                         owner_reason = "活动任务存在但 worker 心跳缺失，进入保护态"
-                        kill_block_reason = "任务可能仍在切换或退出宽限期"
+                        kill_allowed = True
+                        kill_block_reason = None
                 else:
                     if bool(matched.get("is_active")):
                         owner_kind = "unknown"
@@ -178,8 +179,8 @@ class AgentObservabilityService:
                     role_kind=None,
                     owner_kind="unknown",
                     owner_reason="未匹配到任务或会话",
-                    kill_allowed=False,
-                    kill_block_reason="仅明确孤儿进程可手工终止",
+                    kill_allowed=True,
+                    kill_block_reason=None,
                     termination_state="live",
                 ).__dict__)
         sessions = [{
@@ -216,15 +217,23 @@ class AgentObservabilityService:
                 "session_ids": [str(item["session_id"]) for item in linked_sessions if item.get("session_id")],
                 "ownership_status": "partial" if linked_sessions and not linked_processes else "healthy",
             })
+        tracked_process_count = len([item for item in processes if item.get("owner_kind") == "tracked"])
+        orphan_process_count = len([item for item in processes if item.get("owner_kind") == "orphan"])
+        suspected_orphan_process_count = len([item for item in processes if item.get("owner_kind") == "unknown"])
+        active_task_count = len([item for item in tasks if str(item.get("task_status") or "") in {"running", "pending", "queued", "dispatching"}])
+        killable_orphan_count = len([item for item in processes if item.get("owner_kind") == "orphan" and item.get("kill_allowed")])
+        killable_suspected_count = len([item for item in processes if item.get("owner_kind") == "unknown" and item.get("kill_allowed")])
+        scanned_at = time.time()
         return {
             "summary": {
                 "pod_name": POD_NAME,
-                "active_processes": len([item for item in processes if item.get("owner_kind") == "tracked"]),
-                "orphan_processes": len([item for item in processes if item.get("owner_kind") == "orphan"]),
-                "unknown_processes": len([item for item in processes if item.get("owner_kind") == "unknown"]),
-                "killable_orphan_processes": len([item for item in processes if item.get("kill_allowed")]),
+                "active_processes": tracked_process_count,
+                "orphan_processes": orphan_process_count,
+                "unknown_processes": suspected_orphan_process_count,
+                "killable_orphan_processes": killable_orphan_count,
+                "killable_suspected_orphan_processes": killable_suspected_count,
                 "orphan_sessions": len([item for item in sessions if item.get("orphan_session") and not item.get("has_process")]),
-                "scanned_at": time.time(),
+                "scanned_at": scanned_at,
                 "scan_errors": 0,
             },
             "processes": processes,
@@ -232,10 +241,18 @@ class AgentObservabilityService:
             "tasks": tasks,
             "pods": [{
                 "pod_name": POD_NAME,
+                "worker_id": POD_NAME,
+                "healthy": True,
                 "process_count": len(processes),
-                "orphan_process_count": len([item for item in processes if item.get("owner_kind") == "orphan"]),
+                "tracked_process_count": tracked_process_count,
+                "orphan_process_count": orphan_process_count,
+                "suspected_orphan_process_count": suspected_orphan_process_count,
                 "session_count": len(sessions),
                 "orphan_session_count": len([item for item in sessions if item.get("orphan_session") and not item.get("has_process")]),
+                "task_count": len(tasks),
+                "active_task_count": active_task_count,
+                "last_scanned_at": scanned_at,
+                "scan_errors": 0,
             }],
         }
 

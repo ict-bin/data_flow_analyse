@@ -683,8 +683,12 @@ def _render_agent_observability_metrics() -> list[str]:
         "# TYPE secflow_dfa_agent_process_total gauge",
         "# HELP secflow_dfa_agent_orphan_process_total Confirmed orphan agent process total by pod.",
         "# TYPE secflow_dfa_agent_orphan_process_total gauge",
+        "# HELP secflow_dfa_agent_suspected_orphan_process_total Suspected orphan agent process total by pod.",
+        "# TYPE secflow_dfa_agent_suspected_orphan_process_total gauge",
         "# HELP secflow_dfa_agent_killable_orphan_process_total Killable orphan agent process total by pod.",
         "# TYPE secflow_dfa_agent_killable_orphan_process_total gauge",
+        "# HELP secflow_dfa_agent_killable_suspected_orphan_process_total Killable suspected orphan agent process total by pod.",
+        "# TYPE secflow_dfa_agent_killable_suspected_orphan_process_total gauge",
         "# HELP secflow_dfa_agent_session_total Agent session total grouped by state, pod and role.",
         "# TYPE secflow_dfa_agent_session_total gauge",
         "# HELP secflow_dfa_agent_orphan_session_total Orphan agent session total by pod.",
@@ -695,7 +699,9 @@ def _render_agent_observability_metrics() -> list[str]:
     process_counts: dict[tuple[str, str, str], int] = defaultdict(int)
     session_counts: dict[tuple[str, str, str], int] = defaultdict(int)
     orphan_by_pod: dict[str, int] = defaultdict(int)
+    suspected_by_pod: dict[str, int] = defaultdict(int)
     killable_by_pod: dict[str, int] = defaultdict(int)
+    killable_suspected_by_pod: dict[str, int] = defaultdict(int)
     orphan_sessions_by_pod: dict[str, int] = defaultdict(int)
     ownership_counts: dict[str, int] = defaultdict(int)
     for item in processes:
@@ -705,6 +711,10 @@ def _render_agent_observability_metrics() -> list[str]:
             orphan_by_pod[str(item.get("pod_name") or "unknown")] += 1
             if bool(item.get("kill_allowed")):
                 killable_by_pod[str(item.get("pod_name") or "unknown")] += 1
+        if str(item.get("owner_kind") or "") == "unknown":
+            suspected_by_pod[str(item.get("pod_name") or "unknown")] += 1
+            if bool(item.get("kill_allowed")):
+                killable_suspected_by_pod[str(item.get("pod_name") or "unknown")] += 1
     for item in sessions:
         session_state = "orphan" if bool(item.get("orphan_session")) else ("live" if bool(item.get("live")) else "history")
         key = (session_state, str(item.get("pod_name") or "unknown"), str(item.get("role_kind") or "unknown"))
@@ -717,8 +727,12 @@ def _render_agent_observability_metrics() -> list[str]:
         lines.append(f"secflow_dfa_agent_process_total{_labels(state=state, pod=pod, role_kind=role_kind)} {value}")
     for pod, value in sorted(orphan_by_pod.items()):
         lines.append(f"secflow_dfa_agent_orphan_process_total{_labels(pod=pod)} {value}")
+    for pod, value in sorted(suspected_by_pod.items()):
+        lines.append(f"secflow_dfa_agent_suspected_orphan_process_total{_labels(pod=pod)} {value}")
     for pod, value in sorted(killable_by_pod.items()):
         lines.append(f"secflow_dfa_agent_killable_orphan_process_total{_labels(pod=pod)} {value}")
+    for pod, value in sorted(killable_suspected_by_pod.items()):
+        lines.append(f"secflow_dfa_agent_killable_suspected_orphan_process_total{_labels(pod=pod)} {value}")
     for (state, pod, role_kind), value in sorted(session_counts.items()):
         lines.append(f"secflow_dfa_agent_session_total{_labels(state=state, pod=pod, role_kind=role_kind)} {value}")
     for pod, value in sorted(orphan_sessions_by_pod.items()):

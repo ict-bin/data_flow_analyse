@@ -56,6 +56,83 @@ class AgentObservabilityTests(unittest.TestCase):
         finally:
             db.close()
 
+    def test_build_snapshot_exposes_pod_runtime_summary_fields(self):
+        self._insert_task(task_id="dfa_obs_runtime", status="success")
+        db = self._session()
+        try:
+            with patch("app.service.agent_observability._iter_agent_processes", return_value=[
+                {
+                    "pid": 101,
+                    "ppid": 1,
+                    "pgid": 101,
+                    "command": "npx pi worker",
+                    "cwd": "/tmp/unknown",
+                    "rss_bytes": 2048,
+                }
+            ]):
+                snapshot = self.service.build_snapshot(db, project_id="p1")
+            self.assertIn("pods", snapshot)
+            self.assertEqual(1, len(snapshot["pods"]))
+            pod = snapshot["pods"][0]
+            self.assertIn("worker_id", pod)
+            self.assertIn("healthy", pod)
+            self.assertIn("tracked_process_count", pod)
+            self.assertIn("suspected_orphan_process_count", pod)
+            self.assertIn("task_count", pod)
+            self.assertIn("active_task_count", pod)
+            self.assertIn("last_scanned_at", pod)
+            self.assertEqual(1, pod["suspected_orphan_process_count"])
+            self.assertTrue(snapshot["processes"][0]["kill_allowed"])
+        finally:
+            db.close()
+
+    def test_build_snapshot_keeps_unknown_non_killable_when_live_task_signals_exist(self):
+        db = self._session()
+        try:
+            row = AppDfaTask(
+                task_id="dfa_obs_live",
+                project_id="p1",
+                task_name="live task",
+                input_path="/tmp/input",
+                output_path="/tmp/output",
+                prompt_content="analyse",
+                status="running",
+            )
+            db.add(row)
+            db.commit()
+            with patch("app.service.agent_observability._iter_agent_processes", return_value=[]), \
+                 patch("app.service.agent_observability.get_task_service") as mocked_service, \
+                 patch("app.service.agent_observability.build_worker_cluster_snapshot") as mocked_cluster:
+                mocked_service.return_value.get_task_session_index.return_value = {
+                    "nodes": [
+                        {
+                            "relative_path": "session-1.jsonl",
+                            "session_name": "session-1",
+                            "display_name": "session-1",
+                            "is_active": True,
+                            "stage_key": "taint",
+                            "role": "worker",
+                            "session_header": {"id": "s1"},
+                        }
+                    ]
+                }
+                mocked_cluster.return_value.workers = []
+                with patch("app.service.agent_observability._iter_agent_processes", return_value=[
+                    {
+                        "pid": 202,
+                        "ppid": 1,
+                        "pgid": 202,
+                        "command": "npx pi worker",
+                        "cwd": "/tmp/session-1.jsonl",
+                        "rss_bytes": 1024,
+                    }
+                ]):
+                    snapshot = self.service.build_snapshot(db, project_id="p1")
+            self.assertEqual("unknown", snapshot["processes"][0]["owner_kind"])
+            self.assertFalse(snapshot["processes"][0]["kill_allowed"])
+        finally:
+            db.close()
+
 
 if __name__ == "__main__":
     unittest.main()
