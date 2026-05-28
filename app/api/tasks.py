@@ -905,7 +905,7 @@ def list_tasks(
 
 @router.get("/workers/cluster-capacity", response_model=WorkerClusterCapacityResponse)
 def get_worker_cluster_capacity(
-    project_id: str = Query(...),
+    project_id: str | None = Query(None),
     db: Session = Depends(get_db),
 ):
     snapshot = build_worker_cluster_snapshot(db, project_id=project_id)
