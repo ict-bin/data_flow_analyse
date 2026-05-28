@@ -133,6 +133,61 @@ class AgentObservabilityTests(unittest.TestCase):
         finally:
             db.close()
 
+    def test_build_snapshot_matches_workspace_root_without_session_cwd_overlap(self):
+        db = self._session()
+        try:
+            row = AppDfaTask(
+                task_id="dfa_obs_workspace",
+                project_id="p1",
+                task_name="workspace task",
+                input_path="/tmp/input",
+                module_input_path="/tmp/workspace-worker-1/module",
+                source_root_path="/tmp/workspace-worker-1/src",
+                output_path="/tmp/workspace-worker-1/out",
+                prompt_content="analyse",
+                status="running",
+            )
+            db.add(row)
+            db.commit()
+            with patch("app.service.agent_observability.get_task_service") as mocked_service, \
+                 patch("app.service.agent_observability.build_worker_cluster_snapshot") as mocked_cluster, \
+                 patch("app.service.agent_observability._iter_agent_processes", return_value=[
+                     {
+                         "pid": 303,
+                         "ppid": 1,
+                         "pgid": 303,
+                         "command": "codex --session /tmp/workspace-worker-1/out/sessions/r1/agent.jsonl",
+                         "cwd": "/tmp/workspace-worker-1",
+                         "exe": "/usr/bin/codex",
+                         "rss_bytes": 8192,
+                         "runtime_kind": "codex",
+                         "session_arg_path": "/tmp/workspace-worker-1/out/sessions/r1/agent.jsonl",
+                         "open_session_paths": [],
+                     }
+                 ]):
+                mocked_service.return_value.get_task_session_index.return_value = {
+                    "nodes": [
+                        {
+                            "relative_path": "sessions/r1/agent.jsonl",
+                            "session_name": "agent",
+                            "display_name": "agent",
+                            "is_active": True,
+                            "stage_key": "taint",
+                            "role": "worker",
+                            "session_header": {"id": "sess-1"},
+                        }
+                    ]
+                }
+                mocked_cluster.return_value.workers = []
+                snapshot = self.service.build_snapshot(db, project_id="p1")
+            self.assertEqual(1, len(snapshot["processes"]))
+            process = snapshot["processes"][0]
+            self.assertEqual("codex", process["runtime_kind"])
+            self.assertEqual("session_path", process["match_source"])
+            self.assertEqual("dfa_obs_workspace", process["task_id"])
+        finally:
+            db.close()
+
 
 if __name__ == "__main__":
     unittest.main()
