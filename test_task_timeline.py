@@ -10,6 +10,7 @@ from unittest.mock import patch
 from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
@@ -322,6 +323,54 @@ class TaskTimelineTests(unittest.TestCase):
             self.assertFalse(bool(rejected_event.payload.get("delete_files")))
             self.assertIn("lease_live", rejected_event.payload)
             self.assertFalse(bool(rejected_event.payload.get("local_task_active")))
+        finally:
+            db.close()
+
+    def test_delete_task_is_idempotent_after_soft_delete(self):
+        task_id = self._create_task()
+        task_dir = self.output_dir / task_id
+        task_dir.mkdir(parents=True, exist_ok=True)
+        db = self._session()
+        try:
+            row = db.query(AppDfaTask).filter_by(task_id=task_id).first()
+            row.status = "failed"
+            db.commit()
+
+            self.service.delete_task(db, task_id, delete_files=True)
+            self.service.delete_task(db, task_id, delete_files=True)
+
+            deleted_row = db.query(AppDfaTask).filter_by(task_id=task_id).first()
+            self.assertTrue(bool(deleted_row.is_deleted))
+            deleted_events = db.query(AppDfaTaskEvent).filter_by(task_id=task_id, event_type="task_deleted").all()
+            self.assertEqual(1, len(deleted_events))
+        finally:
+            db.close()
+
+    def test_delete_task_ignores_duplicate_task_deleted_event_conflict(self):
+        task_id = self._create_task()
+        db = self._session()
+        try:
+            row = db.query(AppDfaTask).filter_by(task_id=task_id).first()
+            row.status = "failed"
+            db.commit()
+
+            original_flush = db.flush
+            call_state = {"raised": False}
+
+            def flaky_flush(*args, **kwargs):
+                original_flush(*args, **kwargs)
+                if call_state["raised"]:
+                    return
+                for obj in list(db.identity_map.values()) + list(db.new):
+                    if isinstance(obj, AppDfaTaskEvent) and getattr(obj, "event_type", "") == "task_deleted":
+                        call_state["raised"] = True
+                        raise IntegrityError("INSERT", {}, Exception("duplicate"))
+
+            with patch.object(db, "flush", side_effect=flaky_flush):
+                self.service.delete_task(db, task_id, delete_files=False)
+
+            deleted_row = db.query(AppDfaTask).filter_by(task_id=task_id).first()
+            self.assertTrue(bool(deleted_row.is_deleted))
         finally:
             db.close()
 

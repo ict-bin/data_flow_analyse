@@ -20,6 +20,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, load_only
 from sqlalchemy.orm.attributes import flag_modified
 
@@ -230,7 +231,17 @@ def _record_task_event(
     )
     event.payload = _compact_event_payload(payload or {})
     db.add(event)
-    db.flush()
+    try:
+        db.flush()
+    except IntegrityError:
+        db.rollback()
+        logger.warning(
+            "dfa task event dedupe conflict ignored: task_id=%s event_type=%s dedupe_key=%s",
+            row.task_id,
+            event_type,
+            event_dedupe_key,
+        )
+        return db.query(AppDfaTaskEvent).filter(AppDfaTaskEvent.dedupe_key == event_dedupe_key).first()
     return event
 
 
@@ -1793,9 +1804,21 @@ class TaskService:
     def delete_task(self, db: Session, task_id: str, *, delete_files: bool = True) -> None:
         """软删除任务记录，并可选删除输出目录下的任务文件。运行中任务不允许删除。"""
         from fastapi import HTTPException
-        row = self._get_or_404(db, task_id)
+        row = self._get_or_404(db, task_id, include_deleted=True)
         lease_live = bool(row.execution_owner_id and row.execution_lease_until and row.execution_lease_until >= now_local())
         local_task = _active_local_task(task_id)
+        if bool(row.is_deleted):
+            if delete_files and row.output_path:
+                task_dir = os.path.join(row.output_path, task_id)
+                if os.path.isdir(task_dir):
+                    try:
+                        shutil.rmtree(task_dir)
+                        logger.info("delete_task: removed task dir %s", task_dir)
+                    except FileNotFoundError:
+                        logger.info("delete_task: task dir already absent %s", task_dir)
+                    except Exception as _e:
+                        logger.warning("delete_task: failed to remove %s: %s", task_dir, _e)
+            return
         if row.status == "running" or lease_live or local_task is not None:
             detail = "任务仍在本地执行清理中，请稍后再删除" if local_task is not None else "任务正在运行，请先取消后再删除"
             _record_task_event(
@@ -1825,6 +1848,9 @@ class TaskService:
                     shutil.rmtree(task_dir)
                     files_deleted = True
                     logger.info("delete_task: removed task dir %s", task_dir)
+                except FileNotFoundError:
+                    files_deleted = True
+                    logger.info("delete_task: task dir already absent %s", task_dir)
                 except Exception as _e:
                     files_delete_error = str(_e)
                     logger.warning("delete_task: failed to remove %s: %s", task_dir, _e)
@@ -2574,11 +2600,11 @@ class TaskService:
             except StopIteration:
                 pass
 
-    def _get_or_404(self, db: Session, task_id: str) -> AppDfaTask:
-        row = db.query(AppDfaTask).filter(
-            AppDfaTask.task_id == task_id,
-            AppDfaTask.is_deleted.is_(False),
-        ).first()
+    def _get_or_404(self, db: Session, task_id: str, *, include_deleted: bool = False) -> AppDfaTask:
+        query = db.query(AppDfaTask).filter(AppDfaTask.task_id == task_id)
+        if not include_deleted:
+            query = query.filter(AppDfaTask.is_deleted.is_(False))
+        row = query.first()
         if not row:
             from fastapi import HTTPException
             raise HTTPException(404, f"任务不存在: {task_id}")
