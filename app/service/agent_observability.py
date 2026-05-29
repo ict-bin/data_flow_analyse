@@ -239,6 +239,8 @@ def _match_session(
                 return None, "task_root", "medium", root
 
     for rel_path, session in session_by_rel_path.items():
+        if rel_path and rel_path in str(proc.get("cwd") or ""):
+            return session, "cwd_relpath", "low", None
         if rel_path and rel_path in str(proc.get("command") or ""):
             return session, "session_relpath", "low", None
     return None, None, None, None
