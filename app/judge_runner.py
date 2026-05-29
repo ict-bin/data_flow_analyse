@@ -98,6 +98,11 @@ class JudgeMixin:
             timeout_max_retries=cfg.agent_timeout_max_retries,
             pi_max_retries=cfg.pi_max_retries,
             pi_retry_delay=cfg.pi_retry_delay,
+            task_context={
+                "task_id": result.task_id,
+                "task_root": str(Path(cwd).resolve().parent),
+                "task_run_root": str(Path(cwd).resolve()),
+            },
         )
 
         result.total_tokens += ar.token_usage

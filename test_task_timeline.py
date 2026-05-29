@@ -5,6 +5,7 @@ import os
 import asyncio
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
@@ -222,6 +223,54 @@ class TaskTimelineTests(unittest.TestCase):
             self.assertEqual("cancelled", timeline["events"][0]["status"])
             self.assertEqual(2, timeline["events"][0]["control_version"])
         finally:
+            db.close()
+
+    def test_cancel_task_aborts_local_orchestrator_and_runs_targeted_cleanup(self):
+        task_id = self._create_task()
+        db = self._session()
+        try:
+            row = db.query(AppDfaTask).filter_by(task_id=task_id).first()
+            row.status = "running"
+            row.control_version = 3
+            row.execution_epoch = 4
+            row.execution_owner_id = "worker-x"
+            row.dispatch_status = "running"
+            db.commit()
+
+            cancel_calls: list[str] = []
+
+            class _FakeLocalTask:
+                def done(self):
+                    return False
+
+                def cancel(self):
+                    cancel_calls.append("task")
+
+            class _FakeOrchestrator:
+                def abort(self):
+                    cancel_calls.append("orch")
+
+            task_service_module._running_tasks[task_id] = _FakeLocalTask()
+            task_service_module._running_task_contexts[task_id] = task_service_module._RunningTaskContext(
+                task=task_service_module._running_tasks[task_id],
+                orch=_FakeOrchestrator(),
+                task_root="/tmp/dfa-task",
+                run_root="/tmp/dfa-task/run/epochs/0004",
+                epoch=4,
+                control_version=3,
+            )
+            with patch("app.service.task_service.cleanup_task_agent_processes", return_value=2) as cleanup:
+                payload = self.service.cancel_task(db, task_id)
+
+            self.assertEqual("cancelled", payload["status"])
+            self.assertEqual(["orch", "task"], cancel_calls)
+            cleanup.assert_called_once()
+            timeline = self.service.get_task_timeline(db, task_id)
+            self.assertTrue(bool(timeline["events"][0]["payload"]["orchestrator_abort_sent"]))
+            self.assertEqual("/tmp/dfa-task", timeline["events"][0]["payload"]["cleanup_task_root"])
+        finally:
+            task_service_module._running_tasks.pop(task_id, None)
+            task_service_module._running_task_contexts.pop(task_id, None)
             db.close()
 
     def test_delete_task_records_task_deleted_event_before_soft_delete(self):

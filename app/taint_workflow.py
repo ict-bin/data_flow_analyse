@@ -593,6 +593,11 @@ class PerTaintWorkflow:
             timeout_max_retries=self.cfg.agent_timeout_max_retries,
             pi_max_retries=self.cfg.pi_max_retries,
             pi_retry_delay=self.cfg.pi_retry_delay,
+            task_context={
+                "task_id": self.task_id,
+                "task_root": str(self.out_dir.parent) if self.out_dir else "",
+                "task_run_root": str(self.out_dir) if self.out_dir else str(self.ws),
+            },
         )
 
     def _session_relpath(self, session_file: str | Path) -> str:

@@ -351,6 +351,27 @@ def _write_temp_markdown(
     return tmp_dir, file_path
 
 
+def _build_agent_env(
+    base_env: dict[str, str] | None,
+    *,
+    task_context: dict[str, object] | None,
+    cwd: str,
+) -> dict[str, str] | None:
+    payload = dict(base_env or {})
+    if not task_context:
+        return payload or None
+    payload["DFA_TASK_RUN_ROOT"] = str(task_context.get("task_run_root") or cwd)
+    if task_context.get("task_id"):
+        payload["DFA_TASK_ID"] = str(task_context["task_id"])
+    if task_context.get("task_root"):
+        payload["DFA_TASK_ROOT"] = str(task_context["task_root"])
+    if task_context.get("worker_id"):
+        payload["DFA_WORKER_ID"] = str(task_context["worker_id"])
+    if task_context.get("execution_epoch") is not None:
+        payload["DFA_EXECUTION_EPOCH"] = str(task_context["execution_epoch"])
+    return payload
+
+
 # ─── 错误分类 ─────────────────────────────────────────────────────────────────
 
 # 致命错误：配置/环境问题，重试无意义
@@ -596,6 +617,7 @@ async def run_agent(
     timeout_max_retries: int = 3,
     pi_max_retries: int = -1,  # pi 进程最大重试（-1=无限）
     pi_retry_delay: float = 10.0,  # pi 进程重试首次等待
+    task_context: dict[str, object] | None = None,
 ) -> AgentResult:
     """
     运行单个 pi Agent 子进程（双层重试 + 致命错误检测）。
@@ -626,6 +648,8 @@ async def run_agent(
         return r
 
     args = _build_args(pi_cmd, model, tools, thinking_level, session_file)
+    cwd = os.path.abspath(cwd)
+    env = _build_agent_env(env, task_context=task_context, cwd=cwd)
 
     # System/User Prompt → 临时文件，避免超长 argv 导致 Argument list too long
     tmp_dir: str | None = None
@@ -659,7 +683,7 @@ async def run_agent(
                     tools=tools,
                     thinking_level=thinking_level,
                     session_file=session_file,
-                    cwd=os.path.abspath(cwd),
+                    cwd=cwd,
                     env=env,
                     cancel_event=cancel_event,
                     on_stream=on_stream,

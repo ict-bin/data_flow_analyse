@@ -7,6 +7,7 @@ import pathlib
 import shutil
 import signal
 import subprocess
+import time
 from dataclasses import dataclass
 from typing import Callable
 
@@ -49,15 +50,6 @@ def process_group_exists(pgid: int | None) -> bool:
     return True
 
 
-_PID1_REAPER_NAMES = {
-    "init",
-    "systemd",
-    "tini",
-    "dumb-init",
-    "busybox",
-}
-
-
 def _read_proc_name(pid: int, field: str) -> str:
     try:
         return (pathlib.Path("/proc") / str(pid) / field).read_text(
@@ -68,16 +60,209 @@ def _read_proc_name(pid: int, field: str) -> str:
         return ""
 
 
-def _pid1_is_reaper_process() -> bool:
-    """Only treat PPID=1 as orphan when PID 1 looks like a real init/reaper."""
-    pid1_comm = _read_proc_name(1, "comm").lower()
-    if pid1_comm in _PID1_REAPER_NAMES:
-        return True
+def _safe_readlink(path: pathlib.Path) -> str:
     try:
-        pid1_exe = os.path.basename(os.readlink("/proc/1/exe")).lower()
+        return os.readlink(path)
     except Exception:
-        pid1_exe = ""
-    return pid1_exe in _PID1_REAPER_NAMES
+        return ""
+
+
+def _read_proc_environ(pid: int) -> dict[str, str]:
+    try:
+        raw = (pathlib.Path("/proc") / str(pid) / "environ").read_bytes()
+    except Exception:
+        return {}
+    payload: dict[str, str] = {}
+    for item in raw.split(b"\0"):
+        if not item or b"=" not in item:
+            continue
+        key, value = item.split(b"=", 1)
+        try:
+            payload[key.decode("utf-8", errors="replace")] = value.decode("utf-8", errors="replace")
+        except Exception:
+            continue
+    return payload
+
+
+def _read_proc_cmdline(pid: int) -> str:
+    try:
+        raw = (pathlib.Path("/proc") / str(pid) / "cmdline").read_bytes()
+    except Exception:
+        return ""
+    return raw.replace(b"\0", b" ").decode("utf-8", errors="replace").strip()
+
+
+def _read_ppid(status_text: str) -> int | None:
+    for line in status_text.splitlines():
+        if line.startswith("PPid:"):
+            try:
+                return int(line.split(":", 1)[1].strip())
+            except ValueError:
+                return None
+    return None
+
+
+def _read_pgid(pid: int) -> int | None:
+    try:
+        return int(
+            subprocess.check_output(
+                ["sh", "-lc", f"awk '{{print $5}}' /proc/{pid}/stat"],
+                text=True,
+            ).strip()
+        )
+    except Exception:
+        return None
+
+
+def _normalize_path(path_value: str | None) -> str:
+    raw = str(path_value or "").strip()
+    if not raw:
+        return ""
+    try:
+        return os.path.realpath(os.path.abspath(raw))
+    except Exception:
+        return raw
+
+
+def _path_within(path_value: str | None, root_value: str | None) -> bool:
+    path = _normalize_path(path_value)
+    root = _normalize_path(root_value)
+    if not path or not root:
+        return False
+    return path == root or path.startswith(root + os.sep)
+
+
+@dataclass(frozen=True)
+class AgentCleanupTarget:
+    task_id: str | None = None
+    task_root: str | None = None
+    run_root: str | None = None
+    worker_id: str | None = None
+    execution_epoch: int | None = None
+
+
+@dataclass(frozen=True)
+class AgentProcessInfo:
+    pid: int
+    ppid: int | None
+    pgid: int | None
+    comm: str
+    exe: str
+    cwd: str
+    cmdline: str
+    environ: dict[str, str]
+
+
+def _iter_agent_processes() -> list[AgentProcessInfo]:
+    candidates: list[AgentProcessInfo] = []
+    proc_root = pathlib.Path("/proc")
+    for proc_dir in proc_root.iterdir():
+        if not proc_dir.name.isdigit():
+            continue
+        pid = int(proc_dir.name)
+        try:
+            status = (proc_dir / "status").read_text(encoding="utf-8", errors="replace")
+            comm = (proc_dir / "comm").read_text(encoding="utf-8", errors="replace").strip()
+            exe = os.path.basename(_safe_readlink(proc_dir / "exe"))
+        except Exception:
+            continue
+        if comm != "pi" and exe != "node":
+            continue
+        candidates.append(
+            AgentProcessInfo(
+                pid=pid,
+                ppid=_read_ppid(status),
+                pgid=_read_pgid(pid),
+                comm=comm,
+                exe=exe,
+                cwd=_safe_readlink(proc_dir / "cwd"),
+                cmdline=_read_proc_cmdline(pid),
+                environ=_read_proc_environ(pid),
+            )
+        )
+    return candidates
+
+
+def _matches_target(info: AgentProcessInfo, target: AgentCleanupTarget | None) -> bool:
+    task_id = str(info.environ.get("DFA_TASK_ID") or "").strip()
+    task_root = str(info.environ.get("DFA_TASK_ROOT") or "").strip()
+    run_root = str(info.environ.get("DFA_TASK_RUN_ROOT") or "").strip()
+    worker_id = str(info.environ.get("DFA_WORKER_ID") or "").strip()
+    if target is None:
+        return bool(task_id or task_root or run_root or "DFA_TASK_ID=" in info.cmdline)
+    if target.task_id and task_id == target.task_id:
+        return True
+    if target.worker_id and worker_id and worker_id == target.worker_id:
+        if target.task_id:
+            return task_id == target.task_id
+        return True
+    if target.run_root and (_path_within(info.cwd, target.run_root) or _path_within(run_root, target.run_root)):
+        return True
+    if target.task_root and (
+        _path_within(info.cwd, target.task_root)
+        or _path_within(task_root, target.task_root)
+        or _path_within(run_root, target.task_root)
+    ):
+        return True
+    return False
+
+
+def _kill_process_group(
+    logger: Callable[[str], None],
+    *,
+    label: str,
+    info: AgentProcessInfo,
+    reason: str,
+) -> bool:
+    logger(
+        f"cleaning agent process [{label}] pid={info.pid} pgid={info.pgid if info.pgid is not None else 'unknown'} "
+        f"task_id={info.environ.get('DFA_TASK_ID') or '-'} cwd={info.cwd or '-'} reason={reason}"
+    )
+    try:
+        if info.pgid is not None:
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(info.pgid, signal.SIGTERM)
+            time.sleep(0.2)
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(info.pgid, signal.SIGKILL)
+        else:
+            with contextlib.suppress(ProcessLookupError):
+                os.kill(info.pid, signal.SIGTERM)
+            time.sleep(0.2)
+            with contextlib.suppress(ProcessLookupError):
+                os.kill(info.pid, signal.SIGKILL)
+        return True
+    except Exception:
+        return False
+
+
+def cleanup_task_agent_processes(
+    logger: Callable[[str], None],
+    *,
+    label: str,
+    task_id: str | None = None,
+    task_root: str | None = None,
+    run_root: str | None = None,
+    worker_id: str | None = None,
+) -> int:
+    target = AgentCleanupTarget(
+        task_id=task_id or None,
+        task_root=task_root or None,
+        run_root=run_root or None,
+        worker_id=worker_id or None,
+    )
+    killed = 0
+    seen_pgids: set[tuple[str, int]] = set()
+    for info in _iter_agent_processes():
+        if not _matches_target(info, target):
+            continue
+        key = ("pg", info.pgid) if info.pgid is not None else ("pid", info.pid)
+        if key in seen_pgids:
+            continue
+        seen_pgids.add(key)
+        if _kill_process_group(logger, label=label, info=info, reason="task_targeted_cleanup"):
+            killed += 1
+    return killed
 
 
 def cleanup_orphan_pi_processes(
@@ -85,54 +270,19 @@ def cleanup_orphan_pi_processes(
     *,
     label: str,
 ) -> int:
-    if not _pid1_is_reaper_process():
-        return 0
     killed = 0
-    proc_root = pathlib.Path("/proc")
-    for proc_dir in proc_root.iterdir():
-        if not proc_dir.name.isdigit():
+    seen_pgids: set[tuple[str, int]] = set()
+    for info in _iter_agent_processes():
+        if info.ppid != 1:
             continue
-        try:
-            status = (proc_dir / "status").read_text(encoding="utf-8", errors="replace")
-            comm = (proc_dir / "comm").read_text(encoding="utf-8", errors="replace").strip()
-            exe = os.path.basename(os.readlink(proc_dir / "exe"))
-        except Exception:
+        if not _matches_target(info, None):
             continue
-        if comm != "pi" and exe != "node":
+        key = ("pg", info.pgid) if info.pgid is not None else ("pid", info.pid)
+        if key in seen_pgids:
             continue
-        ppid = None
-        pid = int(proc_dir.name)
-        for line in status.splitlines():
-            if line.startswith("PPid:"):
-                try:
-                    ppid = int(line.split(":", 1)[1].strip())
-                except ValueError:
-                    ppid = None
-                break
-        if ppid != 1:
-            continue
-        try:
-            pgid = int(
-                subprocess.check_output(
-                    ["sh", "-lc", f"awk '{{print $5}}' /proc/{pid}/stat"],
-                    text=True,
-                ).strip()
-            )
-        except Exception:
-            pgid = None
-        logger(
-            f"cleaning orphan pi process [{label}] pid={pid} pgid={pgid if pgid is not None else 'unknown'}"
-        )
-        try:
-            if pgid is not None:
-                os.killpg(pgid, signal.SIGKILL)
-            else:
-                os.kill(pid, signal.SIGKILL)
+        seen_pgids.add(key)
+        if _kill_process_group(logger, label=label, info=info, reason="orphan_cleanup"):
             killed += 1
-        except ProcessLookupError:
-            continue
-        except Exception:
-            continue
     return killed
 
 

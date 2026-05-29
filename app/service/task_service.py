@@ -15,6 +15,7 @@ import shutil
 import tempfile
 import time as _time
 import uuid
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -40,7 +41,7 @@ from app.service.execution_coordinator import (
 )
 from app.service.session_index import build_session_catalog
 from app.time_utils import isoformat_local, now_local
-from app.agent_process import cleanup_orphan_pi_processes
+from app.agent_process import cleanup_orphan_pi_processes, cleanup_task_agent_processes
 
 logger = logging.getLogger("dfa.task_service")
 
@@ -53,6 +54,19 @@ TASK_EVENT_RENEW_INTERVAL_SECONDS = max(60, HEARTBEAT_INTERVAL_SECONDS * 6)
 
 # Running asyncio tasks keyed by task_id so we can cancel them
 _running_tasks: dict[str, asyncio.Task] = {}
+
+
+@dataclass
+class _RunningTaskContext:
+    task: asyncio.Task | None = None
+    orch: Orchestrator | None = None
+    task_root: str | None = None
+    run_root: str | None = None
+    epoch: int | None = None
+    control_version: int | None = None
+
+
+_running_task_contexts: dict[str, _RunningTaskContext] = {}
 
 _TASK_LIST_SORT_COLUMNS = {
     "created_at": AppDfaTask.created_at,
@@ -225,6 +239,41 @@ def _active_local_task(task_id: str) -> asyncio.Task | None:
     if local_task is None or local_task.done():
         return None
     return local_task
+
+
+def _register_running_task_context(
+    task_id: str,
+    *,
+    task: asyncio.Task | None = None,
+    orch: Orchestrator | None = None,
+    task_root: str | None = None,
+    run_root: str | None = None,
+    epoch: int | None = None,
+    control_version: int | None = None,
+) -> _RunningTaskContext:
+    ctx = _running_task_contexts.get(task_id) or _RunningTaskContext()
+    if task is not None:
+        ctx.task = task
+    if orch is not None:
+        ctx.orch = orch
+    if task_root is not None:
+        ctx.task_root = task_root
+    if run_root is not None:
+        ctx.run_root = run_root
+    if epoch is not None:
+        ctx.epoch = epoch
+    if control_version is not None:
+        ctx.control_version = control_version
+    _running_task_contexts[task_id] = ctx
+    return ctx
+
+
+def _get_running_task_context(task_id: str) -> _RunningTaskContext | None:
+    return _running_task_contexts.get(task_id)
+
+
+def _unregister_running_task_context(task_id: str) -> None:
+    _running_task_contexts.pop(task_id, None)
 
 
 def _recover_running_task_for_cleanup(
@@ -1227,6 +1276,12 @@ class TaskService:
                 name=f"dfa_task_{claimed.task_id}",
             )
             _running_tasks[claimed.task_id] = asyncio_task
+            _register_running_task_context(
+                claimed.task_id,
+                task=asyncio_task,
+                epoch=claimed.epoch,
+                control_version=claimed.control_version,
+            )
             from app.metrics import observe_local_event
 
             observe_local_event("dispatch_claim", "success")
@@ -1665,9 +1720,42 @@ class TaskService:
         row = self._get_or_404(db, task_id)
         if row.status in ("passed", "failed", "error", "cancelled"):
             return self._row_to_dict(row)
+        ctx = _get_running_task_context(task_id)
         local_task = _active_local_task(task_id)
+        if ctx is not None and ctx.orch is not None:
+            ctx.orch.abort()
+            log_event(
+                logger,
+                logging.INFO,
+                "task cancel signal sent to orchestrator",
+                event="task_cancel_signal_sent",
+                task_id=task_id,
+                project_id=row.project_id,
+                owner_id=WORKER_ID,
+                epoch=ctx.epoch,
+                control_version=ctx.control_version,
+            )
         if local_task is not None:
             local_task.cancel()
+        if ctx is not None and (ctx.task_root or ctx.run_root):
+            cleaned = cleanup_task_agent_processes(
+                logger.warning,
+                label=f"task_cancel:{task_id}",
+                task_id=task_id,
+                task_root=ctx.task_root,
+                run_root=ctx.run_root,
+                worker_id=WORKER_ID,
+            )
+            log_event(
+                logger,
+                logging.INFO,
+                "task agent cleanup finished after cancel",
+                event="task_agent_cleanup_finished",
+                task_id=task_id,
+                project_id=row.project_id,
+                owner_id=WORKER_ID,
+                cleaned_groups=cleaned,
+            )
         row.status = "cancelled"
         row.finished_at = now_local()
         row.control_version = int(row.control_version or 0) + 1
@@ -1688,11 +1776,15 @@ class TaskService:
             status=row.status,
             control_version=int(row.control_version or 0),
             payload={
+                "orchestrator_abort_sent": bool(ctx and ctx.orch is not None),
                 "local_task_active": local_task is not None,
+                "cleanup_task_root": ctx.task_root if ctx is not None else None,
+                "cleanup_run_root": ctx.run_root if ctx is not None else None,
                 "control_version": int(row.control_version or 0),
             },
         )
         db.commit(); db.refresh(row)
+        _unregister_running_task_context(task_id)
         log_event(logger, logging.INFO, "task cancelled by control plane", event="task_cancel_requested",
                   task_id=task_id, project_id=row.project_id, control_version=row.control_version, status=row.status,
                   local_task_active=local_task is not None)
@@ -1767,6 +1859,8 @@ class TaskService:
         heartbeat_task: asyncio.Task | None = None
         guard_counter = 0
         orch_holder: dict[str, Orchestrator] = {}
+        task_root_path: str | None = None
+        epoch_run_root_path: str | None = None
 
         async def _heartbeat_loop(orch: Orchestrator) -> None:
             from app.db import get_db as _get_db
@@ -2100,6 +2194,8 @@ class TaskService:
 
             epoch_run_root = _task_epoch_run_root(row, epoch)
             root_output_dir = (_task_root(row) / "output") if _task_root(row) else None
+            task_root_path = str(_task_root(row)) if _task_root(row) else None
+            epoch_run_root_path = str(epoch_run_root) if epoch_run_root is not None else None
             if epoch_run_root is not None and not bool(tcfg.get("resume", False)):
                 if epoch_run_root.exists():
                     try:
@@ -2143,6 +2239,15 @@ class TaskService:
                 cfg.context = ((cfg.context or "").rstrip() + "\n\n" + entry_context).strip()
             orch = Orchestrator(config=cfg, on_event=on_event)
             orch_holder["orch"] = orch
+            _register_running_task_context(
+                task_id,
+                task=_running_tasks.get(task_id),
+                orch=orch,
+                task_root=task_root_path,
+                run_root=epoch_run_root_path,
+                epoch=epoch,
+                control_version=control_version,
+            )
             heartbeat_task = asyncio.create_task(_heartbeat_loop(orch), name=f"dfa_heartbeat_{task_id}")
             result = await orch.execute_recursive(
                 task_id,
@@ -2267,8 +2372,20 @@ class TaskService:
             from app.metrics import observe_local_event
 
             observe_local_event("task_finished", "cancelled")
+            orch = orch_holder.get("orch")
+            if orch is not None:
+                orch.abort()
+            cleaned = cleanup_task_agent_processes(
+                logger.warning,
+                label=f"task_cancelled:{task_id}",
+                task_id=task_id,
+                task_root=task_root_path,
+                run_root=epoch_run_root_path,
+                worker_id=WORKER_ID,
+            )
             log_event(logger, logging.INFO, "task coroutine cancelled", event="task_coroutine_cancelled",
-                      task_id=task_id, owner_id=WORKER_ID, epoch=epoch, control_version=control_version)
+                      task_id=task_id, owner_id=WORKER_ID, epoch=epoch, control_version=control_version,
+                      cleaned_groups=cleaned)
             try:
                 cancelled_row = db.query(AppDfaTask).filter_by(task_id=task_id).first()
                 if cancelled_row is not None:
@@ -2284,7 +2401,12 @@ class TaskService:
                         execution_epoch=epoch,
                         control_version=control_version,
                         dispatch_status=cancelled_row.dispatch_status,
-                        payload={"owner_id": WORKER_ID, "epoch": epoch, "control_version": control_version},
+                        payload={
+                            "owner_id": WORKER_ID,
+                            "epoch": epoch,
+                            "control_version": control_version,
+                            "cleanup_groups": cleaned,
+                        },
                     )
                     db.commit()
             except Exception:
@@ -2338,8 +2460,43 @@ class TaskService:
                 pass
         finally:
             stop_heartbeat.set()
+            orch = orch_holder.get("orch")
+            if orch is not None:
+                orch.abort()
+            targeted_cleaned = 0
+            if task_root_path or epoch_run_root_path:
+                log_event(
+                    logger,
+                    logging.INFO,
+                    "task agent cleanup started",
+                    event="task_agent_cleanup_started",
+                    task_id=task_id,
+                    owner_id=WORKER_ID,
+                    epoch=epoch,
+                    control_version=control_version,
+                )
+                targeted_cleaned = cleanup_task_agent_processes(
+                    logger.warning,
+                    label=f"task_finally:{task_id}",
+                    task_id=task_id,
+                    task_root=task_root_path,
+                    run_root=epoch_run_root_path,
+                    worker_id=WORKER_ID,
+                )
             try:
-                cleanup_orphan_pi_processes(logger.warning, label=f"task_finally:{task_id}")
+                orphan_cleaned = cleanup_orphan_pi_processes(logger.warning, label=f"task_finally:{task_id}")
+                log_event(
+                    logger,
+                    logging.INFO,
+                    "task agent cleanup finished",
+                    event="task_agent_cleanup_finished",
+                    task_id=task_id,
+                    owner_id=WORKER_ID,
+                    epoch=epoch,
+                    control_version=control_version,
+                    cleaned_groups=targeted_cleaned,
+                    orphan_cleaned_groups=orphan_cleaned,
+                )
             except Exception:
                 logger.warning("failed to cleanup orphan pi processes for %s", task_id, exc_info=True)
             if heartbeat_task is not None and not heartbeat_task.done():
@@ -2411,6 +2568,7 @@ class TaskService:
                 observe_local_event("lease_release", "failed")
                 db.rollback()
             _running_tasks.pop(task_id, None)
+            _unregister_running_task_context(task_id)
             try:
                 next(db_gen)
             except StopIteration:

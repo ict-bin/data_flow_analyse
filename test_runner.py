@@ -26,19 +26,55 @@ def _overflow_result() -> runner.AgentResult:
 
 
 class RunAgentPromptFileTests(unittest.TestCase):
-    def test_cleanup_orphan_pi_processes_skips_business_pid1_container(self):
-        with patch.object(agent_process, "_pid1_is_reaper_process", return_value=False):
-            killed = agent_process.cleanup_orphan_pi_processes(lambda _: None, label="test")
-        self.assertEqual(killed, 0)
+    def test_cleanup_orphan_pi_processes_kills_dfa_orphan_in_business_pid1_container(self):
+        orphan = agent_process.AgentProcessInfo(
+            pid=101,
+            ppid=1,
+            pgid=201,
+            comm="pi",
+            exe="node",
+            cwd="/tmp/dfa-task/run",
+            cmdline="pi --mode rpc",
+            environ={"DFA_TASK_ID": "dfa_1", "DFA_TASK_ROOT": "/tmp/dfa-task"},
+        )
+        with patch.object(agent_process, "_iter_agent_processes", return_value=[orphan]):
+            with patch.object(agent_process, "_kill_process_group", return_value=True) as kill_group:
+                killed = agent_process.cleanup_orphan_pi_processes(lambda _: None, label="test")
+        self.assertEqual(killed, 1)
+        kill_group.assert_called_once()
 
-    def test_pid1_reaper_detection_rejects_python_main(self):
-        with patch.object(agent_process, "_read_proc_name", return_value="python3"):
-            with patch("app.agent_process.os.readlink", return_value="/usr/bin/python3"):
-                self.assertFalse(agent_process._pid1_is_reaper_process())
-
-    def test_pid1_reaper_detection_accepts_tini(self):
-        with patch.object(agent_process, "_read_proc_name", return_value="tini"):
-            self.assertTrue(agent_process._pid1_is_reaper_process())
+    def test_cleanup_task_agent_processes_only_hits_matching_task(self):
+        match = agent_process.AgentProcessInfo(
+            pid=101,
+            ppid=55,
+            pgid=201,
+            comm="pi",
+            exe="node",
+            cwd="/tmp/dfa-task/run/epochs/0001",
+            cmdline="pi --mode rpc",
+            environ={"DFA_TASK_ID": "dfa_match", "DFA_TASK_ROOT": "/tmp/dfa-task"},
+        )
+        other = agent_process.AgentProcessInfo(
+            pid=102,
+            ppid=1,
+            pgid=202,
+            comm="pi",
+            exe="node",
+            cwd="/tmp/other/run",
+            cmdline="pi --mode rpc",
+            environ={"DFA_TASK_ID": "dfa_other", "DFA_TASK_ROOT": "/tmp/other"},
+        )
+        with patch.object(agent_process, "_iter_agent_processes", return_value=[match, other]):
+            with patch.object(agent_process, "_kill_process_group", return_value=True) as kill_group:
+                killed = agent_process.cleanup_task_agent_processes(
+                    lambda _: None,
+                    label="test",
+                    task_id="dfa_match",
+                    task_root="/tmp/dfa-task",
+                    run_root="/tmp/dfa-task/run/epochs/0001",
+                )
+        self.assertEqual(killed, 1)
+        kill_group.assert_called_once()
 
     def test_agent_process_terminate_tree_force_cleans_group_after_exit(self):
         logs: list[str] = []
@@ -138,6 +174,7 @@ class RunAgentPromptFileTests(unittest.TestCase):
         async def fake_run_with_pi_retry(**kwargs):
             captured["args"] = kwargs["args"]
             captured["prompt_text"] = kwargs["prompt"]
+            captured["env"] = kwargs["env"]
             result = runner.AgentResult()
             result.output = "ok"
             result.exit_code = 0
@@ -158,12 +195,23 @@ class RunAgentPromptFileTests(unittest.TestCase):
                             cwd=cwd,
                             max_retries=0,
                             pi_max_retries=0,
+                            task_context={
+                                "task_id": "dfa_123",
+                                "task_root": "/tmp/dfa_123",
+                                "task_run_root": "/tmp/dfa_123/run/epochs/0001",
+                                "worker_id": "worker-a",
+                                "execution_epoch": 1,
+                            },
                         )
                     )
 
         self.assertEqual(result.exit_code, 0)
         self.assertEqual(captured["prompt_text"], long_prompt)
         self.assertNotIn(long_prompt, captured["args"])
+        self.assertEqual(captured["env"]["DFA_TASK_ID"], "dfa_123")
+        self.assertEqual(captured["env"]["DFA_TASK_ROOT"], "/tmp/dfa_123")
+        self.assertEqual(captured["env"]["DFA_TASK_RUN_ROOT"], "/tmp/dfa_123/run/epochs/0001")
+        self.assertEqual(captured["env"]["DFA_WORKER_ID"], "worker-a")
 
     def test_run_agent_retries_after_timeout(self):
         attempts = {"count": 0}

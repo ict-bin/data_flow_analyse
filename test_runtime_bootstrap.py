@@ -81,6 +81,7 @@ class RuntimeBootstrapTests(unittest.IsolatedAsyncioTestCase):
         bootstrap = RuntimeBootstrap()
         reconcile_calls = []
         heartbeat_calls = []
+        orphan_sweep_calls = []
 
         def fake_get_db():
             class _DummyDb:
@@ -102,7 +103,7 @@ class RuntimeBootstrapTests(unittest.IsolatedAsyncioTestCase):
         with patch("app.service.runtime_bootstrap.get_task_service", return_value=SimpleNamespace(reconcile_orphaned_running_tasks=fake_reconcile)), patch(
             "app.service.worker_slot_service.get_worker_slot_service",
             return_value=SimpleNamespace(upsert_heartbeat=lambda db, **kwargs: fake_heartbeat(**kwargs)),
-        ), patch("app.service.runtime_bootstrap.cleanup_orphan_pi_processes"), patch(
+        ), patch("app.service.runtime_bootstrap.cleanup_orphan_pi_processes", side_effect=lambda *args, **kwargs: orphan_sweep_calls.append(kwargs.get("label")) or 0), patch(
             "app.db.get_db",
             fake_get_db,
         ), patch("app.runtime_context.WORKER_SLOT_HEARTBEAT_SECONDS", 1), patch(
@@ -130,6 +131,7 @@ class RuntimeBootstrapTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertGreaterEqual(len(heartbeat_calls), 1)
         self.assertGreaterEqual(len(reconcile_calls), 1)
+        self.assertGreaterEqual(len(orphan_sweep_calls), 1)
 
     def test_install_internal_observability_router_is_idempotent(self):
         bootstrap = RuntimeBootstrap()
