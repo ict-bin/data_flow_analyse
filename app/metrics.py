@@ -249,6 +249,8 @@ def _render_cluster_task_metrics() -> list[str]:
     trace_callee_total = 0
     leased_tasks = 0
     stale_leases = 0
+    orphan_running_tasks = 0
+    running_without_owner = 0
     heartbeat_age_max = 0.0
     heartbeat_live = 0
     session_gauge = 0
@@ -260,6 +262,13 @@ def _render_cluster_task_metrics() -> list[str]:
         status = str(row.status or "unknown")
         status_counts[status] += 1
         dispatch_counts[str(row.dispatch_status or "unknown")] += 1
+        if status == "running":
+            if not row.execution_owner_id:
+                running_without_owner += 1
+            if (not row.execution_owner_id) or (row.execution_lease_until is None) or (
+                row.execution_lease_until and row.execution_lease_until.timestamp() < now
+            ):
+                orphan_running_tasks += 1
         if row.execution_owner_id and row.execution_lease_until and row.execution_lease_until.timestamp() >= now:
             leased_tasks += 1
             observed_active_owners.add(str(row.execution_owner_id))
@@ -422,6 +431,12 @@ def _render_cluster_task_metrics() -> list[str]:
         "# HELP secflow_dfa_cluster_stale_leases Expired lease count for owned tasks.",
         "# TYPE secflow_dfa_cluster_stale_leases gauge",
         f"secflow_dfa_cluster_stale_leases {stale_leases}",
+        "# HELP secflow_dfa_cluster_orphan_running_tasks Running tasks missing a valid execution lease context.",
+        "# TYPE secflow_dfa_cluster_orphan_running_tasks gauge",
+        f"secflow_dfa_cluster_orphan_running_tasks {orphan_running_tasks}",
+        "# HELP secflow_dfa_cluster_running_without_owner Running tasks missing execution_owner_id.",
+        "# TYPE secflow_dfa_cluster_running_without_owner gauge",
+        f"secflow_dfa_cluster_running_without_owner {running_without_owner}",
         "# HELP secflow_dfa_cluster_dispatcher_enabled Dispatcher feature enabled on this scrape source.",
         "# TYPE secflow_dfa_cluster_dispatcher_enabled gauge",
         f"secflow_dfa_cluster_dispatcher_enabled {dispatcher_running}",

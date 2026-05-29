@@ -13,6 +13,8 @@ from app.service.execution_coordinator import (
     begin_execution_if_owner,
     claim_one_runnable_task,
     commit_terminal_state_if_owner,
+    recover_running_task_if_owner,
+    reclaim_orphaned_running_tasks,
     renew_lease,
     still_owner,
 )
@@ -184,6 +186,65 @@ class ExecutionCoordinatorTests(unittest.TestCase):
             self.assertFalse(renew_lease(db, claimed.task_id, "pod-a", claimed.epoch))
             self.assertTrue(begin_execution_if_owner(db, claimed.task_id, "pod-a", claimed.epoch, claimed.control_version, started_at=now_local()))
             self.assertTrue(renew_lease(db, claimed.task_id, "pod-a", claimed.epoch))
+        finally:
+            db.close()
+
+    def test_recover_running_task_if_owner_requeues_without_orphan_running(self):
+        future = now_local() + timedelta(hours=1)
+        self._insert_task(
+            status="running",
+            execution_owner_id="pod-a",
+            execution_lease_until=future,
+            execution_epoch=2,
+            control_version=3,
+            dispatch_status="running",
+        )
+        db = self._session()
+        try:
+            self.assertTrue(recover_running_task_if_owner(db, "dfa_test_1", "pod-a", 2, 3))
+            row = db.query(AppDfaTask).filter_by(task_id="dfa_test_1").first()
+            self.assertEqual(row.status, "pending")
+            self.assertEqual(row.dispatch_status, "pending")
+            self.assertIsNone(row.execution_owner_id)
+            self.assertIsNone(row.execution_lease_until)
+            self.assertIsNone(row.execution_heartbeat_at)
+        finally:
+            db.close()
+
+    def test_reclaim_orphaned_running_tasks_repairs_missing_owner_and_expired_lease(self):
+        expired = now_local() - timedelta(minutes=5)
+        future = now_local() + timedelta(hours=1)
+        self._insert_task(
+            task_id="dfa_missing_owner",
+            status="running",
+            execution_owner_id=None,
+            execution_lease_until=future,
+            execution_epoch=1,
+            control_version=0,
+            dispatch_status=None,
+        )
+        self._insert_task(
+            task_id="dfa_expired_lease",
+            status="running",
+            execution_owner_id="pod-old",
+            execution_lease_until=expired,
+            execution_epoch=4,
+            control_version=1,
+            dispatch_status="running",
+        )
+        db = self._session()
+        try:
+            recovered = reclaim_orphaned_running_tasks(db)
+            recovered_ids = {item.task_id: item.reason for item in recovered}
+            self.assertEqual(recovered_ids["dfa_missing_owner"], "missing_owner")
+            self.assertEqual(recovered_ids["dfa_expired_lease"], "expired_lease")
+            rows = {row.task_id: row for row in db.query(AppDfaTask).all()}
+            self.assertEqual(rows["dfa_missing_owner"].status, "pending")
+            self.assertEqual(rows["dfa_missing_owner"].dispatch_status, "pending")
+            self.assertIsNone(rows["dfa_missing_owner"].execution_owner_id)
+            self.assertEqual(rows["dfa_expired_lease"].status, "pending")
+            self.assertEqual(rows["dfa_expired_lease"].dispatch_status, "pending")
+            self.assertIsNone(rows["dfa_expired_lease"].execution_owner_id)
         finally:
             db.close()
 

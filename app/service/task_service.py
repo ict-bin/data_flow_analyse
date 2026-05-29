@@ -28,7 +28,16 @@ from app.logging_utils import log_event
 from app.models import SwarmEvent, TaskStatus
 from app.orchestrator import Orchestrator
 from app.runtime_context import HEARTBEAT_INTERVAL_SECONDS, WORKER_ID, MAX_LOCAL_RUNNING_TASKS
-from app.service.execution_coordinator import begin_execution_if_owner, claim_one_runnable_task, commit_terminal_state_if_owner, load_execution_snapshot, release_lease, renew_lease, still_owner
+from app.service.execution_coordinator import (
+    begin_execution_if_owner,
+    claim_one_runnable_task,
+    commit_terminal_state_if_owner,
+    load_execution_snapshot,
+    recover_running_task_if_owner,
+    release_lease,
+    renew_lease,
+    still_owner,
+)
 from app.service.session_index import build_session_catalog
 from app.time_utils import isoformat_local, now_local
 from app.agent_process import cleanup_orphan_pi_processes
@@ -216,6 +225,69 @@ def _active_local_task(task_id: str) -> asyncio.Task | None:
     if local_task is None or local_task.done():
         return None
     return local_task
+
+
+def _recover_running_task_for_cleanup(
+    db: Session,
+    *,
+    task_id: str,
+    owner_id: str,
+    epoch: int,
+    control_version: int,
+    reason: str,
+) -> bool:
+    recovered = recover_running_task_if_owner(
+        db,
+        task_id,
+        owner_id,
+        epoch,
+        control_version,
+        reason=reason,
+    )
+    if not recovered:
+        return False
+    row = db.query(AppDfaTask).filter_by(task_id=task_id).first()
+    if row is not None:
+        _record_task_event(
+            db,
+            row=row,
+            event_type="task_running_recovered",
+            message="任务在 worker 非正常收尾后已回退为 pending 并等待重排",
+            level="warning",
+            status=row.status,
+            worker_id=owner_id,
+            execution_owner_id=owner_id,
+            execution_epoch=epoch,
+            control_version=control_version,
+            dispatch_status=row.dispatch_status,
+            payload={
+                "owner_id": owner_id,
+                "epoch": epoch,
+                "control_version": control_version,
+                "recovery_reason": reason,
+            },
+        )
+        _record_task_event(
+            db,
+            row=row,
+            event_type="task_requeued_after_orphaned_running",
+            message="任务已重新进入调度队列",
+            level="warning",
+            status=row.status,
+            worker_id=owner_id,
+            execution_owner_id=owner_id,
+            execution_epoch=epoch,
+            control_version=control_version,
+            dispatch_status=row.dispatch_status,
+            payload={
+                "owner_id": owner_id,
+                "epoch": epoch,
+                "control_version": control_version,
+                "recovery_reason": reason,
+            },
+        )
+        db.commit()
+    return True
 
 
 def _abnormal_evidence(key: str, label: str, value: object) -> dict | None:
@@ -1079,6 +1151,44 @@ def _flush_stages(task_id: str, events: list[dict], owner_id: str | None = None,
 class TaskService:
     def local_running_task_count(self) -> int:
         return sum(1 for task in _running_tasks.values() if not task.done())
+
+    def reconcile_orphaned_running_tasks(self, db: Session, *, limit: int = 100) -> int:
+        from app.service.execution_coordinator import reclaim_orphaned_running_tasks
+
+        recovered = reclaim_orphaned_running_tasks(db, limit=limit)
+        for item in recovered:
+            row = db.query(AppDfaTask).filter_by(task_id=item.task_id).first()
+            if row is None:
+                continue
+            payload = {
+                "previous_owner_id": item.previous_owner_id,
+                "previous_dispatch_status": item.previous_dispatch_status,
+                "previous_lease_until": isoformat_local(item.previous_lease_until),
+                "recovery_reason": item.reason,
+            }
+            _record_task_event(
+                db,
+                row=row,
+                event_type="task_running_recovered",
+                message="后台巡检发现孤儿 running 任务，已回退为 pending",
+                level="warning",
+                status=row.status,
+                dispatch_status=row.dispatch_status,
+                payload=payload,
+            )
+            _record_task_event(
+                db,
+                row=row,
+                event_type="task_requeued_after_orphaned_running",
+                message="孤儿 running 任务已重新排入调度队列",
+                level="warning",
+                status=row.status,
+                dispatch_status=row.dispatch_status,
+                payload=payload,
+            )
+        if recovered:
+            db.commit()
+        return len(recovered)
 
     async def dispatch_once(self) -> str | None:
         if self.local_running_task_count() >= MAX_LOCAL_RUNNING_TASKS:
@@ -2239,6 +2349,36 @@ class TaskService:
                 except asyncio.CancelledError:
                     pass
             try:
+                snapshot = load_execution_snapshot(db, task_id)
+                if (
+                    snapshot is not None
+                    and snapshot.status == "running"
+                    and snapshot.execution_owner_id == WORKER_ID
+                    and int(snapshot.execution_epoch or 0) == int(epoch)
+                    and int(snapshot.control_version or 0) == int(control_version)
+                ):
+                    recovered = _recover_running_task_for_cleanup(
+                        db,
+                        task_id=task_id,
+                        owner_id=WORKER_ID,
+                        epoch=epoch,
+                        control_version=control_version,
+                        reason="worker_finally_without_terminal_state",
+                    )
+                    if recovered:
+                        from app.metrics import observe_local_event
+
+                        observe_local_event("task_running_recovered", "cleanup")
+                        log_event(
+                            logger,
+                            logging.WARNING,
+                            "running task recovered to pending during worker cleanup",
+                            event="task_running_recovered",
+                            task_id=task_id,
+                            owner_id=WORKER_ID,
+                            epoch=epoch,
+                            control_version=control_version,
+                        )
                 released = release_lease(db, task_id, WORKER_ID, epoch)
                 if released:
                     from app.metrics import observe_local_event

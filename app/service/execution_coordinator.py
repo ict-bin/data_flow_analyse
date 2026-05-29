@@ -30,6 +30,15 @@ class ExecutionSnapshot:
     execution_heartbeat_at: object | None
 
 
+@dataclass(frozen=True)
+class RecoveredRunningTask:
+    task_id: str
+    previous_owner_id: str | None
+    previous_dispatch_status: str | None
+    previous_lease_until: object | None
+    reason: str
+
+
 def _lease_deadline():
     return now_local() + timedelta(seconds=LEASE_TTL_SECONDS)
 
@@ -131,6 +140,99 @@ def release_lease(db: Session, task_id: str, owner_id: str, epoch: int) -> bool:
     )
     db.commit()
     return bool(updated)
+
+
+def recover_running_task_if_owner(
+    db: Session,
+    task_id: str,
+    owner_id: str,
+    epoch: int,
+    control_version: int,
+    *,
+    reason: str = "owner_cleanup",
+) -> bool:
+    updated = (
+        db.query(AppDfaTask)
+        .filter(
+            AppDfaTask.task_id == task_id,
+            AppDfaTask.execution_owner_id == owner_id,
+            AppDfaTask.execution_epoch == epoch,
+            AppDfaTask.control_version == control_version,
+            AppDfaTask.is_deleted.is_(False),
+            AppDfaTask.status == "running",
+        )
+        .update(
+            {
+                AppDfaTask.status: "pending",
+                AppDfaTask.execution_owner_id: None,
+                AppDfaTask.execution_lease_until: None,
+                AppDfaTask.execution_heartbeat_at: None,
+                AppDfaTask.dispatch_status: "pending",
+            },
+            synchronize_session=False,
+        )
+    )
+    db.commit()
+    return bool(updated)
+
+
+def reclaim_orphaned_running_tasks(db: Session, *, limit: int = 100) -> list[RecoveredRunningTask]:
+    now = now_local()
+    candidates = (
+        db.query(AppDfaTask)
+        .filter(
+            AppDfaTask.is_deleted.is_(False),
+            AppDfaTask.status == "running",
+            (
+                (AppDfaTask.execution_owner_id.is_(None))
+                | (AppDfaTask.execution_lease_until.is_(None))
+                | (AppDfaTask.execution_lease_until < now)
+            ),
+        )
+        .order_by(AppDfaTask.updated_at.asc(), AppDfaTask.id.asc())
+        .limit(max(1, int(limit or 100)))
+        .all()
+    )
+    recovered: list[RecoveredRunningTask] = []
+    for row in candidates:
+        if row.execution_owner_id is None:
+            reason = "missing_owner"
+        elif row.execution_lease_until is None:
+            reason = "missing_lease"
+        else:
+            reason = "expired_lease"
+        updated = (
+            db.query(AppDfaTask)
+            .filter(
+                AppDfaTask.id == row.id,
+                AppDfaTask.is_deleted.is_(False),
+                AppDfaTask.status == "running",
+            )
+            .update(
+                {
+                    AppDfaTask.status: "pending",
+                    AppDfaTask.execution_owner_id: None,
+                    AppDfaTask.execution_lease_until: None,
+                    AppDfaTask.execution_heartbeat_at: None,
+                    AppDfaTask.dispatch_status: "pending",
+                },
+                synchronize_session=False,
+            )
+        )
+        if not updated:
+            db.rollback()
+            continue
+        recovered.append(
+            RecoveredRunningTask(
+                task_id=row.task_id,
+                previous_owner_id=row.execution_owner_id,
+                previous_dispatch_status=row.dispatch_status,
+                previous_lease_until=row.execution_lease_until,
+                reason=reason,
+            )
+        )
+    db.commit()
+    return recovered
 
 
 def still_owner(db: Session, task_id: str, owner_id: str, epoch: int, control_version: int) -> bool:

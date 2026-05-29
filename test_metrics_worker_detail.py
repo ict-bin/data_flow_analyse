@@ -96,6 +96,32 @@ class MetricsWorkerDetailTests(unittest.TestCase):
         self.assertIn('secflow_dfa_cluster_worker_active_jobs{worker_id="pod-a",host_name="pod-a",status="pending"} 1', rendered)
         self.assertIn('secflow_dfa_cluster_worker_active_jobs{worker_id="pod-a",host_name="pod-a",status="running"} 1', rendered)
 
+    def test_aggregate_metrics_export_orphan_running_samples(self):
+        now = now_local()
+        self._insert_task(
+            task_id="dfa_orphan_running",
+            status="running",
+            execution_owner_id=None,
+            execution_lease_until=None,
+            execution_heartbeat_at=None,
+            dispatch_status=None,
+        )
+
+        session_factory = self.Session
+
+        def fake_get_db():
+            db = session_factory()
+            try:
+                yield db
+            finally:
+                db.close()
+
+        with patch("app.db.get_db", fake_get_db):
+            rendered = render_aggregate_metrics()
+
+        self.assertIn("secflow_dfa_cluster_orphan_running_tasks 1", rendered)
+        self.assertIn("secflow_dfa_cluster_running_without_owner 1", rendered)
+
 
 if __name__ == "__main__":
     unittest.main()

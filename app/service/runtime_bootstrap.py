@@ -270,7 +270,9 @@ class RuntimeBootstrap:
             from app.runtime_context import MAX_LOCAL_RUNNING_TASKS, POD_IP, POD_NAME, WORKER_ID, WORKER_SLOT_HEARTBEAT_SECONDS
             from app.service.worker_slot_service import get_worker_slot_service
             orphan_sweep_seconds = max(10, int(os.environ.get("DFA_ORPHAN_PI_SWEEP_SECONDS", "30")))
+            running_reconcile_seconds = max(10, int(os.environ.get("DFA_ORPHAN_RUNNING_RECONCILE_SECONDS", str(max(10, WORKER_SLOT_HEARTBEAT_SECONDS)))))
             last_orphan_sweep = 0.0
+            last_running_reconcile = 0.0
 
             while not self._stop_event.is_set():
                 db_gen = get_db()
@@ -288,6 +290,18 @@ class RuntimeBootstrap:
                         max_concurrent_tasks=MAX_LOCAL_RUNNING_TASKS,
                         status="running",
                     )
+                    if now_ts - last_running_reconcile >= running_reconcile_seconds:
+                        recovered = get_task_service().reconcile_orphaned_running_tasks(db)
+                        last_running_reconcile = now_ts
+                        if recovered:
+                            log_event(
+                                logger,
+                                logging.WARNING,
+                                "recovered orphaned running tasks",
+                                event="task_running_reconcile_batch",
+                                owner_id=INSTANCE_ID,
+                                recovered_count=recovered,
+                            )
                 except Exception as exc:
                     logger.warning("worker slot heartbeat failed on %s: %s", INSTANCE_ID, exc, exc_info=True)
                 finally:
