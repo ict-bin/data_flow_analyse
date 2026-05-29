@@ -109,6 +109,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="data_flow_analyse", version="2.0.0", lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+get_runtime_bootstrap().install_internal_observability_router(app)
 
 
 @app.middleware("http")

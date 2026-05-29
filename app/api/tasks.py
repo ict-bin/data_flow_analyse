@@ -10,7 +10,7 @@ import httpx
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from fastapi import Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
@@ -25,6 +25,7 @@ from .deps import ensure_admin_user, ensure_project_access, get_current_user
 from . import router
 
 logger = logging.getLogger(__name__)
+internal_observability_router = APIRouter(prefix="/api/app/dataflow-analyse")
 AGGREGATE_HTTP_TIMEOUT_SECONDS = float(os.environ.get("DFA_AGENT_AGGREGATE_TIMEOUT_SECONDS", "3"))
 AGGREGATE_HTTP_PORT = int(os.environ.get("DFA_AGENT_AGGREGATE_PORT", os.environ.get("PORT", "3000")))
 AGGREGATE_CACHE_TTL_SECONDS = max(0.0, float(os.environ.get("DFA_AGENT_AGGREGATE_CACHE_TTL_SECONDS", "2.5")))
@@ -359,13 +360,14 @@ async def _fanout_get_json(urls: list[str], *, path: str, token: str, params: di
                 response = await client.get(url, headers=headers, params=params)
                 if response.status_code == 200:
                     return response.json(), base_url
+                logger.warning("dfa agent fanout non-200 status=%s url=%s", response.status_code, url)
             except Exception:
+                logger.warning("dfa agent fanout request failed url=%s", url, exc_info=True)
                 continue
     return None, None
 
 
-@router.get("/agent-observability/snapshot")
-async def get_agent_observability_snapshot(
+async def _get_agent_observability_snapshot_impl(
     project_id: str = Query(...),
     db: Session = Depends(get_db),
     user_and_token=Depends(get_current_user),
@@ -375,6 +377,24 @@ async def get_agent_observability_snapshot(
     from app.service.agent_observability import get_agent_observability_service
 
     return get_agent_observability_service().build_snapshot(db, project_id=project_id)
+
+
+@router.get("/agent-observability/snapshot")
+async def get_agent_observability_snapshot(
+    project_id: str = Query(...),
+    db: Session = Depends(get_db),
+    user_and_token=Depends(get_current_user),
+):
+    return await _get_agent_observability_snapshot_impl(project_id=project_id, db=db, user_and_token=user_and_token)
+
+
+@internal_observability_router.get("/agent-observability/snapshot", response_model=dict[str, Any], include_in_schema=False)
+async def get_internal_agent_observability_snapshot(
+    project_id: str = Query(...),
+    db: Session = Depends(get_db),
+    user_and_token=Depends(get_current_user),
+):
+    return await _get_agent_observability_snapshot_impl(project_id=project_id, db=db, user_and_token=user_and_token)
 
 
 async def _build_agent_aggregate_snapshot(project_id: str, token: str, db: Session) -> dict[str, Any]:
@@ -1209,13 +1229,14 @@ async def _fanout_post_json(urls: list[str], *, path: str, token: str, params: d
                 response = await client.post(url, headers=headers, params=params)
                 if response.status_code == 200:
                     return response.json(), base_url
+                logger.warning("dfa agent fanout post non-200 status=%s url=%s", response.status_code, url)
             except Exception:
+                logger.warning("dfa agent fanout post failed url=%s", url, exc_info=True)
                 continue
     return None, None
 
 
-@router.post("/agent-observability/processes/{pid}/kill", response_model=AgentProcessKillResponse)
-async def kill_agent_process(
+async def _kill_agent_process_impl(
     pid: int,
     project_id: str = Query(...),
     db: Session = Depends(get_db),
@@ -1276,6 +1297,26 @@ async def kill_agent_process(
         skipped=0,
         items=[AgentProcessKillItemResponse(**result)],
     )
+
+
+@router.post("/agent-observability/processes/{pid}/kill", response_model=AgentProcessKillResponse)
+async def kill_agent_process(
+    pid: int,
+    project_id: str = Query(...),
+    db: Session = Depends(get_db),
+    user_and_token=Depends(get_current_user),
+):
+    return await _kill_agent_process_impl(pid=pid, project_id=project_id, db=db, user_and_token=user_and_token)
+
+
+@internal_observability_router.post("/agent-observability/processes/{pid}/kill", response_model=AgentProcessKillResponse, include_in_schema=False)
+async def kill_internal_agent_process(
+    pid: int,
+    project_id: str = Query(...),
+    db: Session = Depends(get_db),
+    user_and_token=Depends(get_current_user),
+):
+    return await _kill_agent_process_impl(pid=pid, project_id=project_id, db=db, user_and_token=user_and_token)
 
 
 @router.post("/agent-observability/aggregate/processes/{pid}/kill", response_model=AgentProcessKillResponse)

@@ -224,6 +224,14 @@ class RuntimeBootstrap:
         self._router_installed = True
         self._status.management_api_ready = True
 
+    def install_internal_observability_router(self, app: FastAPI) -> None:
+        if getattr(app.state, "dfa_internal_observability_router_installed", False):
+            return
+        from app.api.tasks import internal_observability_router
+
+        app.include_router(internal_observability_router)
+        app.state.dfa_internal_observability_router_installed = True
+
     async def _register_registry(self) -> None:
         from app.service.registry_service import get_registry_service
 

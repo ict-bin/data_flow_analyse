@@ -5,6 +5,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from fastapi import FastAPI
+
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from app.service.runtime_bootstrap import RuntimeBootstrap
@@ -67,6 +69,17 @@ class RuntimeBootstrapTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(2, status["attempts"])
         self.assertEqual(2, len(init_attempts))
         self.assertGreaterEqual(len(dispatch_calls), 0)
+
+    def test_install_internal_observability_router_is_idempotent(self):
+        bootstrap = RuntimeBootstrap()
+        app = FastAPI()
+
+        bootstrap.install_internal_observability_router(app)
+        bootstrap.install_internal_observability_router(app)
+
+        paths = [route.path for route in app.router.routes]
+        self.assertIn("/api/app/dataflow-analyse/agent-observability/snapshot", paths)
+        self.assertEqual(1, paths.count("/api/app/dataflow-analyse/agent-observability/snapshot"))
 
 
 if __name__ == "__main__":
