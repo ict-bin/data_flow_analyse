@@ -9,6 +9,7 @@ from sqlalchemy.orm import sessionmaker
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from app.db.models import AppDfaTask, Base
+from app.api import tasks as tasks_api
 from app.service.agent_observability import AgentObservabilityService
 
 
@@ -187,6 +188,13 @@ class AgentObservabilityTests(unittest.TestCase):
             self.assertEqual("dfa_obs_workspace", process["task_id"])
         finally:
             db.close()
+
+    def test_resolve_worker_targets_prefers_pod_ip_only(self):
+        self.assertEqual(
+            ["10.0.0.8"],
+            tasks_api._resolve_worker_targets(pod_ip="10.0.0.8", pod_name="dfa-worker-1"),
+        )
+        self.assertEqual([], tasks_api._resolve_worker_targets(pod_ip=None, pod_name="dfa-worker-1"))
 
 
 if __name__ == "__main__":

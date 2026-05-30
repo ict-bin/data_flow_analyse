@@ -29,8 +29,6 @@ internal_observability_router = APIRouter(prefix="/api/app/dataflow-analyse")
 AGGREGATE_HTTP_TIMEOUT_SECONDS = float(os.environ.get("DFA_AGENT_AGGREGATE_TIMEOUT_SECONDS", "3"))
 AGGREGATE_HTTP_PORT = int(os.environ.get("DFA_AGENT_AGGREGATE_PORT", os.environ.get("PORT", "3000")))
 AGGREGATE_CACHE_TTL_SECONDS = max(0.0, float(os.environ.get("DFA_AGENT_AGGREGATE_CACHE_TTL_SECONDS", "2.5")))
-POD_DNS_SUFFIX = os.environ.get("K8S_POD_DNS_SUFFIX", "pod.cluster.local").strip() or "pod.cluster.local"
-POD_NAMESPACE = os.environ.get("POD_NAMESPACE", "secflow-ns").strip() or "secflow-ns"
 _LAST_AGENT_AGGREGATE_META: dict[str, Any] = {
     "partial": False,
     "sources": 0,
@@ -353,11 +351,8 @@ def _snapshot_query_params() -> dict[str, Any]:
 def _resolve_worker_targets(*, pod_ip: str | None, pod_name: str | None) -> list[str]:
     targets: list[str] = []
     normalized_ip = str(pod_ip or "").strip()
-    normalized_name = str(pod_name or "").strip()
     if normalized_ip:
         targets.append(normalized_ip)
-    if normalized_name:
-        targets.append(f"{normalized_name}.{POD_NAMESPACE}.{POD_DNS_SUFFIX}")
     return targets
 
 
@@ -440,7 +435,7 @@ async def _build_agent_aggregate_snapshot(token: str, db: Session) -> dict[str, 
 
     local = get_agent_observability_service().build_snapshot(db, project_id=None)
     cluster_snapshot = build_worker_cluster_snapshot(db, project_id=None)
-    workers = [worker for worker in cluster_snapshot.workers if worker.healthy and str(worker.pod_name or "").strip()]
+    workers = [worker for worker in cluster_snapshot.workers if worker.healthy and _resolve_worker_targets(pod_ip=worker.pod_ip, pod_name=worker.pod_name)]
 
     merged_processes: list[dict[str, Any]] = []
     merged_sessions: list[dict[str, Any]] = []
