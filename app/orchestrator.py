@@ -669,21 +669,14 @@ class Orchestrator(JudgeMixin):
             if result is None:
                 self._raise_if_cancelled()
                 # 执行：使用 PerTaintWorkflow 实现多 session 并行污点分析
-                # 优先使用 task_cfg.taint_params（由上游入口分析/DFA API 结构化传入），
-                # 不再只依赖 prompt 文本正则；否则新提示词“污点为函数入参”会解析不到并退化为 all。
-                _taint_list: list[str] = [
-                    str(value).strip()
-                    for value in (getattr(task_cfg, "taint_params", None) or [])
-                    if str(value).strip()
-                ]
-                if not _taint_list:
-                    _taint_match = re.search(r'(?:外部输入参数|污点(?:为函数入参|参数)?|污染参数).*?[:：]\s*([^\n]+)',
-                                            task_cfg.task or "")
-                    if _taint_match:
-                        raw_taints = _taint_match.group(1)
-                        _taint_list = [re.sub(r'[。，,（(].*', '', t).strip().strip('`')
-                                       for t in re.split(r'[,，、]', raw_taints) if t.strip()]
-                        _taint_list = [t for t in _taint_list if t and re.match(r'^[A-Za-z_]', t)]
+                _taint_match = re.search(r'外部输入参数.*?为[:：]\s*([^\n]+)',
+                                        task_cfg.task or "")
+                _taint_list: list[str] = []
+                if _taint_match:
+                    raw_taints = _taint_match.group(1)
+                    _taint_list = [re.sub(r'[。，,（(].*', '', t).strip().strip('`')
+                                   for t in raw_taints.split(',') if t.strip()]
+                    _taint_list = [t for t in _taint_list if t and re.match(r'^[A-Za-z_]', t)]
                 if not _taint_list:
                     _tc_m = re.search(r'污染参数[:\uff1a]\s*([^\n]+)', taint_ctx or "")
                     if _tc_m:
