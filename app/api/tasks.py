@@ -1168,11 +1168,15 @@ async def list_agent_tasks(
 
 @router.get("/agent-observability/aggregate/tasks", response_model=list[AgentTaskOwnershipSnapshotResponse])
 async def list_agent_aggregate_tasks(
+    pod: Optional[str] = Query(None),
     db: Session = Depends(get_db),
     user_and_token=Depends(get_current_user),
 ):
     _, token = user_and_token
-    return (await _build_agent_aggregate_snapshot(token, db))["tasks"]
+    rows = list((await _build_agent_aggregate_snapshot(token, db))["tasks"])
+    if pod:
+        rows = [row for row in rows if str(row.get("pod_name") or "") == pod]
+    return rows
 
 
 @router.get("/agent-observability/pods", response_model=list[AgentPodSnapshotResponse])
