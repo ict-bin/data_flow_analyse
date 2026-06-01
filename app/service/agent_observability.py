@@ -12,7 +12,6 @@ from typing import Any
 from sqlalchemy.orm import Session
 
 from app.db.models import AppDfaTask
-from app.service.task_service import get_task_service
 from app.service.worker_snapshot import build_worker_cluster_snapshot
 
 POD_NAME = (
@@ -39,7 +38,6 @@ _AGENT_TOKENS: tuple[tuple[str, str], ...] = (
     ("/pi", "pi"),
 )
 _WRAPPER_NAMES = {"node", "npm", "npx", "pnpm", "yarn", "python", "python3", "uv"}
-_ACTIVE_TASK_STATUSES = {"running", "pending", "queued", "dispatching"}
 
 
 @dataclass
@@ -56,10 +54,6 @@ class AgentProcessSnapshot:
     match_source: str | None
     match_confidence: str | None
     workspace_root: str | None
-    session_arg_path: str | None
-    open_session_paths: list[str]
-    session_file: str | None
-    session_id: str | None
     task_id: str | None
     task_name: str | None
     task_status: str | None
@@ -104,6 +98,14 @@ def _infer_runtime_kind(command: str, exe: str | None) -> str | None:
     return None
 
 
+def _extract_role_kind(command: str) -> str | None:
+    lowered = f" {command.lower()} "
+    for token in ("judge", "review", "reviewer", "worker", "coder", "analysis", "planner", "critic", "round"):
+        if f" {token} " in lowered or f"/{token}" in lowered or f"--{token}" in lowered:
+            return token
+    return None
+
+
 def _extract_session_arg_path(command: str) -> str | None:
     with contextlib.suppress(Exception):
         tokens = shlex.split(command)
@@ -117,7 +119,7 @@ def _extract_session_arg_path(command: str) -> str | None:
     return None
 
 
-def _collect_open_session_paths(proc_dir: pathlib.Path) -> list[str]:
+def _collect_open_paths(proc_dir: pathlib.Path) -> list[str]:
     rows: list[str] = []
     fd_dir = proc_dir / "fd"
     if not fd_dir.exists():
@@ -125,11 +127,8 @@ def _collect_open_session_paths(proc_dir: pathlib.Path) -> list[str]:
     with contextlib.suppress(Exception):
         for fd_entry in fd_dir.iterdir():
             with contextlib.suppress(Exception):
-                target = os.readlink(fd_entry)
-                if not target:
-                    continue
-                normalized = _normalize_path(target)
-                if normalized and normalized.endswith((".jsonl", ".json")):
+                normalized = _normalize_path(os.readlink(fd_entry))
+                if normalized:
                     rows.append(normalized)
     deduped: list[str] = []
     seen: set[str] = set()
@@ -180,7 +179,7 @@ def _iter_agent_processes() -> list[dict[str, Any]]:
             "rss_bytes": rss_bytes,
             "runtime_kind": runtime_kind,
             "session_arg_path": _extract_session_arg_path(command),
-            "open_session_paths": _collect_open_session_paths(proc_dir),
+            "open_paths": _collect_open_paths(proc_dir),
         })
     return rows
 
@@ -217,33 +216,38 @@ def _path_belongs_to_root(path_value: str | None, root: str | None) -> bool:
         return False
 
 
-def _match_session(
-    proc: dict[str, Any],
-    *,
-    session_by_abs_path: dict[str, dict[str, Any]],
-    session_by_rel_path: dict[str, dict[str, Any]],
-    task_roots_by_id: dict[str, list[str]],
-) -> tuple[dict[str, Any] | None, str | None, str | None, str | None]:
-    for candidate in [proc.get("session_arg_path"), *(proc.get("open_session_paths") or [])]:
-        normalized = _normalize_path(candidate)
-        if normalized and normalized in session_by_abs_path:
-            return session_by_abs_path[normalized], "session_path", "high", None
+def _belongs_to_any_root(proc: dict[str, Any], root: str) -> bool:
+    candidates = [
+        _normalize_path(proc.get("cwd")),
+        _normalize_path(proc.get("exe")),
+        _normalize_path(proc.get("session_arg_path")),
+    ]
+    candidates.extend(_normalize_path(item) for item in (proc.get("open_paths") or []))
+    command = str(proc.get("command") or "")
+    for candidate in candidates:
+        if _path_belongs_to_root(candidate, root):
+            return True
+    return bool(root and root in command)
 
+
+def _match_task(proc: dict[str, Any], task_roots_by_id: dict[str, list[str]]) -> tuple[str | None, str | None, str | None]:
+    session_arg_path = _normalize_path(proc.get("session_arg_path"))
+    if session_arg_path:
+        for task_id, roots in task_roots_by_id.items():
+            for root in roots:
+                if _path_belongs_to_root(session_arg_path, root):
+                    return task_id, "session_arg_path", root
     cwd = _normalize_path(proc.get("cwd"))
+    if cwd:
+        for task_id, roots in task_roots_by_id.items():
+            for root in roots:
+                if _path_belongs_to_root(cwd, root):
+                    return task_id, "cwd", root
     for task_id, roots in task_roots_by_id.items():
         for root in roots:
-            if _path_belongs_to_root(cwd, root):
-                for session in session_by_abs_path.values():
-                    if str(session.get("task_id") or "") == task_id:
-                        return session, "task_root", "medium", root
-                return None, "task_root", "medium", root
-
-    for rel_path, session in session_by_rel_path.items():
-        if rel_path and rel_path in str(proc.get("cwd") or ""):
-            return session, "cwd_relpath", "low", None
-        if rel_path and rel_path in str(proc.get("command") or ""):
-            return session, "session_relpath", "low", None
-    return None, None, None, None
+            if _belongs_to_any_root(proc, root):
+                return task_id, "task_root", root
+    return None, None, None
 
 
 class AgentObservabilityService:
@@ -253,99 +257,30 @@ class AgentObservabilityService:
             query = query.filter(AppDfaTask.project_id == project_id)
         task_rows = query.all()
         task_by_id = {row.task_id: row for row in task_rows}
-        cluster_snapshot = build_worker_cluster_snapshot(db, project_id=project_id)
-        active_owner_ids = {str(worker.worker_id or "") for worker in cluster_snapshot.workers if worker.healthy}
-
-        session_nodes: list[dict[str, Any]] = []
-        session_by_rel_path: dict[str, dict[str, Any]] = {}
-        session_by_abs_path: dict[str, dict[str, Any]] = {}
         task_roots_by_id = {row.task_id: _task_roots(row) for row in task_rows}
-        for row in task_rows:
-            index = get_task_service().get_task_session_index(db, row.task_id)
-            for node in index.get("nodes") or []:
-                item = dict(node)
-                item["task_id"] = row.task_id
-                item["task_name"] = row.task_name
-                item["task_status"] = row.status
-                relative_path = str(node.get("relative_path") or "")
-                item["relative_path"] = relative_path
-                session_nodes.append(item)
-                if relative_path:
-                    session_by_rel_path[relative_path] = item
-                for root in task_roots_by_id.get(row.task_id, []):
-                    absolute = _normalize_path(pathlib.Path(root) / relative_path)
-                    if absolute:
-                        session_by_abs_path[absolute] = item
+        cluster_snapshot = build_worker_cluster_snapshot(db, project_id=project_id)
 
         processes: list[dict[str, Any]] = []
         for proc in _iter_agent_processes():
-            matched, match_source, match_confidence, workspace_root = _match_session(
-                proc,
-                session_by_abs_path=session_by_abs_path,
-                session_by_rel_path=session_by_rel_path,
-                task_roots_by_id=task_roots_by_id,
-            )
-            owner_kind = "unknown"
-            kill_allowed = False
-            owner_reason = "未匹配到任务或会话"
-            kill_block_reason = "仅明确孤儿进程可手工终止"
-            session_file = proc.get("session_arg_path")
-            session_id = None
-            task_id = None
-            task_name = None
-            task_status = None
-            stage_key = None
-            role_kind = None
-            if matched:
-                relative_path = str(matched.get("relative_path") or "")
-                session_file = session_file or relative_path or None
-                session_id = str((matched.get("session_header") or {}).get("id") or matched.get("session_name") or "") or None
-                task_id = str(matched.get("task_id") or "") or None
-                task_name = str(matched.get("task_name") or "") or None
-                task_status = str(matched.get("task_status") or "") or None
-                stage_key = str(matched.get("stage_key") or "") or None
-                role_kind = str(matched.get("role") or "") or None
-            elif match_source == "task_root":
-                workspace_root = workspace_root or _normalize_path(proc.get("cwd"))
-                for current_task_id, roots in task_roots_by_id.items():
-                    if any(_path_belongs_to_root(proc.get("cwd"), root) for root in roots):
-                        task_row = task_by_id.get(current_task_id)
-                        if task_row is not None:
-                            task_id = task_row.task_id
-                            task_name = task_row.task_name
-                            task_status = task_row.status
-                        break
+            task_id, match_source, workspace_root = _match_task(proc, task_roots_by_id)
             task_row = task_by_id.get(task_id or "")
-            if task_row is not None and str(task_status or "").strip() in {"running", "pending"}:
-                owner_id = str(getattr(task_row, "execution_owner_id", "") or "")
-                lease_expires_at = getattr(task_row, "execution_lease_until", None)
-                heartbeat_at = getattr(task_row, "execution_heartbeat_at", None)
-                lease_live = bool(lease_expires_at and lease_expires_at.timestamp() >= time.time())
-                heartbeat_live = bool(heartbeat_at and (time.time() - heartbeat_at.timestamp()) <= 120)
-                if owner_id and owner_id in active_owner_ids:
-                    owner_kind = "tracked"
-                    owner_reason = "已归属到活跃任务，且 worker 心跳正常"
-                    kill_block_reason = "进程仍归属于活动任务"
-                elif lease_live or heartbeat_live or bool(matched and matched.get("is_active")):
-                    owner_kind = "unknown"
-                    owner_reason = "存在未过期 lease、heartbeat 或 live session，进入保护态"
-                    kill_block_reason = "存在活动任务运行信号，禁止手工终止"
-                else:
-                    owner_kind = "unknown"
-                    owner_reason = "任务仍在运行态，但 owner/lease 信号不完整"
-                    kill_allowed = True
-                    kill_block_reason = None
-            elif task_id:
-                owner_kind = "orphan"
-                owner_reason = "已归属到终态任务，且无活跃 owner 信号"
+            task_name = task_row.task_name if task_row is not None else None
+            task_status = str(task_row.status or "") if task_row is not None else None
+            stage_key = str(task_row.current_stage or "") if task_row is not None else None
+            role_kind = _extract_role_kind(str(proc.get("command") or ""))
+            if task_row is not None and str(task_status or "").strip() == "running":
+                owner_kind = "tracked"
+                owner_reason = "running_task_matched"
+                kill_allowed = False
+                kill_block_reason = "进程归属于运行中任务"
+            elif task_row is not None:
+                owner_kind = "residual"
+                owner_reason = "non_running_task_residual"
                 kill_allowed = True
                 kill_block_reason = None
-            elif match_source == "task_root":
-                owner_kind = "unknown"
-                owner_reason = "已按任务根路径归属，但缺少会话级精确证据"
-                kill_allowed = False
-                kill_block_reason = "需要更多归属信息，暂不允许终止"
             else:
+                owner_kind = "unknown"
+                owner_reason = "unmatched_process"
                 kill_allowed = True
                 kill_block_reason = None
             processes.append(
@@ -360,12 +295,8 @@ class AgentObservabilityService:
                     rss_bytes=proc.get("rss_bytes"),
                     runtime_kind=proc.get("runtime_kind"),
                     match_source=match_source,
-                    match_confidence=match_confidence,
+                    match_confidence="high" if match_source in {"session_arg_path", "cwd"} else ("medium" if match_source == "task_root" else None),
                     workspace_root=workspace_root,
-                    session_arg_path=proc.get("session_arg_path"),
-                    open_session_paths=list(proc.get("open_session_paths") or []),
-                    session_file=session_file,
-                    session_id=session_id,
                     task_id=task_id,
                     task_name=task_name,
                     task_status=task_status,
@@ -375,74 +306,43 @@ class AgentObservabilityService:
                     owner_reason=owner_reason,
                     kill_allowed=kill_allowed,
                     kill_block_reason=kill_block_reason,
-                    termination_state="live",
+                    termination_state="running",
                 ).__dict__
             )
-        sessions = [{
-            "pod_name": POD_NAME,
-            "session_file": str(node.get("relative_path") or ""),
-            "session_id": str((node.get("session_header") or {}).get("id") or node.get("session_name") or "") or None,
-            "task_id": node.get("task_id"),
-            "task_name": node.get("task_name"),
-            "stage_key": node.get("stage_key"),
-            "role_kind": node.get("role"),
-            "display_name": str(node.get("display_name") or node.get("relative_path") or ""),
-            "line_count": int(node.get("line_count") or 0),
-            "last_event_at": node.get("last_event_at"),
-            "live": bool(node.get("is_active")),
-            "has_process": any(
-                str(node.get("relative_path") or "") == str(proc.get("session_file") or "")
-                or _normalize_path(pathlib.Path(root) / str(node.get("relative_path") or "")) in set(proc.get("open_session_paths") or [])
-                for proc in processes
-                for root in task_roots_by_id.get(str(node.get("task_id") or ""), [])[:1]
-            ),
-            "process_pid": next((
-                int(proc["pid"])
-                for proc in processes
-                if str(node.get("relative_path") or "") == str(proc.get("session_file") or "")
-            ), None),
-            "orphan_session": not bool(node.get("is_active")),
-            "parse_warnings": list(node.get("warnings") or []),
-        } for node in session_nodes]
-        tasks = []
+
+        tasks: list[dict[str, Any]] = []
         for row in task_rows:
-            linked_sessions = [item for item in sessions if item.get("task_id") == row.task_id]
             linked_processes = [item for item in processes if item.get("task_id") == row.task_id]
+            if not linked_processes:
+                continue
             tasks.append({
                 "task_id": row.task_id,
                 "task_name": row.task_name,
                 "task_status": row.status,
-                "stage_key": "",
+                "stage_key": str(row.current_stage or ""),
                 "pod_name": POD_NAME,
                 "process_count": len(linked_processes),
-                "session_count": len(linked_sessions),
                 "agent_roles": sorted({str(item.get("role_kind") or "") for item in linked_processes if item.get("role_kind")}),
                 "process_pids": [int(item["pid"]) for item in linked_processes],
-                "session_ids": [str(item["session_id"]) for item in linked_sessions if item.get("session_id")],
-                "ownership_status": "partial" if linked_sessions and not linked_processes else "healthy",
+                "ownership_status": "tracked" if str(row.status or "").strip() == "running" else "residual",
             })
+
         tracked_process_count = len([item for item in processes if item.get("owner_kind") == "tracked"])
-        orphan_process_count = len([item for item in processes if item.get("owner_kind") == "orphan"])
-        suspected_orphan_process_count = len([item for item in processes if item.get("owner_kind") == "unknown"])
-        active_task_count = len([item for item in tasks if str(item.get("task_status") or "") in _ACTIVE_TASK_STATUSES])
-        killable_orphan_count = len([item for item in processes if item.get("owner_kind") == "orphan" and item.get("kill_allowed")])
-        killable_suspected_count = len([item for item in processes if item.get("owner_kind") == "unknown" and item.get("kill_allowed")])
+        residual_process_count = len([item for item in processes if item.get("owner_kind") == "residual"])
+        unknown_process_count = len([item for item in processes if item.get("owner_kind") == "unknown"])
         scanned_at = time.time()
-        orphan_session_count = len([item for item in sessions if item.get("orphan_session") and not item.get("has_process")])
         return {
             "summary": {
                 "pod_name": POD_NAME,
                 "active_processes": tracked_process_count,
-                "orphan_processes": orphan_process_count,
-                "unknown_processes": suspected_orphan_process_count,
-                "killable_orphan_processes": killable_orphan_count,
-                "killable_suspected_orphan_processes": killable_suspected_count,
-                "orphan_sessions": orphan_session_count,
+                "residual_processes": residual_process_count,
+                "unknown_processes": unknown_process_count,
+                "killable_residual_processes": len([item for item in processes if item.get("owner_kind") == "residual" and item.get("kill_allowed")]),
+                "killable_unknown_processes": len([item for item in processes if item.get("owner_kind") == "unknown" and item.get("kill_allowed")]),
                 "scanned_at": scanned_at,
                 "scan_errors": 0,
             },
             "processes": processes,
-            "sessions": sessions,
             "tasks": tasks,
             "pods": [{
                 "pod_name": POD_NAME,
@@ -450,17 +350,15 @@ class AgentObservabilityService:
                 "healthy": True,
                 "process_count": len(processes),
                 "tracked_process_count": tracked_process_count,
-                "orphan_process_count": orphan_process_count,
-                "suspected_orphan_process_count": suspected_orphan_process_count,
-                "session_count": len(sessions),
-                "orphan_session_count": orphan_session_count,
+                "residual_process_count": residual_process_count,
+                "unknown_process_count": unknown_process_count,
                 "task_count": len(tasks),
-                "active_task_count": active_task_count,
+                "running_task_count": len([item for item in tasks if str(item.get("ownership_status") or "") == "tracked"]),
+                "residual_task_count": len([item for item in tasks if str(item.get("ownership_status") or "") == "residual"]),
                 "last_scanned_at": scanned_at,
                 "scan_errors": 0,
                 "processes": processes,
                 "tasks": tasks,
-                "sessions": sessions,
             }],
         }
 
