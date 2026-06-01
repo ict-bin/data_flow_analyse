@@ -100,8 +100,6 @@ def render_summary_metrics() -> str:
     try:
         lines.append("secflow_dfa_up 1")
         lines.extend(_render_request_metrics())
-        lines.extend(_render_local_runtime_metrics())
-        lines.extend(_render_agent_observability_metrics())
     except Exception:
         lines.append("secflow_dfa_up 0")
     return "\n".join(lines) + "\n"
