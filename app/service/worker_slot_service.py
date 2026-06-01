@@ -42,6 +42,7 @@ class DfaWorkerSnapshot:
     host_name: str
     pod_name: str
     pod_ip: str | None
+    http_port: int | None
     healthy: bool
     max_concurrent_jobs: int
     running_jobs: int
@@ -87,6 +88,7 @@ class WorkerSlotService:
         worker_id: str,
         pod_name: str,
         pod_ip: str | None,
+        http_port: int = 8080,
         max_concurrent_tasks: int,
         status: str = "running",
     ) -> None:
@@ -98,6 +100,7 @@ class WorkerSlotService:
                 worker_id=worker_id,
                 pod_name=pod_name,
                 pod_ip=pod_ip,
+                http_port=max(1, int(http_port or 8080)),
                 max_concurrent_tasks=capacity,
                 last_seen_status=status,
                 last_heartbeat_at=now,
@@ -106,6 +109,7 @@ class WorkerSlotService:
         else:
             row.pod_name = pod_name
             row.pod_ip = pod_ip
+            row.http_port = max(1, int(http_port or 8080))
             row.max_concurrent_tasks = capacity
             row.last_seen_status = status
             row.last_heartbeat_at = now
@@ -173,6 +177,7 @@ class WorkerSlotService:
                     host_name=row.pod_name or _parse_host_name(row.worker_id),
                     pod_name=row.pod_name,
                     pod_ip=row.pod_ip,
+                    http_port=int(getattr(row, "http_port", 0) or 8080),
                     healthy=healthy,
                     max_concurrent_jobs=max(0, int(row.max_concurrent_tasks or 0)),
                     running_jobs=running_jobs,
@@ -192,6 +197,7 @@ class WorkerSlotService:
                     host_name=_parse_host_name(owner_id),
                     pod_name=owner_id,
                     pod_ip=None,
+                    http_port=8080,
                     healthy=False,
                     max_concurrent_jobs=max(running_jobs, len(active_jobs)),
                     running_jobs=running_jobs,

@@ -287,6 +287,7 @@ class RuntimeBootstrap:
                         worker_id=WORKER_ID,
                         pod_name=POD_NAME,
                         pod_ip=POD_IP or None,
+                        http_port=int(os.environ.get("PORT") or 8080),
                         max_concurrent_tasks=MAX_LOCAL_RUNNING_TASKS,
                         status="running",
                     )

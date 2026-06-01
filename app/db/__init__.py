@@ -72,6 +72,12 @@ _MIGRATIONS = [
     ),
     Migration(
         kind="column",
+        table_name="secflow_app_dfa_worker_slots",
+        name="http_port",
+        statement="ALTER TABLE secflow_app_dfa_worker_slots ADD COLUMN http_port INTEGER NOT NULL DEFAULT 8080",
+    ),
+    Migration(
+        kind="column",
         table_name="secflow_app_dfa_tasks",
         name="task_config_json",
         statement="ALTER TABLE secflow_app_dfa_tasks ADD COLUMN task_config_json JSON NULL",
