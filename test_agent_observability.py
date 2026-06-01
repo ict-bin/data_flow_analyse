@@ -189,13 +189,32 @@ class AgentObservabilityTests(unittest.TestCase):
         finally:
             db.close()
 
-    def test_resolve_worker_targets_prefers_pod_ip_only(self):
+    def test_resolve_worker_targets_prefers_pod_ip_then_pod_name(self):
         self.assertEqual(
             ["10.0.0.8"],
             tasks_api._resolve_worker_targets(pod_ip="10.0.0.8", pod_name="dfa-worker-1"),
         )
-        self.assertEqual([], tasks_api._resolve_worker_targets(pod_ip=None, pod_name="dfa-worker-1"))
+        self.assertEqual(["dfa-worker-1"], tasks_api._resolve_worker_targets(pod_ip=None, pod_name="dfa-worker-1"))
 
+    def test_build_agent_runtime_aggregate_prefers_summary_pod_counts(self):
+        snapshot = {
+            "summary": {
+                "total_pods": 6,
+                "healthy_pods": 5,
+                "aggregate_partial": True,
+                "aggregate_sources": 2,
+                "aggregate_failed_targets": ["dfa-worker-3"],
+                "aggregate_all_sources_failed": False,
+                "scanned_at": 123.0,
+            },
+            "pods": [{"pod_name": "pod-a", "healthy": True}],
+            "processes": [],
+            "tasks": [],
+        }
+
+        runtime = tasks_api._build_agent_runtime_aggregate(snapshot)
+        self.assertEqual(6, runtime["summary"]["total_pods"])
+        self.assertEqual(5, runtime["summary"]["healthy_pods"])
 
 if __name__ == "__main__":
     unittest.main()
