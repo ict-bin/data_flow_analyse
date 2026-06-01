@@ -35,10 +35,13 @@ import logging
 import os
 import time
 from contextlib import asynccontextmanager
+from threading import Lock
+from typing import Any, Callable
 
 import httpx
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
+from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.responses import PlainTextResponse
@@ -73,8 +76,27 @@ from .config import CONFIG_DIR, TARGET_DIR
 
 SERVICE_CONFIG_PATH = os.environ.get("SERVICE_CONFIG", f"{CONFIG_DIR}/config.json")
 CLEANUP_DELAY = int(os.environ.get("CLEANUP_DELAY", "300"))
+_SUMMARY_CACHE_TTL_SECONDS = 5.0
+_summary_cache: dict[str, tuple[float, Any]] = {}
+_summary_cache_lock = Lock()
 
 logger = logging.getLogger("dfa.server")
+
+
+def _cached_summary(key: str, builder: Callable[[], Any]) -> Any:
+    now = time.monotonic()
+    with _summary_cache_lock:
+        cached = _summary_cache.get(key)
+        if cached and now - cached[0] <= _SUMMARY_CACHE_TTL_SECONDS:
+            return cached[1]
+    value = builder()
+    with _summary_cache_lock:
+        _summary_cache[key] = (time.monotonic(), value)
+    return value
+
+
+def _aggregate_metrics_rows():
+    return parse_prometheus_metrics(render_aggregate_metrics())
 
 
 class TaskEntry:
@@ -158,20 +180,29 @@ async def aggregate_metrics():
 
 @app.get("/api/app/dataflow-analyse/metrics/summary", include_in_schema=False)
 async def metrics_summary():
-    rows = parse_prometheus_metrics(render_aggregate_metrics())
-    return build_generic_observability_summary(rows, title="数据流分析")
+    return await run_in_threadpool(
+        _cached_summary,
+        "summary",
+        lambda: build_generic_observability_summary(_aggregate_metrics_rows(), title="数据流分析"),
+    )
 
 
 @app.get("/api/app/dataflow-analyse/metrics/rest-api-summary", include_in_schema=False)
 async def metrics_rest_api_summary():
-    rows = parse_prometheus_metrics(render_aggregate_metrics())
-    return build_rest_api_summary(rows)
+    return await run_in_threadpool(
+        _cached_summary,
+        "rest-api-summary",
+        lambda: build_rest_api_summary(_aggregate_metrics_rows()),
+    )
 
 
 @app.get("/api/app/dataflow-analyse/metrics/ai-summary", include_in_schema=False)
 async def metrics_ai_summary():
-    rows = parse_prometheus_metrics(render_aggregate_metrics())
-    return build_ai_summary(rows, coverage_text="数据流分析 AI 指标覆盖 trace / round / review / judge 相关调用。")
+    return await run_in_threadpool(
+        _cached_summary,
+        "ai-summary",
+        lambda: build_ai_summary(_aggregate_metrics_rows(), coverage_text="数据流分析 AI 指标覆盖 trace / round / review / judge 相关调用。"),
+    )
 
 
 # ─── 请求体 ──────────────────────────────────────────────────────────────────
