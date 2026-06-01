@@ -95,6 +95,18 @@ def render_local_metrics() -> str:
     return "\n".join(lines) + "\n"
 
 
+def render_summary_metrics() -> str:
+    lines = ["# HELP secflow_dfa_up Service metrics scrape succeeded.", "# TYPE secflow_dfa_up gauge"]
+    try:
+        lines.append("secflow_dfa_up 1")
+        lines.extend(_render_request_metrics())
+        lines.extend(_render_local_runtime_metrics())
+        lines.extend(_render_agent_observability_metrics())
+    except Exception:
+        lines.append("secflow_dfa_up 0")
+    return "\n".join(lines) + "\n"
+
+
 def render_aggregate_metrics() -> str:
     lines = [
         "# HELP secflow_dfa_metrics_aggregate_up DFA aggregate metrics scrape succeeded.",
