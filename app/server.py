@@ -49,6 +49,7 @@ from .build_info import build_service_meta
 from .config import build_task_config, get_service_yaml, load_service_config
 from .logging_utils import configure_container_logging
 from .metrics import normalize_http_route, observe_http_request as observe_metrics_request, observe_http_request_inflight, render_aggregate_metrics, render_local_metrics
+from .metrics_summary import build_ai_summary, build_generic_observability_summary, build_rest_api_summary, parse_prometheus_metrics
 from .models import SwarmEvent, TaskResult, TaskStatus, make_id
 from .orchestrator import Orchestrator
 from .runtime_context import (
@@ -153,6 +154,24 @@ async def metrics():
 @app.get("/api/app/dataflow-analyse/metrics/aggregate", include_in_schema=False)
 async def aggregate_metrics():
     return PlainTextResponse(render_aggregate_metrics(), media_type="text/plain; version=0.0.4; charset=utf-8")
+
+
+@app.get("/api/app/dataflow-analyse/metrics/summary", include_in_schema=False)
+async def metrics_summary():
+    rows = parse_prometheus_metrics(render_aggregate_metrics())
+    return build_generic_observability_summary(rows, title="数据流分析")
+
+
+@app.get("/api/app/dataflow-analyse/metrics/rest-api-summary", include_in_schema=False)
+async def metrics_rest_api_summary():
+    rows = parse_prometheus_metrics(render_aggregate_metrics())
+    return build_rest_api_summary(rows)
+
+
+@app.get("/api/app/dataflow-analyse/metrics/ai-summary", include_in_schema=False)
+async def metrics_ai_summary():
+    rows = parse_prometheus_metrics(render_aggregate_metrics())
+    return build_ai_summary(rows, coverage_text="数据流分析 AI 指标覆盖 trace / round / review / judge 相关调用。")
 
 
 # ─── 请求体 ──────────────────────────────────────────────────────────────────
