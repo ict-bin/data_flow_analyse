@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Optional
 
 from sqlalchemy.exc import IntegrityError
+from sqlalchemy import func
 from sqlalchemy.orm import Session, load_only
 from sqlalchemy.orm.attributes import flag_modified
 
@@ -1484,6 +1485,55 @@ class TaskService:
                 .offset((page - 1) * per_page).limit(per_page).all())
         return {"items": [self._row_to_dict(r, include_heavy=False) for r in rows],
                 "total": total, "page": page, "per_page": per_page}
+
+    def get_task_stats(
+        self,
+        db: Session,
+        *,
+        project_id: str,
+        status: Optional[str] = None,
+        mode: Optional[str] = None,
+        parent_task_id: Optional[str] = None,
+        parent_stage_item_id: Optional[str] = None,
+    ) -> dict:
+        query = db.query(AppDfaTask.status, func.count(AppDfaTask.id)).filter(
+            AppDfaTask.project_id == project_id,
+            AppDfaTask.is_deleted.is_(False),
+        )
+        if status:
+            query = query.filter(AppDfaTask.status == status)
+        normalized_mode = str(mode or "").strip().lower()
+        if normalized_mode == "manual":
+            query = query.filter(
+                (AppDfaTask.task_origin_type.is_(None)) | (AppDfaTask.task_origin_type != "binary_security")
+            )
+        elif normalized_mode == "binary":
+            query = query.filter(
+                AppDfaTask.task_origin_type == "binary_security",
+                (AppDfaTask.parent_task_type.is_(None)) | (AppDfaTask.parent_task_type != "source"),
+            )
+        elif normalized_mode == "source":
+            query = query.filter(
+                AppDfaTask.task_origin_type == "binary_security",
+                AppDfaTask.parent_task_type == "source",
+            )
+        normalized_parent_task_id = str(parent_task_id or "").strip()
+        if normalized_parent_task_id:
+            query = query.filter(AppDfaTask.parent_task_id == normalized_parent_task_id)
+        normalized_parent_stage_item_id = str(parent_stage_item_id or "").strip()
+        if normalized_parent_stage_item_id:
+            query = query.filter(AppDfaTask.parent_stage_item_id == normalized_parent_stage_item_id)
+        rows = query.group_by(AppDfaTask.status).all()
+        counts = {str(task_status or ""): int(count or 0) for task_status, count in rows}
+        return {
+            "total": sum(counts.values()),
+            "pending": counts.get("pending", 0),
+            "running": counts.get("running", 0),
+            "passed": counts.get("passed", 0),
+            "failed": counts.get("failed", 0),
+            "error": counts.get("error", 0),
+            "cancelled": counts.get("cancelled", 0),
+        }
 
     def get_task(self, db: Session, task_id: str) -> dict:
         return self._row_to_dict(self._get_or_404(db, task_id))

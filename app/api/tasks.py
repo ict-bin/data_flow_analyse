@@ -811,6 +811,16 @@ class ActionResponse(BaseModel):
     deleted_event_count: int = 0
 
 
+class TaskListStatsResponse(BaseModel):
+    total: int = 0
+    pending: int = 0
+    running: int = 0
+    passed: int = 0
+    failed: int = 0
+    error: int = 0
+    cancelled: int = 0
+
+
 def _get_task_row(db: Session, task_id: str):
     from app.db.models import AppDfaTask
 
@@ -1106,6 +1116,25 @@ def list_tasks(
         parent_stage_item_id=parent_stage_item_id,
         sort_by=sort_by,
         sort_order=sort_order,
+    )
+
+
+@router.get("/tasks/stats", response_model=TaskListStatsResponse)
+def get_task_stats(
+    project_id: str = Query(...),
+    status: Optional[str] = Query(None),
+    mode: Optional[str] = Query(None),
+    parent_task_id: Optional[str] = Query(None),
+    parent_stage_item_id: Optional[str] = Query(None),
+    db: Session = Depends(get_db),
+):
+    return get_task_service().get_task_stats(
+        db,
+        project_id=project_id,
+        status=status,
+        mode=mode,
+        parent_task_id=parent_task_id,
+        parent_stage_item_id=parent_stage_item_id,
     )
 
 
