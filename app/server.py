@@ -56,6 +56,7 @@ from .metrics import normalize_http_route, observe_http_request as observe_metri
 from .metrics_summary import build_ai_summary, build_generic_observability_summary, build_rest_api_summary, parse_prometheus_metrics
 from .models import SwarmEvent, TaskResult, TaskStatus, make_id
 from .orchestrator import Orchestrator
+from .probe_server import ThreadedProbeServer
 from .runtime_context import (
     DISPATCHER_ENABLED,
     EXECUTOR_ENABLED,
@@ -83,6 +84,9 @@ _summary_cache_lock = Lock()
 _loop_lag_seconds = 0.0
 _loop_lag_exceeded_total = 0
 _control_plane_last_tick_at = 0.0
+_probe_server: ThreadedProbeServer | None = None
+_probe_shutdown = False
+_probe_started_at = 0.0
 
 logger = logging.getLogger("dfa.server")
 
@@ -148,15 +152,21 @@ def _forbidden_for_role(feature: str) -> HTTPException:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # --- startup ---
+    global _probe_shutdown, _probe_started_at
+    _probe_shutdown = False
+    _probe_started_at = time.time()
+    _ensure_probe_server_started()
     await get_runtime_bootstrap().start(app)
     lag_task = asyncio.create_task(_control_plane_loop_monitor(), name="dfa_control_plane_loop_monitor")
 
     yield
     # --- shutdown ---
+    _probe_shutdown = True
     lag_task.cancel()
     with contextlib.suppress(asyncio.CancelledError):
         await lag_task
     await get_runtime_bootstrap().stop()
+    _stop_probe_server()
 
 
 app = FastAPI(title="data_flow_analyse", version="2.0.0", lifespan=lifespan)
@@ -247,12 +257,26 @@ class AnalyseRequest(BaseModel):
 @app.get("/health")
 @app.get("/api/app/dataflow-analyse/health")
 async def health():
+    return _probe_payload()
+
+
+def _probe_payload() -> dict[str, object]:
     bootstrap = get_runtime_bootstrap().status()
     worker_slot = get_runtime_bootstrap().worker_slot_status()
     supervisor = get_task_service().supervisor_status()
+    now_ts = time.time()
+    heartbeat_recent = bool(worker_slot["last_heartbeat_at"] and now_ts - float(worker_slot["last_heartbeat_at"]) <= 90)
+    ready_ok = bool(
+        bootstrap["ready"]
+        and worker_slot["thread_alive"]
+        and heartbeat_recent
+        and _loop_lag_seconds <= 5.0
+        and not _probe_shutdown
+    )
     payload = {
-        "status": "ok",
+        "status": "ready" if ready_ok else ("stopping" if _probe_shutdown else ("booting" if bootstrap["error"] is None else "error")),
         **build_service_meta(),
+        "service": "secflow-app-dataflow-analyse",
         "instance_id": INSTANCE_ID,
         "role": ROLE,
         "public_api_enabled": PUBLIC_API_ENABLED,
@@ -280,35 +304,77 @@ async def health():
         "execution_supervisor_thread_alive": supervisor["thread_alive"],
         "execution_supervisor_last_run_at": supervisor["last_run_at"] or None,
         "execution_supervisor_last_error": supervisor["last_error"],
+        "started_at": _probe_started_at or None,
+        "updated_at": now_ts,
+        "shutting_down": _probe_shutdown,
+        "liveness_ok": (not _probe_shutdown) and bool((_control_plane_last_tick_at or 0) <= 0 or now_ts - float(_control_plane_last_tick_at or now_ts) <= 30.0),
+        "readiness_ok": ready_ok,
+        "last_error": bootstrap["error"],
+        "reason": None if ready_ok else (
+            "shutting_down"
+            if _probe_shutdown
+            else bootstrap["error"]
+            or ("worker_slot_heartbeat_stale" if not heartbeat_recent else "control_plane_lagged")
+        ),
+        "checks": {
+            "bootstrap": {
+                "ready": bool(bootstrap["ready"]),
+                "db_ready": bool(bootstrap["db_ready"]),
+                "management_api_ready": bool(bootstrap["management_api_ready"]),
+                "attempts": int(bootstrap["attempts"] or 0),
+            },
+            "control_plane": {
+                "ok": _loop_lag_seconds <= 5.0,
+                "event_loop_lag_seconds": _loop_lag_seconds,
+                "last_tick_at": _control_plane_last_tick_at or None,
+            },
+            "heartbeat": {
+                "ok": heartbeat_recent and bool(worker_slot["thread_alive"]),
+                "thread_alive": bool(worker_slot["thread_alive"]),
+                "last_heartbeat_at": worker_slot["last_heartbeat_at"] or None,
+                "last_heartbeat_ok": bool(worker_slot["last_heartbeat_ok"]),
+                "last_error": worker_slot["last_error"],
+            },
+            "supervisor": {
+                "ok": bool(supervisor["thread_alive"]),
+                "thread_alive": bool(supervisor["thread_alive"]),
+                "last_run_at": supervisor["last_run_at"] or None,
+                "last_error": supervisor["last_error"],
+            },
+        },
     }
-    if bootstrap["ready"]:
-        return payload
-    payload["status"] = "starting" if bootstrap["error"] is None else "error"
-    return JSONResponse(status_code=503, content=payload)
+    return payload
+
+
+def _ensure_probe_server_started() -> None:
+    global _probe_server
+    if _probe_server is not None:
+        _probe_server.start()
+        return
+    port = int(os.environ.get("SECFLOW_DATAFLOW_ANALYSE_PROBE_PORT", "18080"))
+    _probe_server = ThreadedProbeServer(
+        host="0.0.0.0",
+        port=port,
+        payload_provider=_probe_payload,
+        health_paths=("/health", "/api/app/dataflow-analyse/health"),
+        ready_paths=("/ready", "/api/app/dataflow-analyse/ready"),
+    )
+    _probe_server.start()
+
+
+def _stop_probe_server() -> None:
+    global _probe_server
+    if _probe_server is not None:
+        _probe_server.stop()
+        _probe_server = None
 
 
 @app.get("/ready")
 @app.get("/api/app/dataflow-analyse/ready")
 async def ready():
-    bootstrap = get_runtime_bootstrap().status()
-    worker_slot = get_runtime_bootstrap().worker_slot_status()
-    now_ts = time.time()
-    heartbeat_recent = bool(worker_slot["last_heartbeat_at"] and now_ts - float(worker_slot["last_heartbeat_at"]) <= 90)
-    ready_ok = bool(
-        bootstrap["ready"]
-        and worker_slot["thread_alive"]
-        and heartbeat_recent
-        and _loop_lag_seconds <= 5.0
-    )
-    payload = {
-        "status": "ready" if ready_ok else "not_ready",
-        "startup_ready": bootstrap["ready"],
-        "control_plane_last_tick_at": _control_plane_last_tick_at or None,
-        "event_loop_lag_seconds": _loop_lag_seconds,
-        "worker_slot_heartbeat_thread_alive": worker_slot["thread_alive"],
-        "worker_slot_last_heartbeat_at": worker_slot["last_heartbeat_at"] or None,
-        "worker_slot_last_heartbeat_ok": worker_slot["last_heartbeat_ok"],
-    }
+    payload = _probe_payload()
+    ready_ok = bool(payload["readiness_ok"])
+    payload["status"] = "ready" if ready_ok else "not_ready"
     if ready_ok:
         return payload
     return JSONResponse(status_code=503, content=payload)
