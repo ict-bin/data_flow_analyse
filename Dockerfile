@@ -1,25 +1,17 @@
-FROM public.ecr.aws/docker/library/ubuntu:24.04
+ARG SECFLOW_PI_AGENT_RUNTIME_IMAGE=ghcr.io/runshine/secflow-base-pi-agent-runtime:20260602
+FROM ${SECFLOW_PI_AGENT_RUNTIME_IMAGE}
 
 ARG SECFLOW_BUILD_VERSION=""
-ENV DEBIAN_FRONTEND=noninteractive
 ENV PYTHONUNBUFFERED=1
 
-# ═══ 系统工具 ═════════════════════════════════════════════════════════════════
-RUN apt-get update && apt-get install -y \
-    curl wget gnupg ca-certificates git zip \
-    python3 python3-pip python3-venv \
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends zip \
     && rm -rf /var/lib/apt/lists/*
-
-# ═══ Node.js 22 ═══════════════════════════════════════════════════════════════
-RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
-    && apt-get install -y nodejs \
-    && rm -rf /var/lib/apt/lists/*
-
-# ═══ pi-coding-agent ══════════════════════════════════════════════════════════
-RUN npm install -g @mariozechner/pi-coding-agent
 
 # ═══ 项目代码 ═════════════════════════════════════════════════════════════════
 WORKDIR /opt/data_flow_analyse
+COPY requirements.txt ./
+RUN pip install --no-cache-dir -r requirements.txt -q
 COPY app/               ./app/
 COPY cli.py main.py     ./
 COPY prompts/           ./prompts/
@@ -27,9 +19,7 @@ COPY scripts/           ./scripts/
 COPY tools/             ./tools/
 COPY skills/            ./skills/
 COPY config.example.json .env.example ./
-COPY requirements.txt ./
 RUN printf '{"build_version":"%s"}\n' "$SECFLOW_BUILD_VERSION" > /opt/data_flow_analyse/build_meta.json
-RUN pip install --no-cache-dir --break-system-packages -r requirements.txt -q
 RUN find . -name '*.sh' -exec sed -i 's/\r$//' {} + && chmod +x scripts/*.sh 2>/dev/null || true
 # 安装工具：extract_func / gen_dataflow / gen_tainted_list 供 Worker 直接调用
 RUN cp tools/extract_func.py /usr/local/bin/extract_func \
@@ -50,13 +40,7 @@ RUN mkdir -p /root/.pi/agent/bin \
     && ln -sf /opt/data_flow_analyse/skills/write-dataflow /root/.pi/agent/skills/write-dataflow \
     && ln -sf /opt/data_flow_analyse/skills/write-taint-flow /root/.pi/agent/skills/write-taint-flow
 
-# ═══ 预装 ripgrep（pi grep 工具依赖）═══════════════════════════════════════════
-# pi 首次使用 grep 工具时会尝试从外网下载 ripgrep，服务器无外网时会卡死。
-# 1) apt 安装系统级 ripgrep（提供 rg 命令）
-# 2) 同时在 pi 期望路径创建快捷方式，確保 pi 不再尝试下载
-RUN apt-get update && apt-get install -y --no-install-recommends ripgrep \
-    && rm -rf /var/lib/apt/lists/* \
-    && ln -sf "$(which rg)" /root/.pi/agent/bin/rg \
+RUN ln -sf "$(which rg)" /root/.pi/agent/bin/rg \
     && echo "ripgrep ready: $(rg --version | head -1)"
 
 # ═══ 挂载点 ═══════════════════════════════════════════════════════════════════
