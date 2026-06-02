@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import threading
 import time
 from dataclasses import asdict, dataclass
 from typing import Optional
@@ -49,7 +50,12 @@ class RuntimeBootstrap:
         self._status = RuntimeBootstrapStatus()
         self._router_installed = False
         self._dispatcher_task: asyncio.Task | None = None
-        self._worker_slot_task: asyncio.Task | None = None
+        self._worker_slot_thread: threading.Thread | None = None
+        self._worker_slot_stop = threading.Event()
+        self._worker_slot_last_heartbeat_at = 0.0
+        self._worker_slot_last_heartbeat_ok = False
+        self._worker_slot_last_reconcile_at = 0.0
+        self._worker_slot_last_error: str | None = None
 
     async def start(self, app: FastAPI) -> None:
         if self._task and not self._task.done():
@@ -60,6 +66,10 @@ class RuntimeBootstrap:
 
     async def stop(self) -> None:
         self._stop_event.set()
+        svc = get_task_service()
+        stop_supervisor = getattr(svc, "stop_supervisor", None)
+        if callable(stop_supervisor):
+            stop_supervisor()
         if self._task and not self._task.done():
             self._task.cancel()
             try:
@@ -74,13 +84,8 @@ class RuntimeBootstrap:
             except asyncio.CancelledError:
                 pass
         self._dispatcher_task = None
-        if self._worker_slot_task and not self._worker_slot_task.done():
-            self._worker_slot_task.cancel()
-            try:
-                await self._worker_slot_task
-            except asyncio.CancelledError:
-                pass
-        self._worker_slot_task = None
+        self._worker_slot_stop.set()
+        self._worker_slot_thread = None
         try:
             from app.service.registry_service import get_registry_service
 
@@ -94,6 +99,15 @@ class RuntimeBootstrap:
 
     def dispatcher_running(self) -> bool:
         return bool(self._dispatcher_task and not self._dispatcher_task.done())
+
+    def worker_slot_status(self) -> dict[str, object]:
+        return {
+            "thread_alive": bool(self._worker_slot_thread and self._worker_slot_thread.is_alive()),
+            "last_heartbeat_at": self._worker_slot_last_heartbeat_at,
+            "last_heartbeat_ok": self._worker_slot_last_heartbeat_ok,
+            "last_reconcile_at": self._worker_slot_last_reconcile_at,
+            "last_error": self._worker_slot_last_error,
+        }
 
     async def _bootstrap_loop(self, app: FastAPI) -> None:
         svc_yaml = get_service_yaml()
@@ -122,7 +136,7 @@ class RuntimeBootstrap:
                         "dispatcher_start",
                         self._start_dispatcher,
                     ) or made_progress
-                if WORKER_SLOT_REGISTRY_ENABLED and self._worker_slot_task is None:
+                if WORKER_SLOT_REGISTRY_ENABLED and self._worker_slot_thread is None:
                     made_progress = self._attempt_component_start(
                         "worker_slot_start",
                         self._start_worker_slot_registry,
@@ -243,6 +257,9 @@ class RuntimeBootstrap:
     def _start_dispatcher(self) -> None:
         async def _dispatcher_loop() -> None:
             svc = get_task_service()
+            start_supervisor = getattr(svc, "start_supervisor", None)
+            if callable(start_supervisor):
+                start_supervisor()
             while not self._stop_event.is_set():
                 try:
                     claimed = await svc.dispatch_until_full()
@@ -265,23 +282,32 @@ class RuntimeBootstrap:
         log_event(logger, logging.INFO, "dispatcher started", event="dispatcher_started", owner_id=INSTANCE_ID)
 
     def _start_worker_slot_registry(self) -> None:
-        async def _worker_slot_loop() -> None:
+        self._worker_slot_stop = threading.Event()
+
+        def _worker_slot_loop() -> None:
             from app.db import get_db
             from app.runtime_context import MAX_LOCAL_RUNNING_TASKS, POD_IP, POD_NAME, WORKER_ID, WORKER_SLOT_HEARTBEAT_SECONDS
             from app.service.worker_slot_service import get_worker_slot_service
             orphan_sweep_seconds = max(10, int(os.environ.get("DFA_ORPHAN_PI_SWEEP_SECONDS", "30")))
             running_reconcile_seconds = max(10, int(os.environ.get("DFA_ORPHAN_RUNNING_RECONCILE_SECONDS", str(max(10, WORKER_SLOT_HEARTBEAT_SECONDS)))))
-            last_orphan_sweep = 0.0
-            last_running_reconcile = 0.0
+            heartbeat_interval_seconds = max(5, int(WORKER_SLOT_HEARTBEAT_SECONDS))
+            last_orphan_sweep = [0.0]
+            last_running_reconcile = [0.0]
 
-            while not self._stop_event.is_set():
-                db_gen = get_db()
-                db = next(db_gen)
+            def _run_once() -> None:
+                try:
+                    db_gen = get_db()
+                    db = next(db_gen)
+                except Exception as exc:
+                    self._worker_slot_last_heartbeat_ok = False
+                    self._worker_slot_last_error = str(exc)
+                    logger.warning("worker slot heartbeat skipped on %s before db ready: %s", INSTANCE_ID, exc)
+                    return
                 try:
                     now_ts = time.time()
-                    if now_ts - last_orphan_sweep >= orphan_sweep_seconds:
+                    if now_ts - last_orphan_sweep[0] >= orphan_sweep_seconds:
                         cleanup_orphan_pi_processes(logger.warning, label="dfa_worker_registry")
-                        last_orphan_sweep = now_ts
+                        last_orphan_sweep[0] = now_ts
                     get_worker_slot_service().upsert_heartbeat(
                         db,
                         worker_id=WORKER_ID,
@@ -291,9 +317,12 @@ class RuntimeBootstrap:
                         max_concurrent_tasks=MAX_LOCAL_RUNNING_TASKS,
                         status="running",
                     )
-                    if now_ts - last_running_reconcile >= running_reconcile_seconds:
+                    self._worker_slot_last_heartbeat_at = now_ts
+                    self._worker_slot_last_heartbeat_ok = True
+                    if now_ts - last_running_reconcile[0] >= running_reconcile_seconds:
                         recovered = get_task_service().reconcile_orphaned_running_tasks(db)
-                        last_running_reconcile = now_ts
+                        last_running_reconcile[0] = now_ts
+                        self._worker_slot_last_reconcile_at = now_ts
                         if recovered:
                             log_event(
                                 logger,
@@ -303,16 +332,22 @@ class RuntimeBootstrap:
                                 owner_id=INSTANCE_ID,
                                 recovered_count=recovered,
                             )
+                    self._worker_slot_last_error = None
                 except Exception as exc:
+                    self._worker_slot_last_heartbeat_ok = False
+                    self._worker_slot_last_error = str(exc)
                     logger.warning("worker slot heartbeat failed on %s: %s", INSTANCE_ID, exc, exc_info=True)
                 finally:
                     try:
                         next(db_gen)
                     except StopIteration:
                         pass
-                await asyncio.sleep(max(5, int(WORKER_SLOT_HEARTBEAT_SECONDS)))
+            _run_once()
+            while not self._worker_slot_stop.wait(heartbeat_interval_seconds):
+                _run_once()
 
-        self._worker_slot_task = asyncio.create_task(_worker_slot_loop(), name="dfa_worker_slot_registry")
+        self._worker_slot_thread = threading.Thread(target=_worker_slot_loop, name="dfa_worker_slot_registry", daemon=True)
+        self._worker_slot_thread.start()
 
     def _all_required_components_ready(self) -> bool:
         if not self._status.db_ready:
@@ -322,6 +357,8 @@ class RuntimeBootstrap:
         if REGISTRY_ENABLED and not self._status.registry_ready:
             return False
         if DISPATCHER_ENABLED and not self._status.dispatcher_ready:
+            return False
+        if WORKER_SLOT_REGISTRY_ENABLED and self._worker_slot_thread is None:
             return False
         return True
 

@@ -3,6 +3,7 @@ import tempfile
 import unittest
 import os
 import asyncio
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -241,30 +242,38 @@ class TaskTimelineTests(unittest.TestCase):
             cancel_calls: list[str] = []
 
             class _FakeLocalTask:
-                def done(self):
-                    return False
+                def is_alive(self):
+                    return True
 
-                def cancel(self):
-                    cancel_calls.append("task")
+            class _FakeLeaseThread:
+                def is_alive(self):
+                    return True
 
             class _FakeOrchestrator:
                 def abort(self):
                     cancel_calls.append("orch")
 
-            task_service_module._running_tasks[task_id] = _FakeLocalTask()
-            task_service_module._running_task_contexts[task_id] = task_service_module._RunningTaskContext(
-                task=task_service_module._running_tasks[task_id],
+            fake_execution_thread = _FakeLocalTask()
+            fake_lease_thread = _FakeLeaseThread()
+            fake_ctx = task_service_module._RunningTaskContext(
+                execution_thread=fake_execution_thread,
+                lease_thread=fake_lease_thread,
                 orch=_FakeOrchestrator(),
                 task_root="/tmp/dfa-task",
                 run_root="/tmp/dfa-task/run/epochs/0004",
                 epoch=4,
                 control_version=3,
+                cancel_requested=threading.Event(),
+                lease_stop_requested=threading.Event(),
             )
+            task_service_module._running_task_contexts[task_id] = fake_ctx
+            task_service_module._running_tasks[task_id] = fake_ctx
             with patch("app.service.task_service.cleanup_task_agent_processes", return_value=2) as cleanup:
                 payload = self.service.cancel_task(db, task_id)
 
             self.assertEqual("cancelled", payload["status"])
-            self.assertEqual(["orch", "task"], cancel_calls)
+            self.assertEqual(["orch"], cancel_calls)
+            self.assertTrue(fake_ctx.cancel_requested.is_set())
             cleanup.assert_called_once()
             timeline = self.service.get_task_timeline(db, task_id)
             self.assertTrue(bool(timeline["events"][0]["payload"]["orchestrator_abort_sent"]))

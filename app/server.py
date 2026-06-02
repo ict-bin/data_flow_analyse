@@ -30,6 +30,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import os
@@ -79,6 +80,9 @@ CLEANUP_DELAY = int(os.environ.get("CLEANUP_DELAY", "300"))
 _SUMMARY_CACHE_TTL_SECONDS = 5.0
 _summary_cache: dict[str, tuple[float, Any]] = {}
 _summary_cache_lock = Lock()
+_loop_lag_seconds = 0.0
+_loop_lag_exceeded_total = 0
+_control_plane_last_tick_at = 0.0
 
 logger = logging.getLogger("dfa.server")
 
@@ -97,6 +101,27 @@ def _cached_summary(key: str, builder: Callable[[], Any]) -> Any:
 
 def _aggregate_metrics_rows():
     return parse_prometheus_metrics(render_summary_metrics())
+
+
+async def _control_plane_loop_monitor() -> None:
+    global _loop_lag_seconds, _loop_lag_exceeded_total, _control_plane_last_tick_at
+    interval = 1.0
+    while True:
+        started = time.monotonic()
+        await asyncio.sleep(interval)
+        now = time.monotonic()
+        lag = max(0.0, now - started - interval)
+        _loop_lag_seconds = lag
+        _control_plane_last_tick_at = time.time()
+        if lag > 2.0:
+            _loop_lag_exceeded_total += 1
+            log_event(
+                logger,
+                logging.ERROR if lag > 5.0 else logging.WARNING,
+                "control-plane event loop lag detected",
+                event="control_plane_event_loop_stall_detected",
+                lag_seconds=round(lag, 3),
+            )
 
 
 class TaskEntry:
@@ -124,9 +149,13 @@ def _forbidden_for_role(feature: str) -> HTTPException:
 async def lifespan(app: FastAPI):
     # --- startup ---
     await get_runtime_bootstrap().start(app)
+    lag_task = asyncio.create_task(_control_plane_loop_monitor(), name="dfa_control_plane_loop_monitor")
 
     yield
     # --- shutdown ---
+    lag_task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await lag_task
     await get_runtime_bootstrap().stop()
 
 
@@ -219,6 +248,8 @@ class AnalyseRequest(BaseModel):
 @app.get("/api/app/dataflow-analyse/health")
 async def health():
     bootstrap = get_runtime_bootstrap().status()
+    worker_slot = get_runtime_bootstrap().worker_slot_status()
+    supervisor = get_task_service().supervisor_status()
     payload = {
         "status": "ok",
         **build_service_meta(),
@@ -238,10 +269,48 @@ async def health():
         "db_ready": bootstrap["db_ready"],
         "management_api_ready": bootstrap["management_api_ready"],
         "bootstrap_attempts": bootstrap["attempts"],
+        "control_plane_alive": True,
+        "control_plane_last_tick_at": _control_plane_last_tick_at or None,
+        "event_loop_lag_seconds": _loop_lag_seconds,
+        "event_loop_lag_exceeded_total": _loop_lag_exceeded_total,
+        "worker_slot_heartbeat_thread_alive": worker_slot["thread_alive"],
+        "worker_slot_last_heartbeat_at": worker_slot["last_heartbeat_at"] or None,
+        "worker_slot_last_heartbeat_ok": worker_slot["last_heartbeat_ok"],
+        "worker_slot_last_error": worker_slot["last_error"],
+        "execution_supervisor_thread_alive": supervisor["thread_alive"],
+        "execution_supervisor_last_run_at": supervisor["last_run_at"] or None,
+        "execution_supervisor_last_error": supervisor["last_error"],
     }
     if bootstrap["ready"]:
         return payload
     payload["status"] = "starting" if bootstrap["error"] is None else "error"
+    return JSONResponse(status_code=503, content=payload)
+
+
+@app.get("/ready")
+@app.get("/api/app/dataflow-analyse/ready")
+async def ready():
+    bootstrap = get_runtime_bootstrap().status()
+    worker_slot = get_runtime_bootstrap().worker_slot_status()
+    now_ts = time.time()
+    heartbeat_recent = bool(worker_slot["last_heartbeat_at"] and now_ts - float(worker_slot["last_heartbeat_at"]) <= 90)
+    ready_ok = bool(
+        bootstrap["ready"]
+        and worker_slot["thread_alive"]
+        and heartbeat_recent
+        and _loop_lag_seconds <= 5.0
+    )
+    payload = {
+        "status": "ready" if ready_ok else "not_ready",
+        "startup_ready": bootstrap["ready"],
+        "control_plane_last_tick_at": _control_plane_last_tick_at or None,
+        "event_loop_lag_seconds": _loop_lag_seconds,
+        "worker_slot_heartbeat_thread_alive": worker_slot["thread_alive"],
+        "worker_slot_last_heartbeat_at": worker_slot["last_heartbeat_at"] or None,
+        "worker_slot_last_heartbeat_ok": worker_slot["last_heartbeat_ok"],
+    }
+    if ready_ok:
+        return payload
     return JSONResponse(status_code=503, content=payload)
 
 

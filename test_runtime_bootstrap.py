@@ -121,13 +121,8 @@ class RuntimeBootstrapTests(unittest.IsolatedAsyncioTestCase):
             bootstrap._start_worker_slot_registry()
             await asyncio.sleep(0.05)
             bootstrap._stop_event.set()
+            bootstrap._worker_slot_stop.set()
             await asyncio.sleep(0.05)
-            if bootstrap._worker_slot_task is not None and not bootstrap._worker_slot_task.done():
-                bootstrap._worker_slot_task.cancel()
-                try:
-                    await bootstrap._worker_slot_task
-                except asyncio.CancelledError:
-                    pass
 
         self.assertGreaterEqual(len(heartbeat_calls), 1)
         self.assertGreaterEqual(len(reconcile_calls), 1)

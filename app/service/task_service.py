@@ -13,9 +13,10 @@ import logging
 import os
 import shutil
 import tempfile
+import threading
 import time as _time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -53,19 +54,36 @@ ENTRY_CONTEXT_MAX_TAINTS = 64
 ENTRY_CONTEXT_MAX_DESC_CHARS = 2240
 TASK_EVENT_SOURCE_DFA = "dfa"
 TASK_EVENT_RENEW_INTERVAL_SECONDS = max(60, HEARTBEAT_INTERVAL_SECONDS * 6)
+EXECUTION_SUPERVISOR_INTERVAL_SECONDS = float(os.environ.get("DFA_EXECUTION_SUPERVISOR_INTERVAL_SECONDS", "5"))
+EXECUTION_NO_PROGRESS_SECONDS = float(os.environ.get("DFA_EXECUTION_NO_PROGRESS_SECONDS", "120"))
 
-# Running asyncio tasks keyed by task_id so we can cancel them
-_running_tasks: dict[str, asyncio.Task] = {}
+_RUNNING_TASK_LOCK = threading.RLock()
+_running_tasks: dict[str, "_RunningTaskContext"] = {}
 
 
 @dataclass
 class _RunningTaskContext:
-    task: asyncio.Task | None = None
+    execution_thread: threading.Thread | None = None
+    lease_thread: threading.Thread | None = None
     orch: Orchestrator | None = None
     task_root: str | None = None
     run_root: str | None = None
     epoch: int | None = None
     control_version: int | None = None
+    started_at: float = field(default_factory=_time.time)
+    last_progress_at: float = field(default_factory=_time.time)
+    last_lease_heartbeat_at: float = 0.0
+    last_state_sync_at: float = 0.0
+    last_lease_error: str | None = None
+    termination_reason: str | None = None
+    cancel_requested: threading.Event = field(default_factory=threading.Event)
+    lease_stop_requested: threading.Event = field(default_factory=threading.Event)
+
+    def execution_alive(self) -> bool:
+        return bool(self.execution_thread and self.execution_thread.is_alive())
+
+    def lease_alive(self) -> bool:
+        return bool(self.lease_thread and self.lease_thread.is_alive())
 
 
 _running_task_contexts: dict[str, _RunningTaskContext] = {}
@@ -246,26 +264,33 @@ def _record_task_event(
     return event
 
 
-def _active_local_task(task_id: str) -> asyncio.Task | None:
-    local_task = _running_tasks.get(task_id)
-    if local_task is None or local_task.done():
-        return None
-    return local_task
+def _active_local_task(task_id: str) -> _RunningTaskContext | None:
+    with _RUNNING_TASK_LOCK:
+        ctx = _running_tasks.get(task_id)
+        if ctx is None:
+            return None
+        if not ctx.execution_alive():
+            return None
+        return ctx
 
 
 def _register_running_task_context(
     task_id: str,
     *,
-    task: asyncio.Task | None = None,
+    execution_thread: threading.Thread | None = None,
+    lease_thread: threading.Thread | None = None,
     orch: Orchestrator | None = None,
     task_root: str | None = None,
     run_root: str | None = None,
     epoch: int | None = None,
     control_version: int | None = None,
 ) -> _RunningTaskContext:
-    ctx = _running_task_contexts.get(task_id) or _RunningTaskContext()
-    if task is not None:
-        ctx.task = task
+    with _RUNNING_TASK_LOCK:
+        ctx = _running_task_contexts.get(task_id) or _RunningTaskContext()
+    if execution_thread is not None:
+        ctx.execution_thread = execution_thread
+    if lease_thread is not None:
+        ctx.lease_thread = lease_thread
     if orch is not None:
         ctx.orch = orch
     if task_root is not None:
@@ -276,16 +301,133 @@ def _register_running_task_context(
         ctx.epoch = epoch
     if control_version is not None:
         ctx.control_version = control_version
-    _running_task_contexts[task_id] = ctx
+    ctx.last_state_sync_at = _time.time()
+    with _RUNNING_TASK_LOCK:
+        _running_task_contexts[task_id] = ctx
+        _running_tasks[task_id] = ctx
     return ctx
 
 
 def _get_running_task_context(task_id: str) -> _RunningTaskContext | None:
-    return _running_task_contexts.get(task_id)
+    with _RUNNING_TASK_LOCK:
+        return _running_task_contexts.get(task_id)
 
 
 def _unregister_running_task_context(task_id: str) -> None:
-    _running_task_contexts.pop(task_id, None)
+    with _RUNNING_TASK_LOCK:
+        _running_task_contexts.pop(task_id, None)
+        _running_tasks.pop(task_id, None)
+
+
+def _mark_task_progress(task_id: str) -> None:
+    with _RUNNING_TASK_LOCK:
+        ctx = _running_task_contexts.get(task_id)
+        if ctx is not None:
+            now = _time.time()
+            ctx.last_progress_at = now
+            ctx.last_state_sync_at = now
+
+
+def _start_task_lease_heartbeat(
+    task_id: str,
+    *,
+    epoch: int,
+    control_version: int,
+    on_lease_lost,
+) -> threading.Thread:
+    def _worker() -> None:
+        from app.db import get_db
+        from app.metrics import observe_local_event
+
+        last_timeline_renew_at = 0.0
+        while True:
+            ctx = _get_running_task_context(task_id)
+            if ctx is None or ctx.lease_stop_requested.is_set():
+                return
+            if ctx.cancel_requested.wait(timeout=HEARTBEAT_INTERVAL_SECONDS):
+                return
+            _hb_gen = get_db()
+            _hb_db: Session = next(_hb_gen)
+            try:
+                ok = renew_lease(_hb_db, task_id, WORKER_ID, epoch)
+                current_ts = _time.time()
+                if ctx is not None:
+                    ctx.last_lease_heartbeat_at = current_ts
+                    ctx.last_state_sync_at = current_ts
+                    ctx.last_lease_error = None
+                if not ok or not still_owner(_hb_db, task_id, WORKER_ID, epoch, control_version):
+                    observe_local_event("lease_renew", "failed")
+                    if ctx is not None:
+                        ctx.last_lease_error = "lease_lost"
+                        ctx.termination_reason = "lease_lost"
+                    log_event(
+                        logger,
+                        logging.WARNING,
+                        "lease lost during threaded heartbeat, aborting task",
+                        event="task_lease_lost",
+                        task_id=task_id,
+                        owner_id=WORKER_ID,
+                        epoch=epoch,
+                        control_version=control_version,
+                    )
+                    lost_row = _hb_db.query(AppDfaTask).filter_by(task_id=task_id).first()
+                    if lost_row is not None:
+                        _record_task_event(
+                            _hb_db,
+                            row=lost_row,
+                            event_type="task_lease_lost",
+                            message="任务心跳续租失败，租约已丢失",
+                            level="warning",
+                            status=lost_row.status,
+                            worker_id=WORKER_ID,
+                            execution_owner_id=WORKER_ID,
+                            execution_epoch=epoch,
+                            control_version=control_version,
+                            payload={"owner_id": WORKER_ID, "epoch": epoch, "control_version": control_version},
+                        )
+                        _hb_db.commit()
+                    on_lease_lost()
+                    return
+                observe_local_event("lease_renew", "success")
+                if current_ts - last_timeline_renew_at >= TASK_EVENT_RENEW_INTERVAL_SECONDS:
+                    lease_row = _hb_db.query(AppDfaTask).filter_by(task_id=task_id).first()
+                    if lease_row is not None:
+                        _record_task_event(
+                            _hb_db,
+                            row=lease_row,
+                            event_type="task_lease_renewed",
+                            message="任务租约续约成功",
+                            status=lease_row.status,
+                            worker_id=WORKER_ID,
+                            execution_owner_id=WORKER_ID,
+                            execution_epoch=epoch,
+                            control_version=control_version,
+                            payload={
+                                "owner_id": WORKER_ID,
+                                "epoch": epoch,
+                                "control_version": control_version,
+                                "lease_until": isoformat_local(lease_row.execution_lease_until),
+                            },
+                        )
+                        _hb_db.commit()
+                        last_timeline_renew_at = current_ts
+            except Exception as exc:
+                observe_local_event("lease_renew", "thread_error")
+                if ctx is not None:
+                    ctx.last_lease_error = str(exc)
+            finally:
+                try:
+                    next(_hb_gen)
+                except StopIteration:
+                    pass
+
+    thread = threading.Thread(target=_worker, name=f"dfa_lease_{task_id}", daemon=True)
+    thread.start()
+    return thread
+
+
+def _run_execute_task_in_thread(service: "TaskService", task_id: str, epoch: int, control_version: int) -> None:
+    asyncio.run(service._execute_task(task_id, epoch, control_version))
 
 
 def _recover_running_task_for_cleanup(
@@ -1210,8 +1352,110 @@ def _flush_stages(task_id: str, events: list[dict], owner_id: str | None = None,
 
 
 class TaskService:
+    def __init__(self) -> None:
+        self._supervisor_thread: threading.Thread | None = None
+        self._supervisor_stop = threading.Event()
+        self._last_supervisor_run_at = 0.0
+        self._last_supervisor_error: str | None = None
+
     def local_running_task_count(self) -> int:
-        return sum(1 for task in _running_tasks.values() if not task.done())
+        with _RUNNING_TASK_LOCK:
+            return sum(1 for ctx in _running_tasks.values() if ctx.execution_alive())
+
+    def running_task_snapshot(self) -> list[dict[str, object]]:
+        with _RUNNING_TASK_LOCK:
+            rows = []
+            for task_id, ctx in _running_tasks.items():
+                rows.append(
+                    {
+                        "task_id": task_id,
+                        "execution_alive": ctx.execution_alive(),
+                        "lease_alive": ctx.lease_alive(),
+                        "last_progress_at": ctx.last_progress_at,
+                        "last_lease_heartbeat_at": ctx.last_lease_heartbeat_at,
+                        "last_state_sync_at": ctx.last_state_sync_at,
+                        "termination_reason": ctx.termination_reason,
+                        "cancel_requested": ctx.cancel_requested.is_set(),
+                        "epoch": ctx.epoch,
+                        "control_version": ctx.control_version,
+                    }
+                )
+            return rows
+
+    def request_cancel(self, task_id: str, *, reason: str) -> bool:
+        ctx = _get_running_task_context(task_id)
+        if ctx is None:
+            return False
+        ctx.termination_reason = reason
+        ctx.cancel_requested.set()
+        if ctx.orch is not None:
+            ctx.orch.abort()
+        return True
+
+    def supervisor_status(self) -> dict[str, object]:
+        return {
+            "thread_alive": bool(self._supervisor_thread and self._supervisor_thread.is_alive()),
+            "last_run_at": self._last_supervisor_run_at,
+            "last_error": self._last_supervisor_error,
+        }
+
+    def start_supervisor(self) -> None:
+        if self._supervisor_thread and self._supervisor_thread.is_alive():
+            return
+        self._supervisor_stop = threading.Event()
+
+        def _worker() -> None:
+            from app.db import get_db
+            while not self._supervisor_stop.wait(EXECUTION_SUPERVISOR_INTERVAL_SECONDS):
+                self._last_supervisor_run_at = _time.time()
+                try:
+                    with _RUNNING_TASK_LOCK:
+                        contexts = list(_running_task_contexts.items())
+                    for task_id, ctx in contexts:
+                        if ctx.execution_alive():
+                            if ctx.cancel_requested.is_set() and ctx.orch is not None:
+                                ctx.orch.abort()
+                            if EXECUTION_NO_PROGRESS_SECONDS > 0 and (_time.time() - max(ctx.last_progress_at, ctx.started_at)) > EXECUTION_NO_PROGRESS_SECONDS:
+                                ctx.termination_reason = "no_progress"
+                                ctx.cancel_requested.set()
+                                if ctx.orch is not None:
+                                    ctx.orch.abort()
+                            continue
+                        db_gen = get_db()
+                        db: Session = next(db_gen)
+                        try:
+                            snapshot = load_execution_snapshot(db, task_id)
+                            if (
+                                snapshot is not None
+                                and snapshot.status == "running"
+                                and snapshot.execution_owner_id == WORKER_ID
+                                and int(snapshot.execution_epoch or 0) == int(ctx.epoch or 0)
+                                and int(snapshot.control_version or 0) == int(ctx.control_version or 0)
+                            ):
+                                _recover_running_task_for_cleanup(
+                                    db,
+                                    task_id=task_id,
+                                    owner_id=WORKER_ID,
+                                    epoch=int(ctx.epoch or 0),
+                                    control_version=int(ctx.control_version or 0),
+                                    reason=ctx.termination_reason or "executor_thread_dead",
+                                )
+                        finally:
+                            try:
+                                next(db_gen)
+                            except StopIteration:
+                                pass
+                        _unregister_running_task_context(task_id)
+                    self._last_supervisor_error = None
+                except Exception as exc:
+                    self._last_supervisor_error = str(exc)
+                    logger.warning("execution supervisor loop failed: %s", exc, exc_info=True)
+
+        self._supervisor_thread = threading.Thread(target=_worker, name="dfa_execution_supervisor", daemon=True)
+        self._supervisor_thread.start()
+
+    def stop_supervisor(self) -> None:
+        self._supervisor_stop.set()
 
     def reconcile_orphaned_running_tasks(self, db: Session, *, limit: int = 100) -> int:
         from app.service.execution_coordinator import reclaim_orphaned_running_tasks
@@ -1267,7 +1511,7 @@ class TaskService:
 
                 observe_local_event("dispatch_claim", "empty")
                 return None
-            if claimed.task_id in _running_tasks and not _running_tasks[claimed.task_id].done():
+            if _active_local_task(claimed.task_id) is not None:
                 release_lease(db, claimed.task_id, WORKER_ID, claimed.epoch)
                 from app.metrics import observe_local_event
 
@@ -1283,17 +1527,19 @@ class TaskService:
                     control_version=claimed.control_version,
                 )
                 return None
-            asyncio_task = asyncio.create_task(
-                self._execute_task(claimed.task_id, claimed.epoch, claimed.control_version),
+            execution_thread = threading.Thread(
+                target=_run_execute_task_in_thread,
+                args=(self, claimed.task_id, claimed.epoch, claimed.control_version),
                 name=f"dfa_task_{claimed.task_id}",
+                daemon=True,
             )
-            _running_tasks[claimed.task_id] = asyncio_task
             _register_running_task_context(
                 claimed.task_id,
-                task=asyncio_task,
+                execution_thread=execution_thread,
                 epoch=claimed.epoch,
                 control_version=claimed.control_version,
             )
+            execution_thread.start()
             from app.metrics import observe_local_event
 
             observe_local_event("dispatch_claim", "success")
@@ -1719,9 +1965,7 @@ class TaskService:
             payload={"control_version": int(row.control_version or 0)},
         )
         db.commit(); db.refresh(row)
-        at = _running_tasks.get(task_id)
-        if at and not at.done():
-            at.cancel()
+        self.request_cancel(task_id, reason="restart_requested")
         log_event(logger, logging.INFO, "task restarted in-place", event="task_restarted",
                   task_id=task_id, project_id=row.project_id, control_version=row.control_version)
         return self._row_to_dict(row)
@@ -1770,9 +2014,7 @@ class TaskService:
             },
         )
         db.commit(); db.refresh(row)
-        at = _running_tasks.get(task_id)
-        if at and not at.done():
-            at.cancel()
+        self.request_cancel(task_id, reason="resume_requested")
         log_event(logger, logging.INFO, "task resumed in-place", event="task_resumed",
                   task_id=task_id, project_id=row.project_id, control_version=row.control_version, status="pending")
         return self._row_to_dict(row)
@@ -1783,21 +2025,19 @@ class TaskService:
             return self._row_to_dict(row)
         ctx = _get_running_task_context(task_id)
         local_task = _active_local_task(task_id)
-        if ctx is not None and ctx.orch is not None:
-            ctx.orch.abort()
-            log_event(
-                logger,
-                logging.INFO,
-                "task cancel signal sent to orchestrator",
-                event="task_cancel_signal_sent",
-                task_id=task_id,
-                project_id=row.project_id,
-                owner_id=WORKER_ID,
-                epoch=ctx.epoch,
-                control_version=ctx.control_version,
-            )
         if local_task is not None:
-            local_task.cancel()
+            if self.request_cancel(task_id, reason="control_plane_cancel"):
+                log_event(
+                    logger,
+                    logging.INFO,
+                    "task cancel signal sent to orchestrator",
+                    event="task_cancel_signal_sent",
+                    task_id=task_id,
+                    project_id=row.project_id,
+                    owner_id=WORKER_ID,
+                    epoch=ctx.epoch if ctx is not None else None,
+                    control_version=ctx.control_version if ctx is not None else None,
+                )
         if ctx is not None and (ctx.task_root or ctx.run_root):
             cleaned = cleanup_task_agent_processes(
                 logger.warning,
@@ -1931,84 +2171,10 @@ class TaskService:
         db_gen = get_db()
         db: Session = next(db_gen)
         event_buffer: list[dict] = []
-        stop_heartbeat = asyncio.Event()
-        heartbeat_task: asyncio.Task | None = None
         guard_counter = 0
         orch_holder: dict[str, Orchestrator] = {}
         task_root_path: str | None = None
         epoch_run_root_path: str | None = None
-
-        async def _heartbeat_loop(orch: Orchestrator) -> None:
-            from app.db import get_db as _get_db
-            from app.metrics import observe_local_event
-            last_timeline_renew_at = 0.0
-            while not stop_heartbeat.is_set():
-                await asyncio.sleep(HEARTBEAT_INTERVAL_SECONDS)
-                _hb_gen = _get_db()
-                _hb_db: Session = next(_hb_gen)
-                try:
-                    ok = renew_lease(_hb_db, task_id, WORKER_ID, epoch)
-                    if not ok or not still_owner(_hb_db, task_id, WORKER_ID, epoch, control_version):
-                        observe_local_event("lease_renew", "failed")
-                        log_event(
-                            logger,
-                            logging.WARNING,
-                            "lease lost during heartbeat, aborting task",
-                            event="task_lease_lost",
-                            task_id=task_id,
-                            owner_id=WORKER_ID,
-                            epoch=epoch,
-                            control_version=control_version,
-                        )
-                        if orch._cancel_event is not None:
-                            orch._cancel_event.set()
-                        stop_heartbeat.set()
-                        lost_row = _hb_db.query(AppDfaTask).filter_by(task_id=task_id).first()
-                        if lost_row is not None:
-                            _record_task_event(
-                                _hb_db,
-                                row=lost_row,
-                                event_type="task_lease_lost",
-                                message="任务心跳续租失败，租约已丢失",
-                                level="warning",
-                                status=lost_row.status,
-                                worker_id=WORKER_ID,
-                                execution_owner_id=WORKER_ID,
-                                execution_epoch=epoch,
-                                control_version=control_version,
-                                payload={"owner_id": WORKER_ID, "epoch": epoch, "control_version": control_version},
-                            )
-                            _hb_db.commit()
-                        return
-                    observe_local_event("lease_renew", "success")
-                    current_ts = _time.time()
-                    if current_ts - last_timeline_renew_at >= TASK_EVENT_RENEW_INTERVAL_SECONDS:
-                        lease_row = _hb_db.query(AppDfaTask).filter_by(task_id=task_id).first()
-                        if lease_row is not None:
-                            _record_task_event(
-                                _hb_db,
-                                row=lease_row,
-                                event_type="task_lease_renewed",
-                                message="任务租约续约成功",
-                                status=lease_row.status,
-                                worker_id=WORKER_ID,
-                                execution_owner_id=WORKER_ID,
-                                execution_epoch=epoch,
-                                control_version=control_version,
-                                payload={
-                                    "owner_id": WORKER_ID,
-                                    "epoch": epoch,
-                                    "control_version": control_version,
-                                    "lease_until": isoformat_local(lease_row.execution_lease_until),
-                                },
-                            )
-                            _hb_db.commit()
-                            last_timeline_renew_at = current_ts
-                finally:
-                    try:
-                        next(_hb_gen)
-                    except StopIteration:
-                        pass
 
         # Snapshot any previously-saved events BEFORE execution begins.
         # On resume, row.stages_json already has correct historical events
@@ -2023,6 +2189,7 @@ class TaskService:
 
         def on_event(event: SwarmEvent) -> None:
             nonlocal guard_counter
+            _mark_task_progress(task_id)
             event_buffer.append({"ts": _time.time(), "type": event.type,
                                   "data": dict(event.data)})
             try:
@@ -2121,7 +2288,10 @@ class TaskService:
                                     payload={"owner_id": WORKER_ID, "epoch": epoch, "control_version": control_version},
                                 )
                                 _guard_db.commit()
-                            stop_heartbeat.set()
+                            ctx = _get_running_task_context(task_id)
+                            if ctx is not None:
+                                ctx.cancel_requested.set()
+                                ctx.termination_reason = "control_guard_abort"
                             orch = orch_holder.get("orch")
                             if orch and orch._cancel_event is not None:
                                 orch._cancel_event.set()
@@ -2315,24 +2485,30 @@ class TaskService:
                 cfg.context = ((cfg.context or "").rstrip() + "\n\n" + entry_context).strip()
             orch = Orchestrator(config=cfg, on_event=on_event)
             orch_holder["orch"] = orch
-            _register_running_task_context(
+            ctx = _register_running_task_context(
                 task_id,
-                task=_running_tasks.get(task_id),
                 orch=orch,
                 task_root=task_root_path,
                 run_root=epoch_run_root_path,
                 epoch=epoch,
                 control_version=control_version,
             )
-            heartbeat_task = asyncio.create_task(_heartbeat_loop(orch), name=f"dfa_heartbeat_{task_id}")
+            if not ctx.lease_alive():
+                ctx.lease_stop_requested.clear()
+                ctx.lease_thread = _start_task_lease_heartbeat(
+                    task_id,
+                    epoch=epoch,
+                    control_version=control_version,
+                    on_lease_lost=lambda: self.request_cancel(task_id, reason="lease_lost"),
+                )
             result = await orch.execute_recursive(
                 task_id,
                 _root_out_dir=epoch_run_root,
                 _root_output_dir=root_output_dir,
                 resume=bool(tcfg.get("resume", False)),
             )
-            stop_heartbeat.set()
-            await heartbeat_task
+            if ctx is not None:
+                ctx.lease_stop_requested.set()
 
             _flush_stages(task_id, _baseline_events + event_buffer, WORKER_ID, epoch, control_version)
             db.expire(row); db.refresh(row)
@@ -2459,7 +2635,7 @@ class TaskService:
                 run_root=epoch_run_root_path,
                 worker_id=WORKER_ID,
             )
-            log_event(logger, logging.INFO, "task coroutine cancelled", event="task_coroutine_cancelled",
+            log_event(logger, logging.INFO, "task execution cancelled", event="task_execution_cancelled",
                       task_id=task_id, owner_id=WORKER_ID, epoch=epoch, control_version=control_version,
                       cleaned_groups=cleaned)
             try:
@@ -2468,8 +2644,8 @@ class TaskService:
                     _record_task_event(
                         db,
                         row=cancelled_row,
-                        event_type="task_coroutine_cancelled",
-                        message="任务协程已取消",
+                        event_type="task_execution_cancelled",
+                        message="任务执行已取消",
                         level="warning",
                         status=cancelled_row.status,
                         worker_id=WORKER_ID,
@@ -2535,7 +2711,10 @@ class TaskService:
             except Exception:
                 pass
         finally:
-            stop_heartbeat.set()
+            ctx = _get_running_task_context(task_id)
+            if ctx is not None:
+                ctx.lease_stop_requested.set()
+                ctx.cancel_requested.set()
             orch = orch_holder.get("orch")
             if orch is not None:
                 orch.abort()
@@ -2575,12 +2754,6 @@ class TaskService:
                 )
             except Exception:
                 logger.warning("failed to cleanup orphan pi processes for %s", task_id, exc_info=True)
-            if heartbeat_task is not None and not heartbeat_task.done():
-                heartbeat_task.cancel()
-                try:
-                    await heartbeat_task
-                except asyncio.CancelledError:
-                    pass
             try:
                 snapshot = load_execution_snapshot(db, task_id)
                 if (
@@ -2643,7 +2816,6 @@ class TaskService:
 
                 observe_local_event("lease_release", "failed")
                 db.rollback()
-            _running_tasks.pop(task_id, None)
             _unregister_running_task_context(task_id)
             try:
                 next(db_gen)
