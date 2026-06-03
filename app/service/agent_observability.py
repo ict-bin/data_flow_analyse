@@ -21,6 +21,7 @@ POD_NAME = (
     or os.environ.get("HOSTNAME")
     or "dataflow-analyse-pod"
 )
+_RUNNING_TASK_STATUSES = {"running", "pending", "queued", "dispatching"}
 
 _SESSION_ARG_KEYS = {
     "--session",
@@ -300,11 +301,11 @@ class AgentObservabilityService:
             task_status = str(task_row.status or "") if task_row is not None else None
             stage_key = str(task_row.current_stage or "") if task_row is not None else None
             role_kind = _extract_role_kind(str(proc.get("command") or ""))
-            if task_row is not None and str(task_status or "").strip() == "running":
+            if task_row is not None and str(task_status or "").strip() in _RUNNING_TASK_STATUSES:
                 owner_kind = "tracked"
-                owner_reason = "running_task_matched"
+                owner_reason = "active_task_matched"
                 kill_allowed = False
-                kill_block_reason = "进程归属于运行中任务"
+                kill_block_reason = "进程归属于活动任务"
             elif task_row is not None:
                 owner_kind = "residual"
                 owner_reason = "non_running_task_residual"
@@ -356,7 +357,7 @@ class AgentObservabilityService:
                 "process_count": len(linked_processes),
                 "agent_roles": sorted({str(item.get("role_kind") or "") for item in linked_processes if item.get("role_kind")}),
                 "process_pids": [int(item["pid"]) for item in linked_processes],
-                "ownership_status": "tracked" if str(row.status or "").strip() == "running" else "residual",
+                "ownership_status": "tracked" if str(row.status or "").strip() in _RUNNING_TASK_STATUSES else "residual",
             })
 
         tracked_process_count = len([item for item in processes if item.get("owner_kind") == "tracked"])
