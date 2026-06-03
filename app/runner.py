@@ -369,6 +369,8 @@ def _build_agent_env(
         payload["DFA_WORKER_ID"] = str(task_context["worker_id"])
     if task_context.get("execution_epoch") is not None:
         payload["DFA_EXECUTION_EPOCH"] = str(task_context["execution_epoch"])
+    if task_context.get("session_kind"):
+        payload["DFA_SESSION_KIND"] = str(task_context["session_kind"])
     return payload
 
 

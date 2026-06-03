@@ -56,6 +56,7 @@ class RuntimeBootstrap:
         self._worker_slot_last_heartbeat_ok = False
         self._worker_slot_last_reconcile_at = 0.0
         self._worker_slot_last_error: str | None = None
+        self._worker_slot_orphan_tracker: dict[str, int] = {}
 
     async def start(self, app: FastAPI) -> None:
         if self._task and not self._task.done():
@@ -306,7 +307,14 @@ class RuntimeBootstrap:
                 try:
                     now_ts = time.time()
                     if now_ts - last_orphan_sweep[0] >= orphan_sweep_seconds:
-                        cleanup_orphan_pi_processes(logger.warning, label="dfa_worker_registry")
+                        runtime_snapshot = get_task_service().running_task_snapshot()
+                        cleanup_orphan_pi_processes(
+                            logger.warning,
+                            label="dfa_worker_registry",
+                            owner_id=WORKER_ID,
+                            runtime_snapshots=runtime_snapshot,
+                            state_tracker=self._worker_slot_orphan_tracker,
+                        )
                         last_orphan_sweep[0] = now_ts
                     get_worker_slot_service().upsert_heartbeat(
                         db,

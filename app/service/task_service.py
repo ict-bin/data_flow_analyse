@@ -360,6 +360,13 @@ def _mark_task_progress(task_id: str) -> None:
             ctx.last_state_sync_at = now
 
 
+def _epoch_run_root_from_task_root(task_root: str | None, epoch: int | None) -> str | None:
+    normalized_root = str(task_root or "").strip()
+    if not normalized_root or epoch is None:
+        return None
+    return str(Path(normalized_root) / f"{int(epoch):04d}")
+
+
 def _start_task_lease_heartbeat(
     task_id: str,
     *,
@@ -1463,7 +1470,13 @@ class TaskService:
                         "termination_reason": ctx.termination_reason,
                         "cancel_requested": ctx.cancel_requested.is_set(),
                         "epoch": ctx.epoch,
+                        "execution_epoch": ctx.epoch,
                         "control_version": ctx.control_version,
+                        "owner_id": WORKER_ID,
+                        "status": "running" if ctx.execution_alive() else "pending",
+                        "task_root": ctx.task_root,
+                        "run_root": ctx.run_root or _epoch_run_root_from_task_root(ctx.task_root, ctx.epoch),
+                        "active_context": ctx.execution_alive() or ctx.lease_alive(),
                     }
                 )
             return rows
@@ -3138,7 +3151,6 @@ class TaskService:
                     worker_id=WORKER_ID,
                 )
             try:
-                orphan_cleaned = cleanup_orphan_pi_processes(logger.warning, label=f"task_finally:{task_id}")
                 log_event(
                     logger,
                     logging.INFO,
@@ -3149,7 +3161,7 @@ class TaskService:
                     epoch=epoch,
                     control_version=control_version,
                     cleaned_groups=targeted_cleaned,
-                    orphan_cleaned_groups=orphan_cleaned,
+                    orphan_cleaned_groups=0,
                 )
             except Exception:
                 logger.warning("failed to cleanup orphan pi processes for %s", task_id, exc_info=True)

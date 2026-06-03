@@ -26,7 +26,7 @@ def _overflow_result() -> runner.AgentResult:
 
 
 class RunAgentPromptFileTests(unittest.TestCase):
-    def test_cleanup_orphan_pi_processes_kills_dfa_orphan_in_business_pid1_container(self):
+    def test_cleanup_orphan_pi_processes_preserves_active_runtime_snapshot(self):
         orphan = agent_process.AgentProcessInfo(
             pid=101,
             ppid=1,
@@ -35,13 +35,85 @@ class RunAgentPromptFileTests(unittest.TestCase):
             exe="node",
             cwd="/tmp/dfa-task/run",
             cmdline="pi --mode rpc",
-            environ={"DFA_TASK_ID": "dfa_1", "DFA_TASK_ROOT": "/tmp/dfa-task"},
+            environ={"DFA_TASK_ID": "dfa_1", "DFA_TASK_ROOT": "/tmp/dfa-task", "DFA_TASK_RUN_ROOT": "/tmp/dfa-task/run", "DFA_EXECUTION_EPOCH": "3"},
         )
         with patch.object(agent_process, "_iter_agent_processes", return_value=[orphan]):
             with patch.object(agent_process, "_kill_process_group", return_value=True) as kill_group:
-                killed = agent_process.cleanup_orphan_pi_processes(lambda _: None, label="test")
-        self.assertEqual(killed, 1)
+                killed = agent_process.cleanup_orphan_pi_processes(
+                    lambda _: None,
+                    label="test",
+                    owner_id="pod-a",
+                    runtime_snapshots=[{
+                        "task_id": "dfa_1",
+                        "owner_id": "pod-a",
+                        "execution_epoch": 3,
+                        "status": "running",
+                        "run_root": "/tmp/dfa-task/run",
+                        "active_context": True,
+                    }],
+                )
+        self.assertEqual(killed, 0)
+        kill_group.assert_not_called()
+
+    def test_cleanup_orphan_pi_processes_kills_confirmed_orphan_after_guard_rounds(self):
+        orphan = agent_process.AgentProcessInfo(
+            pid=101,
+            ppid=1,
+            pgid=201,
+            comm="pi",
+            exe="node",
+            cwd="/tmp/dfa-task/run",
+            cmdline="pi --mode rpc",
+            environ={"DFA_TASK_ID": "dfa_1", "DFA_TASK_ROOT": "/tmp/dfa-task", "DFA_TASK_RUN_ROOT": "/tmp/dfa-task/run"},
+        )
+        tracker: dict[str, int] = {}
+        with patch.object(agent_process, "_iter_agent_processes", return_value=[orphan]), patch.object(
+            agent_process,
+            "_task_process_started_at",
+            return_value=0.0,
+        ), patch.object(
+            agent_process,
+            "_session_activity_mtime",
+            return_value=None,
+        ), patch.dict("os.environ", {
+            "DFA_AGENT_ORPHAN_CONFIRM_ROUNDS": "2",
+            "DFA_AGENT_ORPHAN_MIN_AGE_SECONDS": "0",
+        }, clear=False):
+            with patch.object(agent_process, "_kill_process_group", return_value=True) as kill_group:
+                first = agent_process.cleanup_orphan_pi_processes(lambda _: None, label="test", state_tracker=tracker)
+                second = agent_process.cleanup_orphan_pi_processes(lambda _: None, label="test", state_tracker=tracker)
+        self.assertEqual(first, 0)
+        self.assertEqual(second, 1)
         kill_group.assert_called_once()
+
+    def test_cleanup_orphan_pi_processes_respects_default_900s_min_age(self):
+        orphan = agent_process.AgentProcessInfo(
+            pid=101,
+            ppid=1,
+            pgid=201,
+            comm="pi",
+            exe="node",
+            cwd="/tmp/dfa-task/run",
+            cmdline="pi --mode rpc",
+            environ={"DFA_TASK_ID": "dfa_1", "DFA_TASK_ROOT": "/tmp/dfa-task", "DFA_TASK_RUN_ROOT": "/tmp/dfa-task/run"},
+        )
+        with patch.object(agent_process, "_iter_agent_processes", return_value=[orphan]), patch.object(
+            agent_process,
+            "_task_process_started_at",
+            return_value=1000.0,
+        ), patch.object(
+            agent_process,
+            "_session_activity_mtime",
+            return_value=None,
+        ), patch.object(
+            agent_process.time,
+            "time",
+            return_value=1500.0,
+        ):
+            with patch.object(agent_process, "_kill_process_group", return_value=True) as kill_group:
+                killed = agent_process.cleanup_orphan_pi_processes(lambda _: None, label="test", state_tracker={})
+        self.assertEqual(killed, 0)
+        kill_group.assert_not_called()
 
     def test_cleanup_task_agent_processes_only_hits_matching_task(self):
         match = agent_process.AgentProcessInfo(

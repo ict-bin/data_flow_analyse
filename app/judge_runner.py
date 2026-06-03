@@ -102,6 +102,7 @@ class JudgeMixin:
                 "task_id": result.task_id,
                 "task_root": str(Path(cwd).resolve().parent),
                 "task_run_root": str(Path(cwd).resolve()),
+                "session_kind": "merge",
             },
         )
 
@@ -120,7 +121,16 @@ class JudgeMixin:
             self._emit("merge_done", result.task_id, size=len(ar.output))
             return ar.output
 
-        self._emit("merge_failed", result.task_id, error=ar.error or "no output")
+        interrupt_reason = (ar.error or "").strip()
+        if "terminated" in interrupt_reason.lower() or "killed" in interrupt_reason.lower():
+            self._emit(
+                "merge_interrupted_by_runtime_cleanup",
+                result.task_id,
+                error=interrupt_reason,
+                session_kind="merge",
+                cleanup_source="runtime_cleanup",
+            )
+        self._emit("merge_failed", result.task_id, error=interrupt_reason or "no output")
         return None
 
     # ═══════════════════════════════════════════════════════════════════════
