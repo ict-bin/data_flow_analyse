@@ -172,6 +172,11 @@ def _compact_event_payload(payload: dict[str, object] | None) -> dict[str, objec
 
 def _is_db_connection_error(exc: Exception) -> bool:
     message = str(exc or "").lower()
+    return _is_db_connection_error_text(message)
+
+
+def _is_db_connection_error_text(text: object) -> bool:
+    message = str(text or "").lower()
     return any(token in message for token in [
         "lost connection to mysql server",
         "server has gone away",
@@ -235,6 +240,13 @@ def _run_db_retry(operation_name: str, fn, *, max_attempts: int | None = None):
     raise RuntimeError(_database_failure_message(last_error, attempts=attempts)) from last_error
 
 
+def _consume_db_generator(db_gen) -> None:
+    try:
+        next(db_gen)
+    except StopIteration:
+        pass
+
+
 def _task_event_dedupe_key(
     task_id: str,
     event_type: str,
@@ -257,6 +269,22 @@ def _task_event_dedupe_key(
         hashlib.sha1(message.encode("utf-8")).hexdigest()[:12],
     ]
     return "::".join(parts)[:255]
+
+
+def _latest_execution_started_at(db: Session, task_id: str) -> str | None:
+    row = (
+        db.query(AppDfaTaskEvent.created_at)
+        .filter(
+            AppDfaTaskEvent.task_id == task_id,
+            AppDfaTaskEvent.event_type == "task_execution_started",
+        )
+        .order_by(AppDfaTaskEvent.created_at.desc())
+        .first()
+    )
+    if not row:
+        return None
+    created_at = row[0] if isinstance(row, tuple) else getattr(row, "created_at", None)
+    return isoformat_local(created_at) if created_at else None
 
 
 def _build_task_event_response(event: AppDfaTaskEvent) -> dict[str, object]:
@@ -2168,6 +2196,8 @@ class TaskService:
                 (
                     (AppDfaTask.lease_recovery_state == LEASE_RECOVERY_STATE_FAILED)
                     | (AppDfaTask.error.like("%Lost connection to MySQL server during query%"))
+                    | (AppDfaTask.error.like("%MySQL server has gone away%"))
+                    | (AppDfaTask.error.like("%Broken pipe%"))
                 ),
             )
             .order_by(AppDfaTask.updated_at.desc(), AppDfaTask.id.desc())
@@ -2178,7 +2208,7 @@ class TaskService:
         for row in candidate_rows:
             abnormal_reason = row.latest_abnormal_reason_json if isinstance(row.latest_abnormal_reason_json, dict) else {}
             abnormal_reason_code = str(abnormal_reason.get("code") or "").strip()
-            mysql_disconnect = "Lost connection to MySQL server during query" in str(row.error or "")
+            mysql_disconnect = _is_db_connection_error_text(row.error)
             expected_requeue = bool(
                 mysql_disconnect
                 and (
@@ -2454,7 +2484,7 @@ class TaskService:
         rows = (query.options(*self._list_load_options())
                 .order_by(order_expr, AppDfaTask.id.desc())
                 .offset((page - 1) * per_page).limit(per_page).all())
-        return {"items": [self._row_to_dict(r, include_heavy=False) for r in rows],
+        return {"items": [self._row_to_dict(r, include_heavy=False, db=db) for r in rows],
                 "total": total, "page": page, "per_page": per_page}
 
     def get_task_stats(
@@ -2915,6 +2945,22 @@ class TaskService:
         orch_holder: dict[str, Orchestrator] = {}
         task_root_path: str | None = None
         epoch_run_root_path: str | None = None
+        ctx: _RunningTaskContext | None = None
+
+        def _close_current_db() -> None:
+            nonlocal db, db_gen
+            if db is None:
+                return
+            _consume_db_generator(db_gen)
+            db = None
+            db_gen = None
+
+        def _ensure_db() -> Session:
+            nonlocal db, db_gen
+            if db is None:
+                db_gen = get_db()
+                db = next(db_gen)
+            return db
 
         # Snapshot any previously-saved events BEFORE execution begins.
         # On resume, row.stages_json already has correct historical events
@@ -3302,6 +3348,7 @@ class TaskService:
                         recovery_reason=AUTO_REQUEUE_REASON_LEASE_LOST,
                     ),
                 )
+            _close_current_db()
             result = await orch.execute_recursive(
                 task_id,
                 _root_out_dir=epoch_run_root,
@@ -3312,6 +3359,10 @@ class TaskService:
                 ctx.lease_stop_requested.set()
 
             _flush_stages(task_id, _baseline_events + event_buffer, WORKER_ID, epoch, control_version)
+            _ensure_db()
+            row = db.query(AppDfaTask).filter_by(task_id=task_id).first()
+            if row is None:
+                return
             db.expire(row); db.refresh(row)
             if row.status == "cancelled":
                 log_event(logger, logging.INFO, "task stopped after control-plane cancel", event="task_cancelled_during_execution",
@@ -3440,6 +3491,7 @@ class TaskService:
                       task_id=task_id, owner_id=WORKER_ID, epoch=epoch, control_version=control_version,
                       cleaned_groups=cleaned)
             try:
+                _ensure_db()
                 cancelled_row = db.query(AppDfaTask).filter_by(task_id=task_id).first()
                 if cancelled_row is not None:
                     _record_task_event(
@@ -3472,6 +3524,7 @@ class TaskService:
             log_event(logger, logging.ERROR, "task execution failed",
                       event="task_error", task_id=task_id, owner_id=WORKER_ID, epoch=epoch, control_version=control_version, error=str(exc))
             try:
+                _ensure_db()
                 db.rollback()
                 r = db.query(AppDfaTask).filter_by(task_id=task_id).first()
                 lease_recovery_in_progress = bool(
@@ -3651,12 +3704,10 @@ class TaskService:
                 from app.metrics import observe_local_event
 
                 observe_local_event("lease_release", "failed")
-                db.rollback()
+                if db is not None:
+                    db.rollback()
             _unregister_running_task_context(task_id)
-            try:
-                next(db_gen)
-            except StopIteration:
-                pass
+            _close_current_db()
 
     def _get_or_404(self, db: Session, task_id: str, *, include_deleted: bool = False) -> AppDfaTask:
         query = db.query(AppDfaTask).filter(AppDfaTask.task_id == task_id)
@@ -3714,7 +3765,7 @@ class TaskService:
         )
 
     @staticmethod
-    def _row_to_dict(row: AppDfaTask, *, include_heavy: bool = True) -> dict:
+    def _row_to_dict(row: AppDfaTask, *, include_heavy: bool = True, db: Session | None = None) -> dict:
         def fmt(dt: datetime | None) -> str | None:
             return isoformat_local(dt)
         abnormal_reason = _task_abnormal_reason(row)
@@ -3723,6 +3774,8 @@ class TaskService:
         run_root = str(Path(task_root) / "run") if task_root else None
         workspace_root = str(Path(run_root) / "epochs") if run_root else None
         ctx = _get_running_task_context(row.task_id)
+        result_json = _lightweight_result_json(row, row.result_json) if include_heavy else None
+        latest_started_at = _latest_execution_started_at(db, row.task_id) if db is not None else fmt(row.started_at)
         return {
             **_origin_payload(row),
             "task_id": row.task_id, "project_id": row.project_id,
@@ -3747,17 +3800,24 @@ class TaskService:
             "prompt_template_id": row.prompt_template_id,
             "prompt_content": row.prompt_content if include_heavy else None, "status": row.status,
             "error": row.error,
-            "result_json": _lightweight_result_json(row, row.result_json) if include_heavy else None,
+            "result_json": result_json,
             "stages_json": row.stages_json if include_heavy else None,
             "task_config_json": row.task_config_json if include_heavy else None,
             "created_by": row.created_by,
             "created_at": fmt(row.created_at), "updated_at": fmt(row.updated_at),
             "started_at": fmt(row.started_at), "finished_at": fmt(row.finished_at),
+            "latest_started_at": latest_started_at,
+            "execution_duration_ms": (
+                float(result_json.get("total_duration_ms"))
+                if isinstance(result_json, dict) and result_json.get("total_duration_ms") is not None
+                else None
+            ),
             "execution_owner_id": row.execution_owner_id,
             "execution_lease_until": fmt(row.execution_lease_until),
             "execution_heartbeat_at": fmt(row.execution_heartbeat_at),
             "execution_epoch": int(row.execution_epoch or 0),
             "control_version": int(row.control_version or 0),
+            "rerun_count": max(0, int(row.control_version or 0)),
             "dispatch_status": row.dispatch_status,
             "lease_lost_count": int(row.lease_lost_count or 0),
             "last_lease_lost_at": fmt(row.last_lease_lost_at),
@@ -3769,7 +3829,7 @@ class TaskService:
             "lease_recovery_failed": str(row.lease_recovery_state or "") == LEASE_RECOVERY_STATE_FAILED,
             "lease_recovery_expected_requeue": bool(
                 str(row.status or "") in {"error", "cancelled"}
-                and ((row.error or "").find("Lost connection to MySQL server during query") >= 0)
+                and _is_db_connection_error_text(row.error)
             ),
             "lease_renew_failure_count": int(ctx.lease_renew_failure_count if ctx is not None else 0),
             "last_lease_renew_success_at": (

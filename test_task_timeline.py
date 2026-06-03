@@ -505,6 +505,32 @@ class TaskTimelineTests(unittest.TestCase):
         finally:
             db.close()
 
+    def test_reconcile_failed_lease_recoveries_requeues_mysql_gone_away_lease_lost_sample(self):
+        task_id = self._create_task()
+        db = self._session()
+        try:
+            row = db.query(AppDfaTask).filter_by(task_id=task_id).first()
+            row.status = "error"
+            row.error = 'MySQL server has gone away (BrokenPipeError(32, "Broken pipe"))'
+            row.lease_lost_count = 0
+            row.latest_abnormal_reason_json = {
+                "code": "lease_lost",
+                "title": "任务租约丢失",
+                "status": "error",
+                "message": row.error,
+            }
+            db.commit()
+
+            repaired = self.service.reconcile_failed_lease_recoveries(db, limit=10)
+
+            self.assertEqual(1, repaired)
+            payload = self.service.get_task(db, task_id)
+            self.assertEqual("pending", payload["status"])
+            self.assertEqual(1, payload["lease_lost_count"])
+            self.assertEqual("requeue_committed", payload["lease_recovery_state"])
+        finally:
+            db.close()
+
     def test_mark_database_failure_sets_explicit_reason(self):
         task_id = self._create_task()
         db = self._session()
@@ -968,6 +994,124 @@ class TaskTimelineTests(unittest.TestCase):
             task_service_module.begin_execution_if_owner = previous_begin
             task_service_module.cleanup_orphan_pi_processes = previous_cleanup
             task_service_module.release_lease = previous_release
+
+    def test_execute_task_closes_db_session_before_long_running_orchestrator(self):
+        task_id = self._create_task()
+        db = self._session()
+        try:
+            row = db.query(AppDfaTask).filter_by(task_id=task_id).first()
+            row.status = "pending"
+            row.execution_owner_id = task_service_module.WORKER_ID
+            row.execution_epoch = 1
+            row.control_version = 0
+            row.dispatch_status = "leased"
+            db.commit()
+        finally:
+            db.close()
+
+        previous_get_db = sys.modules["app.db"].get_db
+        previous_build_task_config = task_service_module.build_task_config
+        previous_load_service_config = task_service_module._load_svc_config_from_db
+        previous_write_models = task_service_module._write_models_json_from_db
+        previous_write_manifest = task_service_module._write_input_manifest
+        previous_flush_stages = task_service_module._flush_stages
+        previous_cleanup = task_service_module.cleanup_task_agent_processes
+        previous_release = task_service_module.release_lease
+        previous_orchestrator = task_service_module.Orchestrator
+        previous_still_owner = task_service_module.still_owner
+        previous_begin = task_service_module.begin_execution_if_owner
+        previous_commit = task_service_module.commit_terminal_state_if_owner
+        closed_flags: list[dict[str, bool]] = []
+
+        def _tracking_get_db():
+            session = self._session()
+            marker = {"closed": False}
+            closed_flags.append(marker)
+            try:
+                yield session
+            finally:
+                marker["closed"] = True
+                session.close()
+
+        class _FakeResult:
+            status = SimpleNamespace(value="passed")
+            error = None
+            completion_reason = "ok"
+            rounds = []
+
+            def model_dump(self, mode="json"):
+                return {
+                    "status": "passed",
+                    "analysis_status": "passed",
+                    "completion_reason": "ok",
+                    "task": "demo",
+                    "error": None,
+                    "rounds": [],
+                    "total_duration_ms": 10,
+                    "total_tokens": {},
+                }
+
+        class _FakeOrchestrator:
+            def __init__(self, config, on_event):
+                self.config = config
+                self.on_event = on_event
+
+            async def execute_recursive(self, *args, **kwargs):
+                if not closed_flags or not closed_flags[0]["closed"]:
+                    raise AssertionError("DB session should be closed before long-running orchestrator execution")
+                return _FakeResult()
+
+            def abort(self):
+                return None
+
+        try:
+            sys.modules["app.db"].get_db = _tracking_get_db
+            task_service_module._load_svc_config_from_db = lambda _db, _project_id: SimpleNamespace(
+                output_dir=str(self.output_dir),
+                archive_dir=str(self.output_dir),
+                result_dir=str(self.output_dir),
+                start_stage=None,
+                resume_workspace=None,
+                resume=False,
+            )
+            task_service_module.build_task_config = lambda *args, **kwargs: SimpleNamespace(
+                context="",
+                source_file="",
+                function_name="",
+                line_hint="",
+                taint_params=[],
+                function_description="",
+                function_description_source="",
+                entry_reason="",
+                entry_reason_source="",
+                taint_details=[],
+            )
+            task_service_module._write_models_json_from_db = lambda _db: None
+            task_service_module._write_input_manifest = lambda _row: None
+            task_service_module._flush_stages = lambda *args, **kwargs: None
+            task_service_module.cleanup_task_agent_processes = lambda *args, **kwargs: 0
+            task_service_module.release_lease = lambda *args, **kwargs: False
+            task_service_module.Orchestrator = _FakeOrchestrator
+            task_service_module.still_owner = lambda *args, **kwargs: True
+            task_service_module.begin_execution_if_owner = lambda *args, **kwargs: True
+            task_service_module.commit_terminal_state_if_owner = lambda *args, **kwargs: True
+
+            asyncio.run(self.service._execute_task(task_id, 1, 0))
+            self.assertTrue(closed_flags)
+            self.assertTrue(closed_flags[0]["closed"])
+        finally:
+            sys.modules["app.db"].get_db = previous_get_db
+            task_service_module.build_task_config = previous_build_task_config
+            task_service_module._load_svc_config_from_db = previous_load_service_config
+            task_service_module._write_models_json_from_db = previous_write_models
+            task_service_module._write_input_manifest = previous_write_manifest
+            task_service_module._flush_stages = previous_flush_stages
+            task_service_module.cleanup_task_agent_processes = previous_cleanup
+            task_service_module.release_lease = previous_release
+            task_service_module.Orchestrator = previous_orchestrator
+            task_service_module.still_owner = previous_still_owner
+            task_service_module.begin_execution_if_owner = previous_begin
+            task_service_module.commit_terminal_state_if_owner = previous_commit
 
 
 if __name__ == "__main__":
