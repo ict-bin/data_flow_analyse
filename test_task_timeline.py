@@ -13,6 +13,7 @@ from unittest.mock import patch
 from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
@@ -417,6 +418,46 @@ class TaskTimelineTests(unittest.TestCase):
         finally:
             db.close()
 
+    def test_request_lease_requeue_retries_db_failures(self):
+        task_id = self._create_task()
+        db = self._session()
+        try:
+            row = db.query(AppDfaTask).filter_by(task_id=task_id).first()
+            row.status = "running"
+            row.execution_owner_id = "worker-a"
+            row.execution_epoch = 2
+            row.control_version = 3
+            row.dispatch_status = "running"
+            row.execution_lease_until = now_local() + timedelta(minutes=5)
+            db.commit()
+
+            real_commit = self.service._commit_lease_requeue
+            attempts = {"count": 0}
+
+            def flaky_commit(*args, **kwargs):
+                attempts["count"] += 1
+                if attempts["count"] < 3:
+                    raise OperationalError("stmt", {}, Exception("Lost connection to MySQL server during query"))
+                return real_commit(*args, **kwargs)
+
+            with patch("app.db.get_db", side_effect=lambda: self._db_generator()):
+                with patch.object(self.service, "_commit_lease_requeue", side_effect=flaky_commit):
+                    requeued = self.service.request_lease_requeue(
+                        db,
+                        task_id,
+                        owner_id="worker-a",
+                        epoch=2,
+                        control_version=3,
+                    )
+
+            self.assertTrue(requeued)
+            self.assertEqual(3, attempts["count"])
+            payload = self.service.get_task(db, task_id)
+            self.assertEqual("pending", payload["status"])
+            self.assertEqual("requeue_committed", payload["lease_recovery_state"])
+        finally:
+            db.close()
+
     def test_reconcile_failed_lease_recoveries_requeues_error_sample(self):
         task_id = self._create_task()
         db = self._session()
@@ -434,6 +475,23 @@ class TaskTimelineTests(unittest.TestCase):
             self.assertEqual("pending", payload["status"])
             self.assertEqual(1, payload["lease_lost_count"])
             self.assertEqual("requeue_committed", payload["lease_recovery_state"])
+        finally:
+            db.close()
+
+    def test_mark_database_failure_sets_explicit_reason(self):
+        task_id = self._create_task()
+        db = self._session()
+        try:
+            row = db.query(AppDfaTask).filter_by(task_id=task_id).first()
+            task_service_module._mark_database_failure(
+                row,
+                RuntimeError("Lost connection to MySQL server during query"),
+                status="error",
+            )
+            db.commit()
+            db.refresh(row)
+            self.assertEqual("database_failure", (row.latest_abnormal_reason_json or {}).get("code"))
+            self.assertIn("数据库操作失败", (row.latest_abnormal_reason_json or {}).get("message", ""))
         finally:
             db.close()
 

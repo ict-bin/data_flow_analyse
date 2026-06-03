@@ -69,6 +69,10 @@ LEASE_RECOVERY_STATE_IDLE = "idle"
 LEASE_RECOVERY_STATE_REQUESTED = "requested"
 LEASE_RECOVERY_STATE_REQUEUE_COMMITTED = "requeue_committed"
 LEASE_RECOVERY_STATE_FAILED = "failed"
+DB_RETRY_MAX_ATTEMPTS = int(os.environ.get("DFA_DB_RETRY_MAX_ATTEMPTS", "5"))
+DB_RETRY_BASE_DELAY_SECONDS = float(os.environ.get("DFA_DB_RETRY_BASE_DELAY_SECONDS", "1"))
+DB_FAILURE_REASON_CODE = "database_failure"
+DB_FAILURE_REASON_TITLE = "数据库操作失败"
 
 _RUNNING_TASK_LOCK = threading.RLock()
 _running_tasks: dict[str, "_RunningTaskContext"] = {}
@@ -171,6 +175,58 @@ def _is_db_connection_error(exc: Exception) -> bool:
         "broken pipe",
         "operationalerror",
     ])
+
+
+def _mark_database_failure(row: AppDfaTask, exc: Exception, *, status: str = "error") -> None:
+    failure_message = str(exc)
+    if DB_FAILURE_REASON_TITLE not in failure_message:
+        failure_message = _database_failure_message(exc, attempts=DB_RETRY_MAX_ATTEMPTS)
+    _persist_terminal_failure(row, failure_message, status=status)
+    reason = {
+        "code": DB_FAILURE_REASON_CODE,
+        "title": DB_FAILURE_REASON_TITLE,
+        "status": status,
+        "message": failure_message,
+        "service": "dataflow-analysis",
+        "category": "database",
+        "terminal": True,
+        "is_abnormal": True,
+    }
+    row.latest_abnormal_reason_json = reason
+    flag_modified(row, "latest_abnormal_reason_json")
+
+
+def _db_retry_delay_seconds(attempt: int) -> float:
+    index = max(0, int(attempt) - 1)
+    return float(DB_RETRY_BASE_DELAY_SECONDS) * (2 ** index)
+
+
+def _database_failure_message(exc: Exception, *, attempts: int) -> str:
+    return f"{DB_FAILURE_REASON_TITLE}: 重试 {attempts} 次后仍失败: {exc}"
+
+
+def _run_db_retry(operation_name: str, fn, *, max_attempts: int | None = None):
+    attempts = max(1, int(max_attempts or DB_RETRY_MAX_ATTEMPTS))
+    last_error: Exception | None = None
+    for attempt in range(1, attempts + 1):
+        try:
+            return fn(attempt)
+        except Exception as exc:
+            last_error = exc
+            if not _is_db_connection_error(exc) or attempt >= attempts:
+                break
+            delay = _db_retry_delay_seconds(attempt)
+            logger.warning(
+                "db operation retry scheduled: op=%s attempt=%s/%s delay=%.2fs error=%s",
+                operation_name,
+                attempt,
+                attempts,
+                delay,
+                exc,
+            )
+            _time.sleep(delay)
+    assert last_error is not None
+    raise RuntimeError(_database_failure_message(last_error, attempts=attempts)) from last_error
 
 
 def _task_event_dedupe_key(
@@ -1609,10 +1665,7 @@ class TaskService:
     ) -> bool:
         from app.db import get_db
 
-        last_error: Exception | None = None
-        for attempt, delay in enumerate((0.0, *LEASE_REQUEUE_RETRY_DELAYS_SECONDS), start=1):
-            if delay > 0:
-                _time.sleep(delay)
+        def _attempt(attempt: int) -> bool:
             db_gen = get_db()
             lease_db: Session = next(db_gen)
             try:
@@ -1631,10 +1684,8 @@ class TaskService:
                         ctx.lease_recovery_state = LEASE_RECOVERY_STATE_REQUEUE_COMMITTED
                         ctx.lease_recovery_error = None
                         ctx.lease_recovery_updated_at = _time.time()
-                    return True
-                return False
+                return recovered
             except Exception as exc:
-                last_error = exc
                 ctx = _get_running_task_context(task_id)
                 if ctx is not None:
                     ctx.lease_recovery_error = str(exc)
@@ -1651,8 +1702,8 @@ class TaskService:
                     _record_task_event(
                         lease_db,
                         row=recover_row,
-                        event_type="task_lease_requeue_retry" if attempt < len(LEASE_REQUEUE_RETRY_DELAYS_SECONDS) + 1 else "task_lease_requeue_failed",
-                        message="任务 lease_lost 自动回队失败，正在重试" if attempt < len(LEASE_REQUEUE_RETRY_DELAYS_SECONDS) + 1 else "任务 lease_lost 自动回队失败，已进入后台修复",
+                        event_type="task_lease_requeue_retry" if attempt < DB_RETRY_MAX_ATTEMPTS else "task_lease_requeue_failed",
+                        message="任务 lease_lost 自动回队失败，正在重试" if attempt < DB_RETRY_MAX_ATTEMPTS else "任务 lease_lost 自动回队失败，原因为数据库失败",
                         level="warning",
                         status=recover_row.status,
                         dispatch_status=recover_row.dispatch_status,
@@ -1662,22 +1713,26 @@ class TaskService:
                             "owner_id": owner_id,
                             "epoch": epoch,
                             "control_version": control_version,
+                            "failure_code": DB_FAILURE_REASON_CODE if _is_db_connection_error(exc) else None,
                         },
                     )
                     lease_db.commit()
-                if not _is_db_connection_error(exc):
-                    break
+                raise
             finally:
                 try:
                     next(db_gen)
                 except StopIteration:
                     pass
-        ctx = _get_running_task_context(task_id)
-        if ctx is not None:
-            ctx.lease_recovery_state = LEASE_RECOVERY_STATE_FAILED
-            ctx.lease_recovery_error = str(last_error) if last_error is not None else "lease_requeue_failed"
-            ctx.lease_recovery_updated_at = _time.time()
-        return False
+
+        try:
+            return bool(_run_db_retry("request_lease_requeue", _attempt, max_attempts=DB_RETRY_MAX_ATTEMPTS))
+        except Exception as exc:
+            ctx = _get_running_task_context(task_id)
+            if ctx is not None:
+                ctx.lease_recovery_state = LEASE_RECOVERY_STATE_FAILED
+                ctx.lease_recovery_error = str(exc)
+                ctx.lease_recovery_updated_at = _time.time()
+            return False
 
     def _commit_lease_requeue(
         self,
@@ -3166,19 +3221,32 @@ class TaskService:
                     )
                     return
                 if r and r.status == "running" and still_owner(db, task_id, WORKER_ID, epoch, control_version):
-                    _persist_terminal_failure(r, str(exc), status="error")
-                    commit_terminal_state_if_owner(
-                        db,
-                        task_id,
-                        WORKER_ID,
-                        epoch,
-                        control_version,
-                        status="error",
-                        finished_at=now_local(),
-                        stages_json={"events": _baseline_events + event_buffer, "final": True},
-                        result_json=r.result_json,
-                        error=str(exc),
-                    )
+                    if _is_db_connection_error(exc):
+                        _mark_database_failure(r, exc, status="error")
+                    else:
+                        _persist_terminal_failure(r, str(exc), status="error")
+
+                    def _commit_terminal(attempt: int) -> bool:
+                        return bool(
+                            commit_terminal_state_if_owner(
+                                db,
+                                task_id,
+                                WORKER_ID,
+                                epoch,
+                                control_version,
+                                status="error",
+                                finished_at=now_local(),
+                                stages_json={"events": _baseline_events + event_buffer, "final": True},
+                                result_json=r.result_json,
+                                error=(
+                                    _database_failure_message(exc, attempts=DB_RETRY_MAX_ATTEMPTS)
+                                    if _is_db_connection_error(exc)
+                                    else str(exc)
+                                ),
+                            )
+                        )
+
+                    _run_db_retry("commit_terminal_state_if_owner", _commit_terminal, max_attempts=DB_RETRY_MAX_ATTEMPTS)
                     refreshed = db.query(AppDfaTask).filter_by(task_id=task_id).first()
                     if refreshed is not None:
                         reason, changed = _sync_task_abnormal_reason(refreshed)
