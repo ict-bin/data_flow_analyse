@@ -2159,25 +2159,38 @@ class TaskService:
         return len(recovered_rows)
 
     def reconcile_failed_lease_recoveries(self, db: Session, *, limit: int = 50) -> int:
-        rows = (
+        candidate_rows = (
             db.query(AppDfaTask)
             .filter(
                 AppDfaTask.is_deleted.is_(False),
                 AppDfaTask.status == "error",
                 AppDfaTask.execution_owner_id.is_(None),
-                AppDfaTask.lease_lost_count == 0,
                 (
                     (AppDfaTask.lease_recovery_state == LEASE_RECOVERY_STATE_FAILED)
-                    | (
-                        AppDfaTask.latest_abnormal_reason_json.is_not(None)
-                        & (AppDfaTask.error.like("%Lost connection to MySQL server during query%"))
-                    )
+                    | (AppDfaTask.error.like("%Lost connection to MySQL server during query%"))
                 ),
             )
             .order_by(AppDfaTask.updated_at.desc(), AppDfaTask.id.desc())
-            .limit(max(1, int(limit or 50)))
+            .limit(max(1, int(limit or 50)) * 4)
             .all()
         )
+        rows: list[AppDfaTask] = []
+        for row in candidate_rows:
+            abnormal_reason = row.latest_abnormal_reason_json if isinstance(row.latest_abnormal_reason_json, dict) else {}
+            abnormal_reason_code = str(abnormal_reason.get("code") or "").strip()
+            mysql_disconnect = "Lost connection to MySQL server during query" in str(row.error or "")
+            expected_requeue = bool(
+                mysql_disconnect
+                and (
+                    abnormal_reason_code == "lease_lost"
+                    or int(row.lease_lost_count or 0) >= 1
+                    or str(row.lease_recovery_state or "") == LEASE_RECOVERY_STATE_FAILED
+                )
+            )
+            if str(row.lease_recovery_state or "") == LEASE_RECOVERY_STATE_FAILED or expected_requeue:
+                rows.append(row)
+            if len(rows) >= max(1, int(limit or 50)):
+                break
         repaired = 0
         for row in rows:
             row.status = "pending"

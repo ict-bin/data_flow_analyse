@@ -478,6 +478,33 @@ class TaskTimelineTests(unittest.TestCase):
         finally:
             db.close()
 
+    def test_reconcile_failed_lease_recoveries_requeues_error_sample_with_existing_lease_lost_count(self):
+        task_id = self._create_task()
+        db = self._session()
+        try:
+            row = db.query(AppDfaTask).filter_by(task_id=task_id).first()
+            row.status = "error"
+            row.error = "Lost connection to MySQL server during query"
+            row.lease_lost_count = 1
+            row.last_lease_lost_at = now_local()
+            row.latest_abnormal_reason_json = {
+                "code": "lease_lost",
+                "title": "任务租约丢失",
+                "status": "error",
+                "message": "Lost connection to MySQL server during query",
+            }
+            db.commit()
+
+            repaired = self.service.reconcile_failed_lease_recoveries(db, limit=10)
+
+            self.assertEqual(1, repaired)
+            payload = self.service.get_task(db, task_id)
+            self.assertEqual("pending", payload["status"])
+            self.assertEqual(2, payload["lease_lost_count"])
+            self.assertEqual("requeue_committed", payload["lease_recovery_state"])
+        finally:
+            db.close()
+
     def test_mark_database_failure_sets_explicit_reason(self):
         task_id = self._create_task()
         db = self._session()
