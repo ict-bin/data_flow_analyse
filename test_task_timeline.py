@@ -4,6 +4,8 @@ import unittest
 import os
 import asyncio
 import threading
+import time
+from datetime import timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -22,6 +24,7 @@ from app.api import tasks as tasks_api
 from app.db.models import AppDfaTask, AppDfaTaskEvent, Base
 from app.service import task_service as task_service_module
 from app.service.task_service import TaskService
+from app.time_utils import now_local
 
 
 class TaskTimelineTests(unittest.TestCase):
@@ -53,6 +56,13 @@ class TaskTimelineTests(unittest.TestCase):
 
     def _session(self):
         return self.Session()
+
+    def _db_generator(self):
+        db = self._session()
+        try:
+            yield db
+        finally:
+            db.close()
 
     def _build_client(self):
         app = FastAPI()
@@ -282,6 +292,205 @@ class TaskTimelineTests(unittest.TestCase):
             task_service_module._running_tasks.pop(task_id, None)
             task_service_module._running_task_contexts.pop(task_id, None)
             db.close()
+
+    def test_request_lease_requeue_requeues_task_and_records_timeline(self):
+        task_id = self._create_task()
+        db = self._session()
+        try:
+            row = db.query(AppDfaTask).filter_by(task_id=task_id).first()
+            row.status = "running"
+            row.execution_owner_id = "worker-a"
+            row.execution_epoch = 2
+            row.control_version = 3
+            row.dispatch_status = "running"
+            row.execution_lease_until = now_local() + timedelta(minutes=5)
+            row.latest_abnormal_reason_json = {
+                "code": "lease_lost",
+                "title": "任务租约丢失",
+                "terminal": True,
+            }
+            db.commit()
+
+            requeued = self.service.request_lease_requeue(
+                db,
+                task_id,
+                owner_id="worker-a",
+                epoch=2,
+                control_version=3,
+            )
+
+            self.assertTrue(requeued)
+            payload = self.service.get_task(db, task_id)
+            self.assertEqual("pending", payload["status"])
+            self.assertEqual("pending", payload["dispatch_status"])
+            self.assertIsNone(payload["execution_owner_id"])
+            self.assertEqual(1, payload["lease_lost_count"])
+            self.assertTrue(bool(payload["auto_requeue_pending"]))
+            self.assertEqual("lease_lost", payload["auto_requeue_reason"])
+            self.assertIsNone(payload["abnormal_reason"])
+            self.assertIsNone(payload["abnormal_reason_code"])
+            self.assertIsNotNone(payload["lease_requeue_not_before"])
+            timeline_types = [event["event_type"] for event in self.service.get_task_timeline(db, task_id)["events"]]
+            self.assertIn("task_lease_lost", timeline_types)
+            self.assertIn("task_auto_requeued_after_lease_lost", timeline_types)
+            self.assertIn("task_lease_requeue_waiting", timeline_types)
+        finally:
+            db.close()
+
+    def test_get_task_marks_auto_requeue_pending_without_current_abnormal_reason(self):
+        task_id = self._create_task()
+        db = self._session()
+        try:
+            row = db.query(AppDfaTask).filter_by(task_id=task_id).first()
+            row.status = "pending"
+            row.dispatch_status = "pending"
+            row.lease_lost_count = 2
+            row.last_lease_lost_at = now_local()
+            row.lease_requeue_not_before = now_local() + timedelta(seconds=45)
+            row.latest_abnormal_reason_json = {
+                "code": "lease_lost",
+                "title": "任务租约丢失",
+                "terminal": True,
+            }
+            db.commit()
+
+            payload = self.service.get_task(db, task_id)
+
+            self.assertTrue(bool(payload["auto_requeue_pending"]))
+            self.assertEqual("lease_lost", payload["auto_requeue_reason"])
+            self.assertIsNone(payload["abnormal_reason"])
+            self.assertIsNone(payload["abnormal_reason_title"])
+            self.assertIsNone(payload["abnormal_reason_code"])
+            self.assertEqual(2, payload["lease_lost_count"])
+            self.assertIsNotNone(payload["lease_requeue_not_before"])
+        finally:
+            db.close()
+
+    def test_get_task_includes_local_lease_renew_diagnostics(self):
+        task_id = self._create_task()
+        fake_ctx = task_service_module._RunningTaskContext(
+            lease_renew_failure_count=3,
+            last_lease_error="lease_renew_failed",
+            last_lease_renew_success_at=now_local().timestamp(),
+        )
+        task_service_module._running_task_contexts[task_id] = fake_ctx
+        task_service_module._running_tasks[task_id] = fake_ctx
+        db = self._session()
+        try:
+            payload = self.service.get_task(db, task_id)
+            self.assertEqual(3, payload["lease_renew_failure_count"])
+            self.assertEqual("lease_renew_failed", payload["last_lease_renew_error"])
+            self.assertIsNotNone(payload["last_lease_renew_success_at"])
+        finally:
+            task_service_module._running_tasks.pop(task_id, None)
+            task_service_module._running_task_contexts.pop(task_id, None)
+            db.close()
+
+    def test_lease_heartbeat_failure_before_ttl_does_not_requeue(self):
+        task_id = self._create_task()
+        db = self._session()
+        try:
+            row = db.query(AppDfaTask).filter_by(task_id=task_id).first()
+            row.status = "running"
+            row.execution_owner_id = task_service_module.WORKER_ID
+            row.execution_epoch = 2
+            row.control_version = 5
+            row.dispatch_status = "running"
+            row.execution_lease_until = now_local() + timedelta(minutes=3)
+            db.commit()
+        finally:
+            db.close()
+
+        fake_ctx = task_service_module._RunningTaskContext(
+            cancel_requested=threading.Event(),
+            lease_stop_requested=threading.Event(),
+        )
+        task_service_module._running_task_contexts[task_id] = fake_ctx
+        task_service_module._running_tasks[task_id] = fake_ctx
+        on_lease_lost_calls: list[str] = []
+
+        try:
+            with patch("app.service.task_service.HEARTBEAT_INTERVAL_SECONDS", 0.01), patch(
+                "app.service.task_service.renew_lease", return_value=False
+            ), patch("app.service.task_service.still_owner", return_value=True), patch(
+                "app.db.get_db", side_effect=lambda: self._db_generator()
+            ):
+                thread = task_service_module._start_task_lease_heartbeat(
+                    task_id,
+                    epoch=2,
+                    control_version=5,
+                    on_lease_lost=lambda _db: on_lease_lost_calls.append("lost"),
+                )
+                deadline = time.time() + 2
+                while fake_ctx.lease_renew_failure_count < 1 and time.time() < deadline:
+                    time.sleep(0.01)
+                fake_ctx.lease_stop_requested.set()
+                thread.join(timeout=2)
+
+            self.assertEqual([], on_lease_lost_calls)
+            self.assertGreaterEqual(fake_ctx.lease_renew_failure_count, 1)
+            self.assertEqual("lease_renew_failed", fake_ctx.last_lease_error)
+            db = self._session()
+            try:
+                row = db.query(AppDfaTask).filter_by(task_id=task_id).first()
+                self.assertEqual("running", row.status)
+                self.assertEqual(task_service_module.WORKER_ID, row.execution_owner_id)
+            finally:
+                db.close()
+        finally:
+            task_service_module._running_tasks.pop(task_id, None)
+            task_service_module._running_task_contexts.pop(task_id, None)
+
+    def test_lease_heartbeat_expired_ttl_triggers_requeue(self):
+        task_id = self._create_task()
+        db = self._session()
+        try:
+            row = db.query(AppDfaTask).filter_by(task_id=task_id).first()
+            row.status = "running"
+            row.execution_owner_id = task_service_module.WORKER_ID
+            row.execution_epoch = 4
+            row.control_version = 6
+            row.dispatch_status = "running"
+            row.execution_lease_until = now_local() - timedelta(seconds=5)
+            db.commit()
+        finally:
+            db.close()
+
+        fake_ctx = task_service_module._RunningTaskContext(
+            cancel_requested=threading.Event(),
+            lease_stop_requested=threading.Event(),
+        )
+        task_service_module._running_task_contexts[task_id] = fake_ctx
+        task_service_module._running_tasks[task_id] = fake_ctx
+        on_lease_lost_calls: list[str] = []
+
+        try:
+            with patch("app.service.task_service.HEARTBEAT_INTERVAL_SECONDS", 0.01), patch(
+                "app.service.task_service.renew_lease", return_value=False
+            ), patch("app.service.task_service.still_owner", return_value=False), patch(
+                "app.db.get_db", side_effect=lambda: self._db_generator()
+            ):
+                thread = task_service_module._start_task_lease_heartbeat(
+                    task_id,
+                    epoch=4,
+                    control_version=6,
+                    on_lease_lost=lambda _db: on_lease_lost_calls.append("lost"),
+                )
+                deadline = time.time() + 2
+                while not on_lease_lost_calls and time.time() < deadline:
+                    time.sleep(0.01)
+                thread.join(timeout=2)
+
+            self.assertEqual(["lost"], on_lease_lost_calls)
+            db = self._session()
+            try:
+                timeline_types = [event.event_type for event in db.query(AppDfaTaskEvent).filter_by(task_id=task_id).all()]
+                self.assertIn("task_lease_lost", timeline_types)
+            finally:
+                db.close()
+        finally:
+            task_service_module._running_tasks.pop(task_id, None)
+            task_service_module._running_task_contexts.pop(task_id, None)
 
     def test_delete_task_records_task_deleted_event_before_soft_delete(self):
         task_id = self._create_task()

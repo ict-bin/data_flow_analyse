@@ -31,19 +31,26 @@ from app.db.models import AppDfaTask, AppDfaTaskEvent
 from app.logging_utils import log_event
 from app.models import SwarmEvent, TaskStatus
 from app.orchestrator import Orchestrator
-from app.runtime_context import HEARTBEAT_INTERVAL_SECONDS, WORKER_ID, MAX_LOCAL_RUNNING_TASKS
+from app.runtime_context import (
+    HEARTBEAT_INTERVAL_SECONDS,
+    LEASE_TTL_SECONDS,
+    LEASE_REQUEUE_DELAY_SECONDS,
+    MAX_LOCAL_RUNNING_TASKS,
+    WORKER_ID,
+)
 from app.service.execution_coordinator import (
     begin_execution_if_owner,
     claim_one_runnable_task,
     commit_terminal_state_if_owner,
     load_execution_snapshot,
     recover_running_task_if_owner,
+    reclaim_orphaned_running_tasks,
     release_lease,
     renew_lease,
     still_owner,
 )
 from app.service.session_index import build_session_catalog
-from app.time_utils import isoformat_local, now_local
+from app.time_utils import UTC_PLUS_8, isoformat_local, now_local
 from app.agent_process import cleanup_orphan_pi_processes, cleanup_task_agent_processes
 
 logger = logging.getLogger("dfa.task_service")
@@ -56,6 +63,7 @@ TASK_EVENT_SOURCE_DFA = "dfa"
 TASK_EVENT_RENEW_INTERVAL_SECONDS = max(60, HEARTBEAT_INTERVAL_SECONDS * 6)
 EXECUTION_SUPERVISOR_INTERVAL_SECONDS = float(os.environ.get("DFA_EXECUTION_SUPERVISOR_INTERVAL_SECONDS", "5"))
 EXECUTION_NO_PROGRESS_SECONDS = float(os.environ.get("DFA_EXECUTION_NO_PROGRESS_SECONDS", "120"))
+AUTO_REQUEUE_REASON_LEASE_LOST = "lease_lost"
 
 _RUNNING_TASK_LOCK = threading.RLock()
 _running_tasks: dict[str, "_RunningTaskContext"] = {}
@@ -75,6 +83,9 @@ class _RunningTaskContext:
     last_lease_heartbeat_at: float = 0.0
     last_state_sync_at: float = 0.0
     last_lease_error: str | None = None
+    lease_renew_failure_count: int = 0
+    last_lease_renew_attempt_at: float = 0.0
+    last_lease_renew_success_at: float = 0.0
     termination_reason: str | None = None
     cancel_requested: threading.Event = field(default_factory=threading.Event)
     lease_stop_requested: threading.Event = field(default_factory=threading.Event)
@@ -340,6 +351,7 @@ def _start_task_lease_heartbeat(
         from app.metrics import observe_local_event
 
         last_timeline_renew_at = 0.0
+        last_renew_failure_event_at = 0.0
         while True:
             ctx = _get_running_task_context(task_id)
             if ctx is None or ctx.lease_stop_requested.is_set():
@@ -349,71 +361,116 @@ def _start_task_lease_heartbeat(
             _hb_gen = get_db()
             _hb_db: Session = next(_hb_gen)
             try:
-                ok = renew_lease(_hb_db, task_id, WORKER_ID, epoch)
                 current_ts = _time.time()
                 if ctx is not None:
-                    ctx.last_lease_heartbeat_at = current_ts
-                    ctx.last_state_sync_at = current_ts
-                    ctx.last_lease_error = None
-                if not ok or not still_owner(_hb_db, task_id, WORKER_ID, epoch, control_version):
-                    observe_local_event("lease_renew", "failed")
-                    if ctx is not None:
-                        ctx.last_lease_error = "lease_lost"
-                        ctx.termination_reason = "lease_lost"
-                    log_event(
-                        logger,
-                        logging.WARNING,
-                        "lease lost during threaded heartbeat, aborting task",
-                        event="task_lease_lost",
-                        task_id=task_id,
-                        owner_id=WORKER_ID,
-                        epoch=epoch,
+                    ctx.last_lease_renew_attempt_at = current_ts
+                snapshot = load_execution_snapshot(_hb_db, task_id)
+                lease_until = snapshot.execution_lease_until if snapshot is not None else None
+                lease_expired = lease_until is None or lease_until <= now_local()
+                ok = renew_lease(_hb_db, task_id, WORKER_ID, epoch)
+                if ok:
+                    owner_ok = still_owner(_hb_db, task_id, WORKER_ID, epoch, control_version)
+                    if owner_ok:
+                        observe_local_event("lease_renew", "success")
+                        if ctx is not None:
+                            ctx.last_lease_heartbeat_at = current_ts
+                            ctx.last_state_sync_at = current_ts
+                            ctx.last_lease_error = None
+                            ctx.lease_renew_failure_count = 0
+                            ctx.last_lease_renew_success_at = current_ts
+                        if current_ts - last_timeline_renew_at >= TASK_EVENT_RENEW_INTERVAL_SECONDS:
+                            lease_row = _hb_db.query(AppDfaTask).filter_by(task_id=task_id).first()
+                            if lease_row is not None:
+                                _record_task_event(
+                                    _hb_db,
+                                    row=lease_row,
+                                    event_type="task_lease_renewed",
+                                    message="任务租约续约成功",
+                                    status=lease_row.status,
+                                    worker_id=WORKER_ID,
+                                    execution_owner_id=WORKER_ID,
+                                    execution_epoch=epoch,
+                                    control_version=control_version,
+                                    payload={
+                                        "owner_id": WORKER_ID,
+                                        "epoch": epoch,
+                                        "control_version": control_version,
+                                        "lease_until": isoformat_local(lease_row.execution_lease_until),
+                                    },
+                                )
+                                _hb_db.commit()
+                                last_timeline_renew_at = current_ts
+                        continue
+
+                observe_local_event("lease_renew", "failed")
+                if ctx is not None:
+                    ctx.lease_renew_failure_count += 1
+                    ctx.last_lease_error = "lease_renew_failed" if not lease_expired else "lease_lost"
+                failure_payload = {
+                    "owner_id": WORKER_ID,
+                    "epoch": epoch,
+                    "control_version": control_version,
+                    "failure_count": int(ctx.lease_renew_failure_count if ctx is not None else 1),
+                    "lease_until": isoformat_local(lease_until),
+                    "heartbeat_interval_seconds": HEARTBEAT_INTERVAL_SECONDS,
+                    "lease_ttl_seconds": LEASE_TTL_SECONDS,
+                    "error": (ctx.last_lease_error if ctx is not None else "lease_renew_failed"),
+                }
+                if not lease_expired:
+                    if current_ts - last_renew_failure_event_at >= TASK_EVENT_RENEW_INTERVAL_SECONDS:
+                        renew_failed_row = _hb_db.query(AppDfaTask).filter_by(task_id=task_id).first()
+                        if renew_failed_row is not None:
+                            _record_task_event(
+                                _hb_db,
+                                row=renew_failed_row,
+                                event_type="task_lease_renew_failed",
+                                message="任务租约续租失败，但租约尚未过期，将继续重试",
+                                level="warning",
+                                status=renew_failed_row.status,
+                                worker_id=WORKER_ID,
+                                execution_owner_id=WORKER_ID,
+                                execution_epoch=epoch,
+                                control_version=control_version,
+                                payload=failure_payload,
+                            )
+                            _hb_db.commit()
+                            last_renew_failure_event_at = current_ts
+                    continue
+
+                if ctx is not None:
+                    ctx.termination_reason = "lease_lost"
+                log_event(
+                    logger,
+                    logging.WARNING,
+                    "lease expired during threaded heartbeat, aborting task",
+                    event="task_lease_lost",
+                    task_id=task_id,
+                    owner_id=WORKER_ID,
+                    epoch=epoch,
+                    control_version=control_version,
+                )
+                lost_row = _hb_db.query(AppDfaTask).filter_by(task_id=task_id).first()
+                if lost_row is not None:
+                    _record_task_event(
+                        _hb_db,
+                        row=lost_row,
+                        event_type="task_lease_lost",
+                        message="任务租约已超过超期窗口，判定为 lease_lost",
+                        level="warning",
+                        status=lost_row.status,
+                        worker_id=WORKER_ID,
+                        execution_owner_id=WORKER_ID,
+                        execution_epoch=epoch,
                         control_version=control_version,
+                        payload=failure_payload,
                     )
-                    lost_row = _hb_db.query(AppDfaTask).filter_by(task_id=task_id).first()
-                    if lost_row is not None:
-                        _record_task_event(
-                            _hb_db,
-                            row=lost_row,
-                            event_type="task_lease_lost",
-                            message="任务心跳续租失败，租约已丢失",
-                            level="warning",
-                            status=lost_row.status,
-                            worker_id=WORKER_ID,
-                            execution_owner_id=WORKER_ID,
-                            execution_epoch=epoch,
-                            control_version=control_version,
-                            payload={"owner_id": WORKER_ID, "epoch": epoch, "control_version": control_version},
-                        )
-                        _hb_db.commit()
-                    on_lease_lost()
-                    return
-                observe_local_event("lease_renew", "success")
-                if current_ts - last_timeline_renew_at >= TASK_EVENT_RENEW_INTERVAL_SECONDS:
-                    lease_row = _hb_db.query(AppDfaTask).filter_by(task_id=task_id).first()
-                    if lease_row is not None:
-                        _record_task_event(
-                            _hb_db,
-                            row=lease_row,
-                            event_type="task_lease_renewed",
-                            message="任务租约续约成功",
-                            status=lease_row.status,
-                            worker_id=WORKER_ID,
-                            execution_owner_id=WORKER_ID,
-                            execution_epoch=epoch,
-                            control_version=control_version,
-                            payload={
-                                "owner_id": WORKER_ID,
-                                "epoch": epoch,
-                                "control_version": control_version,
-                                "lease_until": isoformat_local(lease_row.execution_lease_until),
-                            },
-                        )
-                        _hb_db.commit()
-                        last_timeline_renew_at = current_ts
+                    _hb_db.commit()
+                on_lease_lost(_hb_db)
+                return
             except Exception as exc:
                 observe_local_event("lease_renew", "thread_error")
                 if ctx is not None:
+                    ctx.lease_renew_failure_count += 1
                     ctx.last_lease_error = str(exc)
             finally:
                 try:
@@ -600,6 +657,14 @@ def _sync_task_abnormal_reason(row: AppDfaTask) -> tuple[dict | None, bool]:
         row.latest_abnormal_reason_json = next_payload
         flag_modified(row, "latest_abnormal_reason_json")
     return next_payload, changed
+
+
+def _auto_requeue_pending(row: AppDfaTask) -> bool:
+    return bool(
+        str(row.status or "") == "pending"
+        and row.lease_requeue_not_before is not None
+        and row.lease_requeue_not_before > now_local()
+    )
 
 
 def _record_abnormal_reason(row: AppDfaTask, reason: dict | None, *, changed: bool) -> None:
@@ -1392,6 +1457,87 @@ class TaskService:
             ctx.orch.abort()
         return True
 
+    def request_lease_requeue(
+        self,
+        db: Session,
+        task_id: str,
+        *,
+        owner_id: str,
+        epoch: int,
+        control_version: int,
+        recovery_reason: str = AUTO_REQUEUE_REASON_LEASE_LOST,
+    ) -> bool:
+        ctx = _get_running_task_context(task_id)
+        if ctx is not None:
+            ctx.termination_reason = recovery_reason
+            ctx.cancel_requested.set()
+            if ctx.orch is not None:
+                ctx.orch.abort()
+        row = db.query(AppDfaTask).filter_by(task_id=task_id).first()
+        if row is None:
+            return False
+        recovered = recover_running_task_if_owner(
+            db,
+            task_id,
+            owner_id,
+            epoch,
+            control_version,
+            reason=recovery_reason,
+        )
+        if not recovered:
+            return False
+        refreshed = db.query(AppDfaTask).filter_by(task_id=task_id).first()
+        if refreshed is None:
+            return False
+        payload = {
+            "owner_id": owner_id,
+            "epoch": epoch,
+            "control_version": control_version,
+            "lease_lost_count": int(refreshed.lease_lost_count or 0),
+            "lease_requeue_not_before": isoformat_local(refreshed.lease_requeue_not_before),
+            "recovery_reason": recovery_reason,
+        }
+        _record_task_event(
+            db,
+            row=refreshed,
+            event_type="task_lease_lost",
+            message="任务心跳续租失败，租约已丢失",
+            level="warning",
+            status=refreshed.status,
+            dispatch_status=refreshed.dispatch_status,
+            worker_id=owner_id,
+            execution_owner_id=owner_id,
+            execution_epoch=epoch,
+            control_version=control_version,
+            payload=payload,
+        )
+        _record_task_event(
+            db,
+            row=refreshed,
+            event_type="task_auto_requeued_after_lease_lost",
+            message="任务因租约丢失已自动回退为 pending",
+            level="warning",
+            status=refreshed.status,
+            dispatch_status=refreshed.dispatch_status,
+            worker_id=owner_id,
+            execution_owner_id=owner_id,
+            execution_epoch=epoch,
+            control_version=control_version,
+            payload=payload,
+        )
+        _record_task_event(
+            db,
+            row=refreshed,
+            event_type="task_lease_requeue_waiting",
+            message=f"任务等待自动重排队，固定退避 {LEASE_REQUEUE_DELAY_SECONDS}s",
+            level="info",
+            status=refreshed.status,
+            dispatch_status=refreshed.dispatch_status,
+            payload=payload,
+        )
+        db.commit()
+        return True
+
     def supervisor_status(self) -> dict[str, object]:
         return {
             "thread_alive": bool(self._supervisor_thread and self._supervisor_thread.is_alive()),
@@ -1458,8 +1604,6 @@ class TaskService:
         self._supervisor_stop.set()
 
     def reconcile_orphaned_running_tasks(self, db: Session, *, limit: int = 100) -> int:
-        from app.service.execution_coordinator import reclaim_orphaned_running_tasks
-
         recovered = reclaim_orphaned_running_tasks(db, limit=limit)
         for item in recovered:
             row = db.query(AppDfaTask).filter_by(task_id=item.task_id).first()
@@ -1470,12 +1614,14 @@ class TaskService:
                 "previous_dispatch_status": item.previous_dispatch_status,
                 "previous_lease_until": isoformat_local(item.previous_lease_until),
                 "recovery_reason": item.reason,
+                "lease_lost_count": int(row.lease_lost_count or 0),
+                "lease_requeue_not_before": isoformat_local(row.lease_requeue_not_before),
             }
             _record_task_event(
                 db,
                 row=row,
-                event_type="task_running_recovered",
-                message="后台巡检发现孤儿 running 任务，已回退为 pending",
+                event_type="task_lease_lost",
+                message="后台巡检发现任务租约丢失，已自动恢复",
                 level="warning",
                 status=row.status,
                 dispatch_status=row.dispatch_status,
@@ -1484,8 +1630,18 @@ class TaskService:
             _record_task_event(
                 db,
                 row=row,
-                event_type="task_requeued_after_orphaned_running",
-                message="孤儿 running 任务已重新排入调度队列",
+                event_type="task_auto_requeued_after_lease_lost",
+                message="孤儿 running 任务已自动回退为 pending",
+                level="warning",
+                status=row.status,
+                dispatch_status=row.dispatch_status,
+                payload=payload,
+            )
+            _record_task_event(
+                db,
+                row=row,
+                event_type="task_lease_requeue_waiting",
+                message=f"任务等待自动重排队，固定退避 {LEASE_REQUEUE_DELAY_SECONDS}s",
                 level="warning",
                 status=row.status,
                 dispatch_status=row.dispatch_status,
@@ -1908,6 +2064,11 @@ class TaskService:
             execution_epoch=0,
             control_version=0,
             dispatch_status="pending",
+            lease_lost_count=0,
+            last_lease_lost_at=None,
+            lease_requeue_not_before=None,
+            last_lease_lost_epoch=None,
+            last_lease_lost_control_version=None,
         )
         db.add(row); db.commit(); db.refresh(row)
         _record_task_event(
@@ -1951,6 +2112,11 @@ class TaskService:
         row.execution_heartbeat_at = None
         row.control_version = int(row.control_version or 0) + 1
         row.dispatch_status = "pending"
+        row.lease_lost_count = 0
+        row.last_lease_lost_at = None
+        row.lease_requeue_not_before = None
+        row.last_lease_lost_epoch = None
+        row.last_lease_lost_control_version = None
         flag_modified(row, "task_config_json")
         flag_modified(row, "latest_abnormal_reason_json")
         db.commit(); db.refresh(row)
@@ -1996,6 +2162,11 @@ class TaskService:
         row.execution_heartbeat_at = None
         row.control_version = int(row.control_version or 0) + 1
         row.dispatch_status = "pending"
+        row.lease_lost_count = 0
+        row.last_lease_lost_at = None
+        row.lease_requeue_not_before = None
+        row.last_lease_lost_epoch = None
+        row.last_lease_lost_control_version = None
         flag_modified(row, "task_config_json")
         flag_modified(row, "latest_abnormal_reason_json")
         db.commit(); db.refresh(row)
@@ -2499,7 +2670,14 @@ class TaskService:
                     task_id,
                     epoch=epoch,
                     control_version=control_version,
-                    on_lease_lost=lambda: self.request_cancel(task_id, reason="lease_lost"),
+                    on_lease_lost=lambda lease_db: self.request_lease_requeue(
+                        lease_db,
+                        task_id,
+                        owner_id=WORKER_ID,
+                        epoch=epoch,
+                        control_version=control_version,
+                        recovery_reason=AUTO_REQUEUE_REASON_LEASE_LOST,
+                    ),
                 )
             result = await orch.execute_recursive(
                 task_id,
@@ -2866,6 +3044,11 @@ class TaskService:
                 AppDfaTask.execution_epoch,
                 AppDfaTask.control_version,
                 AppDfaTask.dispatch_status,
+                AppDfaTask.lease_lost_count,
+                AppDfaTask.last_lease_lost_at,
+                AppDfaTask.lease_requeue_not_before,
+                AppDfaTask.last_lease_lost_epoch,
+                AppDfaTask.last_lease_lost_control_version,
             ),
         )
 
@@ -2874,9 +3057,11 @@ class TaskService:
         def fmt(dt: datetime | None) -> str | None:
             return isoformat_local(dt)
         abnormal_reason = _task_abnormal_reason(row)
+        auto_requeue_pending = _auto_requeue_pending(row)
         task_root = str(Path(row.output_path) / row.task_id) if row.output_path else None
         run_root = str(Path(task_root) / "run") if task_root else None
         workspace_root = str(Path(run_root) / "epochs") if run_root else None
+        ctx = _get_running_task_context(row.task_id)
         return {
             **_origin_payload(row),
             "task_id": row.task_id, "project_id": row.project_id,
@@ -2913,11 +3098,25 @@ class TaskService:
             "execution_epoch": int(row.execution_epoch or 0),
             "control_version": int(row.control_version or 0),
             "dispatch_status": row.dispatch_status,
-            "abnormal_reason": abnormal_reason,
+            "lease_lost_count": int(row.lease_lost_count or 0),
+            "last_lease_lost_at": fmt(row.last_lease_lost_at),
+            "lease_requeue_not_before": fmt(row.lease_requeue_not_before),
+            "last_lease_lost_epoch": row.last_lease_lost_epoch,
+            "last_lease_lost_control_version": row.last_lease_lost_control_version,
+            "lease_renew_failure_count": int(ctx.lease_renew_failure_count if ctx is not None else 0),
+            "last_lease_renew_success_at": (
+                isoformat_local(datetime.fromtimestamp(ctx.last_lease_renew_success_at, tz=UTC_PLUS_8).replace(tzinfo=None))
+                if ctx is not None and ctx.last_lease_renew_success_at > 0
+                else None
+            ),
+            "last_lease_renew_error": ctx.last_lease_error if ctx is not None else None,
+            "auto_requeue_pending": auto_requeue_pending,
+            "auto_requeue_reason": AUTO_REQUEUE_REASON_LEASE_LOST if auto_requeue_pending else None,
+            "abnormal_reason": None if auto_requeue_pending else abnormal_reason,
             "abnormal_reason_history": _abnormal_reason_history(row) if include_heavy else [],
-            "abnormal_reason_title": (abnormal_reason or {}).get("title"),
-            "abnormal_reason_code": (abnormal_reason or {}).get("code"),
-            "abnormal_reason_category": (abnormal_reason or {}).get("category"),
+            "abnormal_reason_title": None if auto_requeue_pending else (abnormal_reason or {}).get("title"),
+            "abnormal_reason_code": None if auto_requeue_pending else (abnormal_reason or {}).get("code"),
+            "abnormal_reason_category": None if auto_requeue_pending else (abnormal_reason or {}).get("category"),
         }
 
 
