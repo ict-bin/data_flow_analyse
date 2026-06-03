@@ -191,6 +191,36 @@ _MIGRATIONS = [
         statement="ALTER TABLE secflow_app_dfa_tasks ADD COLUMN dispatch_status VARCHAR(32) NULL",
     ),
     Migration(
+        kind="column",
+        table_name="secflow_app_dfa_tasks",
+        name="lease_lost_count",
+        statement="ALTER TABLE secflow_app_dfa_tasks ADD COLUMN lease_lost_count INT NOT NULL DEFAULT 0",
+    ),
+    Migration(
+        kind="column",
+        table_name="secflow_app_dfa_tasks",
+        name="last_lease_lost_at",
+        statement="ALTER TABLE secflow_app_dfa_tasks ADD COLUMN last_lease_lost_at DATETIME NULL",
+    ),
+    Migration(
+        kind="column",
+        table_name="secflow_app_dfa_tasks",
+        name="lease_requeue_not_before",
+        statement="ALTER TABLE secflow_app_dfa_tasks ADD COLUMN lease_requeue_not_before DATETIME NULL",
+    ),
+    Migration(
+        kind="column",
+        table_name="secflow_app_dfa_tasks",
+        name="last_lease_lost_epoch",
+        statement="ALTER TABLE secflow_app_dfa_tasks ADD COLUMN last_lease_lost_epoch INT NULL",
+    ),
+    Migration(
+        kind="column",
+        table_name="secflow_app_dfa_tasks",
+        name="last_lease_lost_control_version",
+        statement="ALTER TABLE secflow_app_dfa_tasks ADD COLUMN last_lease_lost_control_version INT NULL",
+    ),
+    Migration(
         kind="index",
         table_name="secflow_app_dfa_tasks",
         name="ix_dfa_tasks_project_deleted_created_id",
@@ -219,6 +249,12 @@ _MIGRATIONS = [
         table_name="secflow_app_dfa_tasks",
         name="ix_dfa_tasks_owner",
         statement="CREATE INDEX ix_dfa_tasks_owner ON secflow_app_dfa_tasks (execution_owner_id, status)",
+    ),
+    Migration(
+        kind="index",
+        table_name="secflow_app_dfa_tasks",
+        name="ix_dfa_tasks_lease_requeue_not_before",
+        statement="CREATE INDEX ix_dfa_tasks_lease_requeue_not_before ON secflow_app_dfa_tasks (lease_requeue_not_before)",
     ),
 ]
 

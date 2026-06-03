@@ -18,6 +18,7 @@ from app.service.execution_coordinator import (
     renew_lease,
     still_owner,
 )
+from app.runtime_context import LEASE_REQUEUE_DELAY_SECONDS
 from app.time_utils import now_local
 
 
@@ -46,6 +47,11 @@ class ExecutionCoordinatorTests(unittest.TestCase):
                 execution_epoch=kwargs.get("execution_epoch", 0),
                 control_version=kwargs.get("control_version", 0),
                 dispatch_status=kwargs.get("dispatch_status"),
+                lease_lost_count=kwargs.get("lease_lost_count", 0),
+                last_lease_lost_at=kwargs.get("last_lease_lost_at"),
+                lease_requeue_not_before=kwargs.get("lease_requeue_not_before"),
+                last_lease_lost_epoch=kwargs.get("last_lease_lost_epoch"),
+                last_lease_lost_control_version=kwargs.get("last_lease_lost_control_version"),
             )
             db.add(row)
             db.commit()
@@ -208,6 +214,29 @@ class ExecutionCoordinatorTests(unittest.TestCase):
             self.assertIsNone(row.execution_owner_id)
             self.assertIsNone(row.execution_lease_until)
             self.assertIsNone(row.execution_heartbeat_at)
+            self.assertEqual(1, int(row.lease_lost_count or 0))
+            self.assertIsNotNone(row.last_lease_lost_at)
+            self.assertIsNotNone(row.lease_requeue_not_before)
+            self.assertEqual(2, int(row.last_lease_lost_epoch or 0))
+            self.assertEqual(3, int(row.last_lease_lost_control_version or 0))
+            self.assertEqual(3, int(row.execution_epoch or 0))
+            self.assertGreaterEqual(
+                (row.lease_requeue_not_before - row.last_lease_lost_at).total_seconds(),
+                LEASE_REQUEUE_DELAY_SECONDS - 1,
+            )
+        finally:
+            db.close()
+
+    def test_claim_skips_task_during_lease_requeue_backoff(self):
+        now = now_local()
+        self._insert_task(
+            execution_lease_until=None,
+            lease_requeue_not_before=now + timedelta(seconds=30),
+        )
+        db = self._session()
+        try:
+            claimed = claim_one_runnable_task(db, "pod-a")
+            self.assertIsNone(claimed)
         finally:
             db.close()
 
@@ -242,9 +271,13 @@ class ExecutionCoordinatorTests(unittest.TestCase):
             self.assertEqual(rows["dfa_missing_owner"].status, "pending")
             self.assertEqual(rows["dfa_missing_owner"].dispatch_status, "pending")
             self.assertIsNone(rows["dfa_missing_owner"].execution_owner_id)
+            self.assertEqual(1, int(rows["dfa_missing_owner"].lease_lost_count or 0))
+            self.assertIsNotNone(rows["dfa_missing_owner"].lease_requeue_not_before)
             self.assertEqual(rows["dfa_expired_lease"].status, "pending")
             self.assertEqual(rows["dfa_expired_lease"].dispatch_status, "pending")
             self.assertIsNone(rows["dfa_expired_lease"].execution_owner_id)
+            self.assertEqual(1, int(rows["dfa_expired_lease"].lease_lost_count or 0))
+            self.assertIsNotNone(rows["dfa_expired_lease"].lease_requeue_not_before)
         finally:
             db.close()
 

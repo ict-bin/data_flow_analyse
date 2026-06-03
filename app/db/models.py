@@ -64,6 +64,11 @@ class AppDfaTask(Base):
     execution_epoch: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     control_version: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     dispatch_status: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
+    lease_lost_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    last_lease_lost_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    lease_requeue_not_before: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True, index=True)
+    last_lease_lost_epoch: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    last_lease_lost_control_version: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
 
     is_deleted: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
 

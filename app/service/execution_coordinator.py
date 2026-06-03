@@ -6,7 +6,7 @@ from datetime import timedelta
 from sqlalchemy.orm import Session
 
 from app.db.models import AppDfaTask
-from app.runtime_context import LEASE_TTL_SECONDS
+from app.runtime_context import LEASE_REQUEUE_DELAY_SECONDS, LEASE_TTL_SECONDS
 from app.time_utils import now_local
 
 
@@ -39,6 +39,10 @@ class RecoveredRunningTask:
     reason: str
 
 
+def _lease_requeue_deadline(base_time=None):
+    return (base_time or now_local()) + timedelta(seconds=LEASE_REQUEUE_DELAY_SECONDS)
+
+
 def _lease_deadline():
     return now_local() + timedelta(seconds=LEASE_TTL_SECONDS)
 
@@ -50,6 +54,10 @@ def claim_one_runnable_task(db: Session, owner_id: str) -> ClaimedTask | None:
         .filter(
             AppDfaTask.is_deleted.is_(False),
             AppDfaTask.status.in_(["pending", "running"]),
+            (
+                (AppDfaTask.lease_requeue_not_before.is_(None))
+                | (AppDfaTask.lease_requeue_not_before <= now)
+            ),
             ((AppDfaTask.execution_lease_until.is_(None)) | (AppDfaTask.execution_lease_until < now)),
         )
         .order_by(AppDfaTask.status.asc(), AppDfaTask.created_at.asc(), AppDfaTask.id.asc())
@@ -65,6 +73,7 @@ def claim_one_runnable_task(db: Session, owner_id: str) -> ClaimedTask | None:
         AppDfaTask.execution_heartbeat_at: now,
         AppDfaTask.execution_epoch: int(candidate.execution_epoch or 0) + 1,
         AppDfaTask.dispatch_status: "leased",
+        AppDfaTask.lease_requeue_not_before: None,
     }
     if expected_status == "running":
         # Reclaimed tasks lost their worker lease during rollout/crash; make them
@@ -77,6 +86,10 @@ def claim_one_runnable_task(db: Session, owner_id: str) -> ClaimedTask | None:
             AppDfaTask.id == candidate.id,
             AppDfaTask.is_deleted.is_(False),
             AppDfaTask.status == expected_status,
+            (
+                (AppDfaTask.lease_requeue_not_before.is_(None))
+                | (AppDfaTask.lease_requeue_not_before <= now)
+            ),
             ((AppDfaTask.execution_lease_until.is_(None)) | (AppDfaTask.execution_lease_until < now)),
         )
         .update(
@@ -151,6 +164,7 @@ def recover_running_task_if_owner(
     *,
     reason: str = "owner_cleanup",
 ) -> bool:
+    now = now_local()
     updated = (
         db.query(AppDfaTask)
         .filter(
@@ -168,6 +182,15 @@ def recover_running_task_if_owner(
                 AppDfaTask.execution_lease_until: None,
                 AppDfaTask.execution_heartbeat_at: None,
                 AppDfaTask.dispatch_status: "pending",
+                AppDfaTask.finished_at: None,
+                AppDfaTask.error: None,
+                AppDfaTask.latest_abnormal_reason_json: None,
+                AppDfaTask.lease_lost_count: AppDfaTask.lease_lost_count + 1,
+                AppDfaTask.last_lease_lost_at: now,
+                AppDfaTask.lease_requeue_not_before: _lease_requeue_deadline(now),
+                AppDfaTask.last_lease_lost_epoch: epoch,
+                AppDfaTask.last_lease_lost_control_version: control_version,
+                AppDfaTask.execution_epoch: int(epoch) + 1,
             },
             synchronize_session=False,
         )
@@ -215,6 +238,15 @@ def reclaim_orphaned_running_tasks(db: Session, *, limit: int = 100) -> list[Rec
                     AppDfaTask.execution_lease_until: None,
                     AppDfaTask.execution_heartbeat_at: None,
                     AppDfaTask.dispatch_status: "pending",
+                    AppDfaTask.finished_at: None,
+                    AppDfaTask.error: None,
+                    AppDfaTask.latest_abnormal_reason_json: None,
+                    AppDfaTask.lease_lost_count: AppDfaTask.lease_lost_count + 1,
+                    AppDfaTask.last_lease_lost_at: now,
+                    AppDfaTask.lease_requeue_not_before: _lease_requeue_deadline(now),
+                    AppDfaTask.last_lease_lost_epoch: AppDfaTask.execution_epoch,
+                    AppDfaTask.last_lease_lost_control_version: AppDfaTask.control_version,
+                    AppDfaTask.execution_epoch: AppDfaTask.execution_epoch + 1,
                 },
                 synchronize_session=False,
             )
