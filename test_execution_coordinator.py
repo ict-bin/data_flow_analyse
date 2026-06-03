@@ -13,6 +13,7 @@ from app.service.execution_coordinator import (
     begin_execution_if_owner,
     claim_one_runnable_task,
     commit_terminal_state_if_owner,
+    list_recoverable_orphaned_running_tasks,
     recover_running_task_if_owner,
     reclaim_orphaned_running_tasks,
     renew_lease,
@@ -278,6 +279,40 @@ class ExecutionCoordinatorTests(unittest.TestCase):
             self.assertIsNone(rows["dfa_expired_lease"].execution_owner_id)
             self.assertEqual(1, int(rows["dfa_expired_lease"].lease_lost_count or 0))
             self.assertIsNotNone(rows["dfa_expired_lease"].lease_requeue_not_before)
+        finally:
+            db.close()
+
+    def test_list_recoverable_orphaned_running_tasks_only_lists_candidates(self):
+        expired = now_local() - timedelta(minutes=5)
+        future = now_local() + timedelta(hours=1)
+        self._insert_task(
+            task_id="dfa_missing_owner",
+            status="running",
+            execution_owner_id=None,
+            execution_lease_until=future,
+            execution_epoch=1,
+            control_version=0,
+            dispatch_status=None,
+        )
+        self._insert_task(
+            task_id="dfa_expired_lease",
+            status="running",
+            execution_owner_id="pod-old",
+            execution_lease_until=expired,
+            execution_epoch=4,
+            control_version=1,
+            dispatch_status="running",
+        )
+        db = self._session()
+        try:
+            candidates = list_recoverable_orphaned_running_tasks(db)
+            reasons = {item.task_id: item.reason for item in candidates}
+            self.assertEqual("missing_owner", reasons["dfa_missing_owner"])
+            self.assertEqual("expired_lease", reasons["dfa_expired_lease"])
+            rows = {row.task_id: row for row in db.query(AppDfaTask).all()}
+            self.assertEqual(rows["dfa_missing_owner"].status, "running")
+            self.assertEqual(rows["dfa_expired_lease"].status, "running")
+            self.assertEqual(rows["dfa_expired_lease"].execution_owner_id, "pod-old")
         finally:
             db.close()
 

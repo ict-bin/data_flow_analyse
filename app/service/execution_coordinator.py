@@ -39,6 +39,17 @@ class RecoveredRunningTask:
     reason: str
 
 
+@dataclass(frozen=True)
+class OrphanedRunningCandidate:
+    task_id: str
+    execution_owner_id: str | None
+    execution_epoch: int
+    control_version: int
+    dispatch_status: str | None
+    execution_lease_until: object | None
+    reason: str
+
+
 def _lease_requeue_deadline(base_time=None):
     return (base_time or now_local()) + timedelta(seconds=LEASE_REQUEUE_DELAY_SECONDS)
 
@@ -199,9 +210,9 @@ def recover_running_task_if_owner(
     return bool(updated)
 
 
-def reclaim_orphaned_running_tasks(db: Session, *, limit: int = 100) -> list[RecoveredRunningTask]:
+def list_recoverable_orphaned_running_tasks(db: Session, *, limit: int = 100) -> list[OrphanedRunningCandidate]:
     now = now_local()
-    candidates = (
+    rows = (
         db.query(AppDfaTask)
         .filter(
             AppDfaTask.is_deleted.is_(False),
@@ -216,14 +227,35 @@ def reclaim_orphaned_running_tasks(db: Session, *, limit: int = 100) -> list[Rec
         .limit(max(1, int(limit or 100)))
         .all()
     )
-    recovered: list[RecoveredRunningTask] = []
-    for row in candidates:
+    candidates: list[OrphanedRunningCandidate] = []
+    for row in rows:
         if row.execution_owner_id is None:
             reason = "missing_owner"
         elif row.execution_lease_until is None:
             reason = "missing_lease"
         else:
             reason = "expired_lease"
+        candidates.append(
+            OrphanedRunningCandidate(
+                task_id=row.task_id,
+                execution_owner_id=row.execution_owner_id,
+                execution_epoch=int(row.execution_epoch or 0),
+                control_version=int(row.control_version or 0),
+                dispatch_status=row.dispatch_status,
+                execution_lease_until=row.execution_lease_until,
+                reason=reason,
+            )
+        )
+    return candidates
+
+
+def reclaim_orphaned_running_tasks(db: Session, *, limit: int = 100) -> list[RecoveredRunningTask]:
+    now = now_local()
+    recovered: list[RecoveredRunningTask] = []
+    for candidate in list_recoverable_orphaned_running_tasks(db, limit=limit):
+        row = db.query(AppDfaTask).filter(AppDfaTask.task_id == candidate.task_id).first()
+        if row is None:
+            continue
         updated = (
             db.query(AppDfaTask)
             .filter(
@@ -260,7 +292,7 @@ def reclaim_orphaned_running_tasks(db: Session, *, limit: int = 100) -> list[Rec
                 previous_owner_id=row.execution_owner_id,
                 previous_dispatch_status=row.dispatch_status,
                 previous_lease_until=row.execution_lease_until,
-                reason=reason,
+                reason=candidate.reason,
             )
         )
     db.commit()

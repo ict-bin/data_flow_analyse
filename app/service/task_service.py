@@ -17,7 +17,7 @@ import threading
 import time as _time
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
 
@@ -42,9 +42,9 @@ from app.service.execution_coordinator import (
     begin_execution_if_owner,
     claim_one_runnable_task,
     commit_terminal_state_if_owner,
+    list_recoverable_orphaned_running_tasks,
     load_execution_snapshot,
     recover_running_task_if_owner,
-    reclaim_orphaned_running_tasks,
     release_lease,
     renew_lease,
     still_owner,
@@ -63,6 +63,12 @@ TASK_EVENT_SOURCE_DFA = "dfa"
 TASK_EVENT_RENEW_INTERVAL_SECONDS = max(60, HEARTBEAT_INTERVAL_SECONDS * 6)
 EXECUTION_SUPERVISOR_INTERVAL_SECONDS = float(os.environ.get("DFA_EXECUTION_SUPERVISOR_INTERVAL_SECONDS", "5"))
 EXECUTION_NO_PROGRESS_SECONDS = float(os.environ.get("DFA_EXECUTION_NO_PROGRESS_SECONDS", "120"))
+RUNNING_RECONCILE_LOCAL_GRACE_SECONDS = float(
+    os.environ.get(
+        "DFA_RUNNING_RECONCILE_LOCAL_GRACE_SECONDS",
+        str(max(LEASE_TTL_SECONDS, HEARTBEAT_INTERVAL_SECONDS * 3)),
+    )
+)
 AUTO_REQUEUE_REASON_LEASE_LOST = "lease_lost"
 LEASE_REQUEUE_RETRY_DELAYS_SECONDS = (1.0, 2.0, 5.0)
 LEASE_RECOVERY_STATE_IDLE = "idle"
@@ -364,6 +370,58 @@ def _active_local_task(task_id: str) -> _RunningTaskContext | None:
         if not ctx.execution_alive():
             return None
         return ctx
+
+
+def _context_latest_activity_at(ctx: _RunningTaskContext | None) -> float:
+    if ctx is None:
+        return 0.0
+    return max(
+        float(ctx.last_progress_at or 0.0),
+        float(ctx.last_lease_heartbeat_at or 0.0),
+        float(ctx.last_state_sync_at or 0.0),
+        float(ctx.started_at or 0.0),
+    )
+
+
+def _build_runtime_snapshot_index(runtime_snapshots: list[dict[str, object]]) -> dict[str, list[dict[str, object]]]:
+    index: dict[str, list[dict[str, object]]] = {}
+    for item in runtime_snapshots:
+        if not isinstance(item, dict):
+            continue
+        keys = {
+            str(item.get("task_id") or "").strip(),
+            str(item.get("root_task_id") or "").strip(),
+            str(item.get("parent_task_id") or "").strip(),
+        }
+        for key in keys:
+            if not key:
+                continue
+            index.setdefault(key, []).append(item)
+    return index
+
+
+def _runtime_snapshot_latest_activity(snapshot: dict[str, object]) -> float:
+    values = [
+        snapshot.get("last_progress_at"),
+        snapshot.get("last_lease_heartbeat_at"),
+        snapshot.get("last_state_sync_at"),
+    ]
+    latest = 0.0
+    for value in values:
+        try:
+            latest = max(latest, float(value or 0.0))
+        except (TypeError, ValueError):
+            continue
+    return latest
+
+
+def _is_runtime_snapshot_active(snapshot: dict[str, object], *, now_ts: float) -> bool:
+    if bool(snapshot.get("active_context")) and (bool(snapshot.get("execution_alive")) or bool(snapshot.get("lease_alive"))):
+        return True
+    latest_activity = _runtime_snapshot_latest_activity(snapshot)
+    if latest_activity <= 0.0:
+        return False
+    return (now_ts - latest_activity) <= RUNNING_RECONCILE_LOCAL_GRACE_SECONDS
 
 
 def _register_running_task_context(
@@ -1901,24 +1959,174 @@ class TaskService:
         self._supervisor_stop.set()
 
     def reconcile_orphaned_running_tasks(self, db: Session, *, limit: int = 100) -> int:
-        recovered = reclaim_orphaned_running_tasks(db, limit=limit)
-        for item in recovered:
-            row = db.query(AppDfaTask).filter_by(task_id=item.task_id).first()
+        from app.metrics import observe_local_event
+
+        runtime_snapshots = self.running_task_snapshot()
+        runtime_index = _build_runtime_snapshot_index(runtime_snapshots)
+        now_ts = _time.time()
+        candidates = list_recoverable_orphaned_running_tasks(db, limit=limit)
+        recovered_rows: list[tuple[AppDfaTask, str, str | None, str | None, str | None]] = []
+        events_written = False
+        for candidate in candidates:
+            matching = runtime_index.get(candidate.task_id, [])
+            latest_snapshot = None
+            for snapshot in matching:
+                if _is_runtime_snapshot_active(snapshot, now_ts=now_ts):
+                    latest_snapshot = snapshot
+                    break
+            if latest_snapshot is not None:
+                row = db.query(AppDfaTask).filter_by(task_id=candidate.task_id).first()
+                if row is not None:
+                    latest_runtime_activity_at = _runtime_snapshot_latest_activity(latest_snapshot)
+                    event_type = (
+                        "task_running_reconcile_skipped_local_active"
+                        if bool(latest_snapshot.get("execution_alive")) or bool(latest_snapshot.get("lease_alive"))
+                        else "task_running_reconcile_skipped_recent_activity"
+                    )
+                    skip_reason = (
+                        "local_active_runtime"
+                        if event_type == "task_running_reconcile_skipped_local_active"
+                        else "recent_runtime_activity"
+                    )
+                    _record_task_event(
+                        db,
+                        row=row,
+                        event_type=event_type,
+                        message="后台巡检检测到本机仍有活跃运行上下文，跳过 orphan-running 回收",
+                        level="warning",
+                        status=row.status,
+                        dispatch_status=row.dispatch_status,
+                        worker_id=WORKER_ID,
+                        execution_owner_id=row.execution_owner_id,
+                        execution_epoch=int(row.execution_epoch or 0),
+                        control_version=int(row.control_version or 0),
+                        payload={
+                            "task_id": row.task_id,
+                            "db_owner_id": row.execution_owner_id,
+                            "db_execution_epoch": int(row.execution_epoch or 0),
+                            "db_lease_until": isoformat_local(row.execution_lease_until),
+                            "runtime_owner_id": latest_snapshot.get("owner_id"),
+                            "runtime_execution_epoch": latest_snapshot.get("execution_epoch"),
+                            "runtime_active_context": bool(latest_snapshot.get("active_context")),
+                            "runtime_execution_alive": bool(latest_snapshot.get("execution_alive")),
+                            "runtime_lease_alive": bool(latest_snapshot.get("lease_alive")),
+                            "latest_runtime_activity_at": datetime.fromtimestamp(latest_runtime_activity_at, tz=UTC_PLUS_8).isoformat() if latest_runtime_activity_at > 0 else None,
+                            "skip_reason": skip_reason,
+                            "recovery_reason": candidate.reason,
+                        },
+                    )
+                    events_written = True
+                    observe_local_event(
+                        "task_running_reconcile",
+                        "skipped_local_active" if event_type == "task_running_reconcile_skipped_local_active" else "skipped_recent_activity",
+                    )
+                continue
+            row = db.query(AppDfaTask).filter_by(task_id=candidate.task_id).first()
+            if row is not None:
+                _record_task_event(
+                    db,
+                    row=row,
+                    event_type="task_running_reconcile_candidate",
+                    message="后台巡检确认任务满足 orphan-running 回收条件",
+                    level="warning",
+                    status=row.status,
+                    dispatch_status=row.dispatch_status,
+                    worker_id=WORKER_ID,
+                    execution_owner_id=row.execution_owner_id,
+                    execution_epoch=int(row.execution_epoch or 0),
+                    control_version=int(row.control_version or 0),
+                    payload={
+                        "task_id": row.task_id,
+                        "db_owner_id": row.execution_owner_id,
+                        "db_execution_epoch": int(row.execution_epoch or 0),
+                        "db_lease_until": isoformat_local(row.execution_lease_until),
+                        "runtime_owner_id": None,
+                        "runtime_execution_epoch": None,
+                        "runtime_active_context": False,
+                        "runtime_execution_alive": False,
+                        "runtime_lease_alive": False,
+                        "latest_runtime_activity_at": None,
+                        "recovery_reason": candidate.reason,
+                    },
+                )
+                events_written = True
+            if row is None:
+                continue
+            previous_owner_id = row.execution_owner_id
+            previous_dispatch_status = row.dispatch_status
+            previous_lease_until = isoformat_local(row.execution_lease_until)
+            recovered_ok = False
+            if candidate.execution_owner_id:
+                recovered_ok = recover_running_task_if_owner(
+                    db,
+                    candidate.task_id,
+                    candidate.execution_owner_id,
+                    candidate.execution_epoch,
+                    candidate.control_version,
+                    reason=candidate.reason,
+                )
+            else:
+                now_local_ts = now_local()
+                updated = (
+                    db.query(AppDfaTask)
+                    .filter(
+                        AppDfaTask.task_id == candidate.task_id,
+                        AppDfaTask.is_deleted.is_(False),
+                        AppDfaTask.status == "running",
+                        AppDfaTask.execution_owner_id.is_(None),
+                    )
+                    .update(
+                        {
+                            AppDfaTask.status: "pending",
+                            AppDfaTask.execution_owner_id: None,
+                            AppDfaTask.execution_lease_until: None,
+                            AppDfaTask.execution_heartbeat_at: None,
+                            AppDfaTask.dispatch_status: "pending",
+                            AppDfaTask.finished_at: None,
+                            AppDfaTask.error: None,
+                            AppDfaTask.latest_abnormal_reason_json: None,
+                            AppDfaTask.lease_lost_count: AppDfaTask.lease_lost_count + 1,
+                            AppDfaTask.last_lease_lost_at: now_local_ts,
+                            AppDfaTask.lease_requeue_not_before: now_local_ts + timedelta(seconds=LEASE_REQUEUE_DELAY_SECONDS),
+                            AppDfaTask.last_lease_lost_epoch: AppDfaTask.execution_epoch,
+                            AppDfaTask.last_lease_lost_control_version: AppDfaTask.control_version,
+                            AppDfaTask.execution_epoch: AppDfaTask.execution_epoch + 1,
+                        },
+                        synchronize_session=False,
+                    )
+                )
+                if updated:
+                    db.commit()
+                    recovered_ok = True
+            if recovered_ok:
+                refreshed = db.query(AppDfaTask).filter_by(task_id=candidate.task_id).first()
+                if refreshed is not None:
+                    recovered_rows.append((refreshed, candidate.reason, previous_owner_id, previous_dispatch_status, previous_lease_until))
+        for row, recovery_reason, previous_owner_id, previous_dispatch_status, previous_lease_until in recovered_rows:
             if row is None:
                 continue
             payload = {
-                "previous_owner_id": item.previous_owner_id,
-                "previous_dispatch_status": item.previous_dispatch_status,
-                "previous_lease_until": isoformat_local(item.previous_lease_until),
-                "recovery_reason": item.reason,
+                "previous_owner_id": previous_owner_id,
+                "previous_dispatch_status": previous_dispatch_status,
+                "previous_lease_until": previous_lease_until,
+                "recovery_reason": recovery_reason,
                 "lease_lost_count": int(row.lease_lost_count or 0),
                 "lease_requeue_not_before": isoformat_local(row.lease_requeue_not_before),
+                "db_owner_id": row.execution_owner_id,
+                "db_execution_epoch": int(row.execution_epoch or 0),
+                "db_lease_until": isoformat_local(row.execution_lease_until),
+                "runtime_owner_id": None,
+                "runtime_execution_epoch": None,
+                "runtime_active_context": False,
+                "runtime_execution_alive": False,
+                "runtime_lease_alive": False,
+                "latest_runtime_activity_at": None,
             }
             _record_task_event(
                 db,
                 row=row,
-                event_type="task_lease_lost",
-                message="后台巡检发现任务租约丢失，已自动恢复",
+                event_type="task_running_reconcile_recovered",
+                message="后台巡检确认任务已失去有效执行权，已自动回收并重新排队",
                 level="warning",
                 status=row.status,
                 dispatch_status=row.dispatch_status,
@@ -1944,9 +2152,11 @@ class TaskService:
                 dispatch_status=row.dispatch_status,
                 payload=payload,
             )
-        if recovered:
+            observe_local_event("task_running_reconcile", "recovered")
+            events_written = True
+        if events_written:
             db.commit()
-        return len(recovered)
+        return len(recovered_rows)
 
     def reconcile_failed_lease_recoveries(self, db: Session, *, limit: int = 50) -> int:
         rows = (
@@ -2779,6 +2989,20 @@ class TaskService:
                     _guard_db: Session = next(_guard_gen)
                     try:
                         if not still_owner(_guard_db, task_id, WORKER_ID, epoch, control_version):
+                            guard_row = _guard_db.query(AppDfaTask).filter_by(task_id=task_id).first()
+                            ctx = _get_running_task_context(task_id)
+                            latest_ctx_activity = _context_latest_activity_at(ctx)
+                            local_reconcile_exempt = bool(
+                                ctx is not None
+                                and (
+                                    ctx.execution_alive()
+                                    or ctx.lease_alive()
+                                    or (
+                                        latest_ctx_activity > 0
+                                        and (_time.time() - latest_ctx_activity) <= RUNNING_RECONCILE_LOCAL_GRACE_SECONDS
+                                    )
+                                )
+                            )
                             log_event(
                                 logger,
                                 logging.WARNING,
@@ -2788,8 +3012,24 @@ class TaskService:
                                 owner_id=WORKER_ID,
                                 epoch=epoch,
                                 control_version=control_version,
+                                background_reconcile_reclaimed=(
+                                    guard_row is not None
+                                    and str(guard_row.status or "") == "pending"
+                                    and str(guard_row.dispatch_status or "") == "pending"
+                                ),
+                                lease_requeue_committed=(
+                                    guard_row is not None
+                                    and str(guard_row.lease_recovery_state or "") == LEASE_RECOVERY_STATE_REQUEUE_COMMITTED
+                                ),
+                                external_owner_changed=(
+                                    guard_row is not None
+                                    and str(guard_row.execution_owner_id or "").strip() not in {"", WORKER_ID}
+                                ),
+                                manual_control_change=(
+                                    guard_row is not None
+                                    and int(guard_row.control_version or 0) != int(control_version or 0)
+                                ),
                             )
-                            guard_row = _guard_db.query(AppDfaTask).filter_by(task_id=task_id).first()
                             if guard_row is not None:
                                 _record_task_event(
                                     _guard_db,
@@ -2802,10 +3042,34 @@ class TaskService:
                                     execution_owner_id=WORKER_ID,
                                     execution_epoch=epoch,
                                     control_version=control_version,
-                                    payload={"owner_id": WORKER_ID, "epoch": epoch, "control_version": control_version},
+                                    payload={
+                                        "owner_id": WORKER_ID,
+                                        "epoch": epoch,
+                                        "control_version": control_version,
+                                        "db_execution_owner_id": guard_row.execution_owner_id,
+                                        "db_execution_epoch": int(guard_row.execution_epoch or 0),
+                                        "db_control_version": int(guard_row.control_version or 0),
+                                        "db_status": guard_row.status,
+                                        "ctx_epoch": int(ctx.epoch or 0) if ctx is not None and ctx.epoch is not None else None,
+                                        "ctx_control_version": int(ctx.control_version or 0) if ctx is not None and ctx.control_version is not None else None,
+                                        "ctx_latest_activity_at": (
+                                            datetime.fromtimestamp(latest_ctx_activity, tz=UTC_PLUS_8).isoformat()
+                                            if latest_ctx_activity > 0
+                                            else None
+                                        ),
+                                        "local_reconcile_exempt": local_reconcile_exempt,
+                                        "background_reconcile_reclaimed": (
+                                            str(guard_row.status or "") == "pending"
+                                            and str(guard_row.dispatch_status or "") == "pending"
+                                        ),
+                                        "lease_requeue_committed": (
+                                            str(guard_row.lease_recovery_state or "") == LEASE_RECOVERY_STATE_REQUEUE_COMMITTED
+                                        ),
+                                        "external_owner_changed": str(guard_row.execution_owner_id or "").strip() not in {"", WORKER_ID},
+                                        "manual_control_change": int(guard_row.control_version or 0) != int(control_version or 0),
+                                    },
                                 )
                                 _guard_db.commit()
-                            ctx = _get_running_task_context(task_id)
                             if ctx is not None:
                                 ctx.cancel_requested.set()
                                 ctx.termination_reason = "control_guard_abort"
