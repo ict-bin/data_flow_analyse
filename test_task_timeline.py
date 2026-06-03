@@ -22,7 +22,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from app.api import router as api_router
 from app.api import tasks as tasks_api
-from app.db.models import AppDfaTask, AppDfaTaskEvent, Base
+from app.db.models import AppDfaTask, AppDfaTaskEvent, AppDfaWorkerSlot, Base
+from app.service.execution_coordinator import renew_lease
 from app.service import task_service as task_service_module
 from app.service.task_service import TaskService
 from app.time_utils import now_local
@@ -653,6 +654,184 @@ class TaskTimelineTests(unittest.TestCase):
         finally:
             task_service_module._running_tasks.pop(task_id, None)
             task_service_module._running_task_contexts.pop(task_id, None)
+
+    def test_renew_lease_does_not_require_exact_epoch_match(self):
+        task_id = self._create_task()
+        db = self._session()
+        try:
+            row = db.query(AppDfaTask).filter_by(task_id=task_id).first()
+            row.status = "running"
+            row.execution_owner_id = task_service_module.WORKER_ID
+            row.execution_epoch = 9
+            row.control_version = 1
+            row.dispatch_status = "running"
+            row.execution_lease_until = now_local() - timedelta(seconds=5)
+            row.execution_heartbeat_at = now_local() - timedelta(seconds=5)
+            db.commit()
+
+            renewed = renew_lease(db, task_id, task_service_module.WORKER_ID, epoch=4)
+            db.refresh(row)
+
+            self.assertTrue(renewed)
+            self.assertEqual(9, row.execution_epoch)
+            self.assertIsNotNone(row.execution_lease_until)
+            self.assertIsNotNone(row.execution_heartbeat_at)
+            self.assertGreaterEqual(row.execution_lease_until, now_local())
+        finally:
+            db.close()
+
+    def test_lease_heartbeat_retries_transient_db_errors(self):
+        task_id = self._create_task()
+        db = self._session()
+        try:
+            row = db.query(AppDfaTask).filter_by(task_id=task_id).first()
+            row.status = "running"
+            row.execution_owner_id = task_service_module.WORKER_ID
+            row.execution_epoch = 5
+            row.control_version = 2
+            row.dispatch_status = "running"
+            row.execution_lease_until = now_local() + timedelta(minutes=1)
+            db.commit()
+        finally:
+            db.close()
+
+        fake_ctx = task_service_module._RunningTaskContext(
+            cancel_requested=threading.Event(),
+            lease_stop_requested=threading.Event(),
+        )
+        task_service_module._running_task_contexts[task_id] = fake_ctx
+        task_service_module._running_tasks[task_id] = fake_ctx
+        on_lease_lost_calls: list[str] = []
+        renew_attempts = {"count": 0}
+        real_renew_lease = task_service_module.renew_lease
+
+        def flaky_renew(db, inner_task_id, owner_id, epoch):
+            renew_attempts["count"] += 1
+            if renew_attempts["count"] == 1:
+                raise OperationalError("UPDATE", {}, Exception("Lost connection to MySQL server during query"))
+            return real_renew_lease(db, inner_task_id, owner_id, epoch)
+
+        try:
+            with patch("app.service.task_service.HEARTBEAT_INTERVAL_SECONDS", 0.01), patch(
+                "app.service.task_service.DB_RETRY_BASE_DELAY_SECONDS", 0.01
+            ), patch("app.service.task_service.renew_lease", side_effect=flaky_renew), patch(
+                "app.service.task_service.still_owner", return_value=True
+            ), patch("app.db.get_db", side_effect=lambda: self._db_generator()):
+                thread = task_service_module._start_task_lease_heartbeat(
+                    task_id,
+                    epoch=5,
+                    control_version=2,
+                    on_lease_lost=lambda _db: on_lease_lost_calls.append("lost"),
+                )
+                deadline = time.time() + 2
+                while fake_ctx.last_lease_renew_success_at <= 0 and time.time() < deadline:
+                    time.sleep(0.01)
+                fake_ctx.lease_stop_requested.set()
+                thread.join(timeout=2)
+
+            self.assertEqual([], on_lease_lost_calls)
+            self.assertGreaterEqual(renew_attempts["count"], 2)
+            self.assertGreater(fake_ctx.last_lease_renew_success_at, 0)
+            self.assertIsNone(fake_ctx.last_lease_error)
+        finally:
+            task_service_module._running_tasks.pop(task_id, None)
+            task_service_module._running_task_contexts.pop(task_id, None)
+
+    def test_reconcile_orphaned_running_tasks_skips_when_owner_worker_heartbeat_is_fresh(self):
+        task_id = self._create_task()
+        db = self._session()
+        try:
+            row = db.query(AppDfaTask).filter_by(task_id=task_id).first()
+            row.status = "running"
+            row.execution_owner_id = "pod-live:worker-1"
+            row.execution_owner_instance_id = "pod-live:worker-1:instance-a"
+            row.execution_epoch = 7
+            row.control_version = 3
+            row.dispatch_status = "running"
+            row.execution_lease_until = now_local() - timedelta(minutes=20)
+            row.execution_heartbeat_at = now_local() - timedelta(minutes=20)
+            db.add(
+                AppDfaWorkerSlot(
+                    worker_id="pod-live:worker-1",
+                    instance_id="pod-live:worker-1:instance-a",
+                    pod_name="pod-live",
+                    pod_ip="10.0.0.8",
+                    http_port=8080,
+                    max_concurrent_tasks=4,
+                    last_seen_status="running",
+                    last_heartbeat_at=now_local(),
+                )
+            )
+            db.commit()
+
+            recovered = self.service.reconcile_orphaned_running_tasks(db)
+            db.refresh(row)
+            events = db.query(AppDfaTaskEvent).filter_by(task_id=task_id).all()
+
+            self.assertEqual(0, recovered)
+            self.assertEqual("running", row.status)
+            self.assertEqual("pod-live:worker-1", row.execution_owner_id)
+            self.assertIn("task_running_reconcile_skipped_owner_alive", [event.event_type for event in events])
+        finally:
+            db.close()
+
+    def test_reconcile_orphaned_running_tasks_does_not_skip_when_owner_instance_changed(self):
+        task_id = self._create_task()
+        db = self._session()
+        try:
+            row = db.query(AppDfaTask).filter_by(task_id=task_id).first()
+            row.status = "running"
+            row.execution_owner_id = "pod-live:worker-1"
+            row.execution_owner_instance_id = "pod-live:worker-1:instance-a"
+            row.execution_epoch = 7
+            row.control_version = 3
+            row.dispatch_status = "running"
+            row.execution_lease_until = now_local() - timedelta(minutes=20)
+            row.execution_heartbeat_at = now_local() - timedelta(minutes=20)
+            db.add(
+                AppDfaWorkerSlot(
+                    worker_id="pod-live:worker-1",
+                    instance_id="pod-live:worker-1:instance-b",
+                    pod_name="pod-live",
+                    pod_ip="10.0.0.8",
+                    http_port=8080,
+                    max_concurrent_tasks=4,
+                    last_seen_status="running",
+                    last_heartbeat_at=now_local(),
+                )
+            )
+            db.commit()
+
+            recovered = self.service.reconcile_orphaned_running_tasks(db)
+            db.refresh(row)
+            events = db.query(AppDfaTaskEvent).filter_by(task_id=task_id).all()
+
+            self.assertEqual(1, recovered)
+            self.assertEqual("pending", row.status)
+            self.assertIsNone(row.execution_owner_id)
+            self.assertNotIn("task_running_reconcile_skipped_owner_alive", [event.event_type for event in events])
+        finally:
+            db.close()
+
+    def test_abort_local_running_context_unregisters_task_and_reports_cleanup(self):
+        task_id = self._create_task()
+        fake_ctx = task_service_module._RunningTaskContext(
+            lease_stop_requested=threading.Event(),
+            cancel_requested=threading.Event(),
+        )
+        fake_ctx.task_root = str(self.output_dir / task_id)
+        fake_ctx.run_root = str(self.output_dir / task_id / "run")
+        with patch.object(task_service_module, "cleanup_task_agent_processes", return_value=2):
+            try:
+                task_service_module._running_task_contexts[task_id] = fake_ctx
+                task_service_module._running_tasks[task_id] = fake_ctx
+                result = task_service_module._abort_local_running_context(task_id, reason="background_reconcile:test")
+            finally:
+                task_service_module._running_task_contexts.pop(task_id, None)
+                task_service_module._running_tasks.pop(task_id, None)
+        self.assertEqual(2, result["cleaned_groups"])
+        self.assertFalse(result["local_task_active"])
+        self.assertNotIn(task_id, task_service_module._running_task_contexts)
 
     def test_delete_task_records_task_deleted_event_before_soft_delete(self):
         task_id = self._create_task()

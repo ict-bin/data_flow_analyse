@@ -27,15 +27,17 @@ from sqlalchemy.orm import Session, load_only
 from sqlalchemy.orm.attributes import flag_modified
 
 from app.config import build_task_config, load_service_config
-from app.db.models import AppDfaTask, AppDfaTaskEvent
+from app.db.models import AppDfaTask, AppDfaTaskEvent, AppDfaWorkerSlot
 from app.logging_utils import log_event
 from app.models import SwarmEvent, TaskStatus
 from app.orchestrator import Orchestrator
 from app.runtime_context import (
     HEARTBEAT_INTERVAL_SECONDS,
+    INSTANCE_ID,
     LEASE_TTL_SECONDS,
     LEASE_REQUEUE_DELAY_SECONDS,
     MAX_LOCAL_RUNNING_TASKS,
+    WORKER_SLOT_STALE_AFTER_SECONDS,
     WORKER_ID,
 )
 from app.service.execution_coordinator import (
@@ -452,6 +454,28 @@ def _is_runtime_snapshot_active(snapshot: dict[str, object], *, now_ts: float) -
     return (now_ts - latest_activity) <= RUNNING_RECONCILE_LOCAL_GRACE_SECONDS
 
 
+def _fresh_owner_worker_heartbeat(db: Session, owner_id: str | None, owner_instance_id: str | None) -> datetime | None:
+    normalized_owner_id = str(owner_id or "").strip()
+    if not normalized_owner_id:
+        return None
+    row = (
+        db.query(AppDfaWorkerSlot.last_heartbeat_at, AppDfaWorkerSlot.instance_id)
+        .filter(AppDfaWorkerSlot.worker_id == normalized_owner_id)
+        .first()
+    )
+    if row is None or row[0] is None:
+        return None
+    normalized_owner_instance_id = str(owner_instance_id or "").strip()
+    slot_instance_id = str(row[1] or "").strip()
+    if normalized_owner_instance_id and slot_instance_id and slot_instance_id != normalized_owner_instance_id:
+        return None
+    fresh_cutoff = now_local() - timedelta(seconds=WORKER_SLOT_STALE_AFTER_SECONDS)
+    last_heartbeat_at = row[0]
+    if last_heartbeat_at < fresh_cutoff:
+        return None
+    return last_heartbeat_at
+
+
 def _register_running_task_context(
     task_id: str,
     *,
@@ -505,6 +529,36 @@ def _unregister_running_task_context(task_id: str) -> None:
         _running_task_contexts.pop(task_id, None)
         _running_tasks.pop(task_id, None)
         _child_execution_contexts.pop(task_id, None)
+
+
+def _abort_local_running_context(task_id: str, *, reason: str) -> dict[str, object]:
+    ctx = _get_running_task_context(task_id)
+    local_task = _active_local_task(task_id)
+    cleaned_groups = 0
+    if ctx is None:
+        return {"local_task_active": False, "cleaned_groups": 0}
+    ctx.termination_reason = reason
+    ctx.lease_stop_requested.set()
+    ctx.cancel_requested.set()
+    if ctx.orch is not None:
+        try:
+            ctx.orch.abort()
+        except Exception:
+            logger.warning("failed to abort local orchestrator for %s", task_id, exc_info=True)
+    if ctx.task_root or ctx.run_root:
+        cleaned_groups = cleanup_task_agent_processes(
+            logger.warning,
+            label=f"task_reconcile:{task_id}",
+            task_id=task_id,
+            task_root=ctx.task_root,
+            run_root=ctx.run_root,
+            worker_id=WORKER_ID,
+        )
+    _unregister_running_task_context(task_id)
+    return {
+        "local_task_active": local_task is not None,
+        "cleaned_groups": int(cleaned_groups or 0),
+    }
 
 
 def _register_child_execution_context(
@@ -573,13 +627,80 @@ def _start_task_lease_heartbeat(
         from app.db import get_db
         from app.metrics import observe_local_event
 
+        def _run_lease_db_retry(operation_name: str, fn):
+            attempts = max(1, int(DB_RETRY_MAX_ATTEMPTS))
+            last_error: Exception | None = None
+            for attempt in range(1, attempts + 1):
+                try:
+                    return fn()
+                except Exception as exc:
+                    last_error = exc
+                    if not _is_db_connection_error_text(exc):
+                        raise
+                    if attempt >= attempts:
+                        break
+                    delay = _db_retry_delay_seconds(attempt)
+                    log_event(
+                        logger,
+                        logging.WARNING,
+                        "lease heartbeat db retry scheduled",
+                        event="task_lease_db_retry",
+                        task_id=task_id,
+                        owner_id=WORKER_ID,
+                        epoch=epoch,
+                        control_version=control_version,
+                        operation=operation_name,
+                        attempt=attempt,
+                        max_attempts=attempts,
+                        delay_seconds=delay,
+                        error=repr(exc),
+                    )
+                    _time.sleep(delay)
+            assert last_error is not None
+            raise last_error
+
         last_timeline_renew_at = 0.0
         last_renew_failure_event_at = 0.0
         while True:
             ctx = _get_running_task_context(task_id)
-            if ctx is None or ctx.lease_stop_requested.is_set():
+            if ctx is None:
+                log_event(
+                    logger,
+                    logging.WARNING,
+                    "lease heartbeat thread stopped because running context is missing",
+                    event="task_lease_thread_stopped",
+                    task_id=task_id,
+                    owner_id=WORKER_ID,
+                    epoch=epoch,
+                    control_version=control_version,
+                    reason="missing_running_context",
+                )
+                return
+            if ctx.lease_stop_requested.is_set():
+                log_event(
+                    logger,
+                    logging.INFO,
+                    "lease heartbeat thread stopped after lease stop request",
+                    event="task_lease_thread_stopped",
+                    task_id=task_id,
+                    owner_id=WORKER_ID,
+                    epoch=epoch,
+                    control_version=control_version,
+                    reason="lease_stop_requested",
+                )
                 return
             if ctx.cancel_requested.wait(timeout=HEARTBEAT_INTERVAL_SECONDS):
+                log_event(
+                    logger,
+                    logging.INFO,
+                    "lease heartbeat thread stopped after task cancellation request",
+                    event="task_lease_thread_stopped",
+                    task_id=task_id,
+                    owner_id=WORKER_ID,
+                    epoch=epoch,
+                    control_version=control_version,
+                    reason="cancel_requested",
+                )
                 return
             _hb_gen = get_db()
             _hb_db: Session = next(_hb_gen)
@@ -587,12 +708,21 @@ def _start_task_lease_heartbeat(
                 current_ts = _time.time()
                 if ctx is not None:
                     ctx.last_lease_renew_attempt_at = current_ts
-                snapshot = load_execution_snapshot(_hb_db, task_id)
+                snapshot = _run_lease_db_retry(
+                    "load_execution_snapshot",
+                    lambda: load_execution_snapshot(_hb_db, task_id),
+                )
                 lease_until = snapshot.execution_lease_until if snapshot is not None else None
                 lease_expired = lease_until is None or lease_until <= now_local()
-                ok = renew_lease(_hb_db, task_id, WORKER_ID, epoch)
+                ok = _run_lease_db_retry(
+                    "renew_lease",
+                    lambda: renew_lease(_hb_db, task_id, WORKER_ID, epoch),
+                )
                 if ok:
-                    owner_ok = still_owner(_hb_db, task_id, WORKER_ID, epoch, control_version)
+                    owner_ok = _run_lease_db_retry(
+                        "still_owner",
+                        lambda: still_owner(_hb_db, task_id, WORKER_ID, epoch, control_version),
+                    )
                     if owner_ok:
                         observe_local_event("lease_renew", "success")
                         if ctx is not None:
@@ -602,7 +732,10 @@ def _start_task_lease_heartbeat(
                             ctx.lease_renew_failure_count = 0
                             ctx.last_lease_renew_success_at = current_ts
                         if current_ts - last_timeline_renew_at >= TASK_EVENT_RENEW_INTERVAL_SECONDS:
-                            lease_row = _hb_db.query(AppDfaTask).filter_by(task_id=task_id).first()
+                            lease_row = _run_lease_db_retry(
+                                "load_lease_row",
+                                lambda: _hb_db.query(AppDfaTask).filter_by(task_id=task_id).first(),
+                            )
                             if lease_row is not None:
                                 _record_task_event(
                                     _hb_db,
@@ -621,9 +754,24 @@ def _start_task_lease_heartbeat(
                                         "lease_until": isoformat_local(lease_row.execution_lease_until),
                                     },
                                 )
-                                _hb_db.commit()
+                                _run_lease_db_retry("commit_task_lease_renewed", _hb_db.commit)
                                 last_timeline_renew_at = current_ts
                         continue
+                    observe_local_event("lease_renew", "owner_mismatch")
+                    if ctx is not None:
+                        ctx.lease_renew_failure_count += 1
+                        ctx.last_lease_error = "lease_renew_owner_mismatch"
+                    log_event(
+                        logger,
+                        logging.WARNING,
+                        "lease renewed in db but ownership check failed",
+                        event="task_lease_owner_mismatch",
+                        task_id=task_id,
+                        owner_id=WORKER_ID,
+                        epoch=epoch,
+                        control_version=control_version,
+                    )
+                    continue
 
                 observe_local_event("lease_renew", "failed")
                 if ctx is not None:
@@ -640,8 +788,23 @@ def _start_task_lease_heartbeat(
                     "error": (ctx.last_lease_error if ctx is not None else "lease_renew_failed"),
                 }
                 if not lease_expired:
+                    log_event(
+                        logger,
+                        logging.WARNING,
+                        "task lease renew returned false before lease expiry",
+                        event="task_lease_renew_returned_false",
+                        task_id=task_id,
+                        owner_id=WORKER_ID,
+                        epoch=epoch,
+                        control_version=control_version,
+                        lease_until=isoformat_local(lease_until),
+                        failure_count=int(ctx.lease_renew_failure_count if ctx is not None else 1),
+                    )
                     if current_ts - last_renew_failure_event_at >= TASK_EVENT_RENEW_INTERVAL_SECONDS:
-                        renew_failed_row = _hb_db.query(AppDfaTask).filter_by(task_id=task_id).first()
+                        renew_failed_row = _run_lease_db_retry(
+                            "load_renew_failed_row",
+                            lambda: _hb_db.query(AppDfaTask).filter_by(task_id=task_id).first(),
+                        )
                         if renew_failed_row is not None:
                             _record_task_event(
                                 _hb_db,
@@ -656,7 +819,7 @@ def _start_task_lease_heartbeat(
                                 control_version=control_version,
                                 payload=failure_payload,
                             )
-                            _hb_db.commit()
+                            _run_lease_db_retry("commit_task_lease_renew_failed", _hb_db.commit)
                             last_renew_failure_event_at = current_ts
                     continue
 
@@ -672,7 +835,10 @@ def _start_task_lease_heartbeat(
                     epoch=epoch,
                     control_version=control_version,
                 )
-                lost_row = _hb_db.query(AppDfaTask).filter_by(task_id=task_id).first()
+                lost_row = _run_lease_db_retry(
+                    "load_lost_row",
+                    lambda: _hb_db.query(AppDfaTask).filter_by(task_id=task_id).first(),
+                )
                 if lost_row is not None:
                     _record_task_event(
                         _hb_db,
@@ -687,7 +853,7 @@ def _start_task_lease_heartbeat(
                         control_version=control_version,
                         payload=failure_payload,
                     )
-                    _hb_db.commit()
+                    _run_lease_db_retry("commit_task_lease_lost", _hb_db.commit)
                 on_lease_lost(_hb_db)
                 return
             except Exception as exc:
@@ -695,6 +861,17 @@ def _start_task_lease_heartbeat(
                 if ctx is not None:
                     ctx.lease_renew_failure_count += 1
                     ctx.last_lease_error = str(exc)
+                log_event(
+                    logger,
+                    logging.ERROR,
+                    "lease heartbeat thread failed with exception",
+                    event="task_lease_thread_error",
+                    task_id=task_id,
+                    owner_id=WORKER_ID,
+                    epoch=epoch,
+                    control_version=control_version,
+                    error=repr(exc),
+                )
             finally:
                 try:
                     next(_hb_gen)
@@ -1623,6 +1800,7 @@ def _flush_stages(task_id: str, events: list[dict], owner_id: str | None = None,
                 if owner_id is not None and epoch is not None and control_version is not None:
                     if not (
                         _r.execution_owner_id == owner_id
+                        and str(_r.execution_owner_instance_id or "") == INSTANCE_ID
                         and int(_r.execution_epoch or 0) == int(epoch)
                         and int(_r.control_version or 0) == int(control_version)
                     ):
@@ -1941,6 +2119,7 @@ class TaskService:
                                 snapshot is not None
                                 and snapshot.status == "running"
                                 and snapshot.execution_owner_id == WORKER_ID
+                                and str(snapshot.execution_owner_instance_id or "") == INSTANCE_ID
                                 and int(snapshot.execution_epoch or 0) == int(ctx.epoch or 0)
                                 and int(snapshot.control_version or 0) == int(ctx.control_version or 0)
                             ):
@@ -2050,6 +2229,41 @@ class TaskService:
                         "skipped_local_active" if event_type == "task_running_reconcile_skipped_local_active" else "skipped_recent_activity",
                     )
                 continue
+            owner_heartbeat_at = _fresh_owner_worker_heartbeat(
+                db,
+                candidate.execution_owner_id,
+                candidate.execution_owner_instance_id,
+            )
+            if owner_heartbeat_at is not None:
+                row = db.query(AppDfaTask).filter_by(task_id=candidate.task_id).first()
+                if row is not None:
+                    _record_task_event(
+                        db,
+                        row=row,
+                        event_type="task_running_reconcile_skipped_owner_alive",
+                        message="后台巡检检测到 owner worker 心跳仍存活，跳过 orphan-running 回收",
+                        level="warning",
+                        status=row.status,
+                        dispatch_status=row.dispatch_status,
+                        worker_id=WORKER_ID,
+                        execution_owner_id=row.execution_owner_id,
+                        execution_epoch=int(row.execution_epoch or 0),
+                        control_version=int(row.control_version or 0),
+                        payload={
+                            "task_id": row.task_id,
+                            "db_owner_id": row.execution_owner_id,
+                            "db_owner_instance_id": row.execution_owner_instance_id,
+                            "db_execution_epoch": int(row.execution_epoch or 0),
+                            "db_lease_until": isoformat_local(row.execution_lease_until),
+                            "db_execution_heartbeat_at": isoformat_local(row.execution_heartbeat_at),
+                            "owner_worker_heartbeat_at": isoformat_local(owner_heartbeat_at),
+                            "skip_reason": "owner_worker_heartbeat_alive",
+                            "recovery_reason": candidate.reason,
+                        },
+                    )
+                    events_written = True
+                    observe_local_event("task_running_reconcile", "skipped_owner_alive")
+                continue
             row = db.query(AppDfaTask).filter_by(task_id=candidate.task_id).first()
             if row is not None:
                 _record_task_event(
@@ -2135,6 +2349,12 @@ class TaskService:
         for row, recovery_reason, previous_owner_id, previous_dispatch_status, previous_lease_until in recovered_rows:
             if row is None:
                 continue
+            local_abort_result = {"local_task_active": False, "cleaned_groups": 0}
+            if str(previous_owner_id or "").strip() == WORKER_ID:
+                local_abort_result = _abort_local_running_context(
+                    row.task_id,
+                    reason=f"background_reconcile:{recovery_reason}",
+                )
             payload = {
                 "previous_owner_id": previous_owner_id,
                 "previous_dispatch_status": previous_dispatch_status,
@@ -2151,6 +2371,8 @@ class TaskService:
                 "runtime_execution_alive": False,
                 "runtime_lease_alive": False,
                 "latest_runtime_activity_at": None,
+                "local_task_active_before_abort": bool(local_abort_result.get("local_task_active")),
+                "cleaned_groups": int(local_abort_result.get("cleaned_groups") or 0),
             }
             _record_task_event(
                 db,
@@ -2162,6 +2384,17 @@ class TaskService:
                 dispatch_status=row.dispatch_status,
                 payload=payload,
             )
+            if bool(local_abort_result.get("local_task_active")) or int(local_abort_result.get("cleaned_groups") or 0) > 0:
+                _record_task_event(
+                    db,
+                    row=row,
+                    event_type="task_running_reconcile_local_cleanup",
+                    message="后台巡检已主动终止本地运行上下文并清理任务进程组",
+                    level="warning",
+                    status=row.status,
+                    dispatch_status=row.dispatch_status,
+                    payload=payload,
+                )
             _record_task_event(
                 db,
                 row=row,
@@ -2325,6 +2558,7 @@ class TaskService:
                     execution_owner_id=WORKER_ID,
                     payload={
                         "owner_id": WORKER_ID,
+                        "owner_instance_id": INSTANCE_ID,
                         "epoch": claimed.epoch,
                         "control_version": claimed.control_version,
                         "dispatch_status": claimed.dispatch_status,
@@ -2660,6 +2894,7 @@ class TaskService:
             parent_stage_item_id=parent_stage_item_id,
             parent_stage_item_key=parent_stage_item_key,
             execution_owner_id=None,
+            execution_owner_instance_id=None,
             execution_lease_until=None,
             execution_heartbeat_at=None,
             execution_epoch=0,
@@ -2709,6 +2944,7 @@ class TaskService:
         row.error = None
         row.latest_abnormal_reason_json = None
         row.execution_owner_id = None
+        row.execution_owner_instance_id = None
         row.execution_lease_until = None
         row.execution_heartbeat_at = None
         row.control_version = int(row.control_version or 0) + 1
@@ -2759,6 +2995,7 @@ class TaskService:
         row.error = None
         row.latest_abnormal_reason_json = None
         row.execution_owner_id = None
+        row.execution_owner_instance_id = None
         row.execution_lease_until = None
         row.execution_heartbeat_at = None
         row.control_version = int(row.control_version or 0) + 1
@@ -2833,6 +3070,7 @@ class TaskService:
         row.finished_at = now_local()
         row.control_version = int(row.control_version or 0) + 1
         row.execution_owner_id = None
+        row.execution_owner_instance_id = None
         row.execution_epoch = int(row.execution_epoch or 0) + 1
         row.execution_lease_until = None
         row.execution_heartbeat_at = None
@@ -3837,6 +4075,7 @@ class TaskService:
             "latest_started_at": latest_started_at,
             "execution_duration_ms": duration_ms(),
             "execution_owner_id": row.execution_owner_id,
+            "execution_owner_instance_id": row.execution_owner_instance_id,
             "execution_lease_until": fmt(row.execution_lease_until),
             "execution_heartbeat_at": fmt(row.execution_heartbeat_at),
             "execution_epoch": int(row.execution_epoch or 0),

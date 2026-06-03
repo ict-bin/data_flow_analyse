@@ -78,6 +78,12 @@ _MIGRATIONS = [
     ),
     Migration(
         kind="column",
+        table_name="secflow_app_dfa_worker_slots",
+        name="instance_id",
+        statement="ALTER TABLE secflow_app_dfa_worker_slots ADD COLUMN instance_id VARCHAR(160) NULL",
+    ),
+    Migration(
+        kind="column",
         table_name="secflow_app_dfa_tasks",
         name="task_config_json",
         statement="ALTER TABLE secflow_app_dfa_tasks ADD COLUMN task_config_json JSON NULL",
@@ -159,6 +165,12 @@ _MIGRATIONS = [
         table_name="secflow_app_dfa_tasks",
         name="execution_owner_id",
         statement="ALTER TABLE secflow_app_dfa_tasks ADD COLUMN execution_owner_id VARCHAR(128) NULL",
+    ),
+    Migration(
+        kind="column",
+        table_name="secflow_app_dfa_tasks",
+        name="execution_owner_instance_id",
+        statement="ALTER TABLE secflow_app_dfa_tasks ADD COLUMN execution_owner_instance_id VARCHAR(160) NULL",
     ),
     Migration(
         kind="column",

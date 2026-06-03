@@ -59,6 +59,7 @@ class AppDfaTask(Base):
     started_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
     finished_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
     execution_owner_id: Mapped[Optional[str]] = mapped_column(String(128), nullable=True, index=True)
+    execution_owner_instance_id: Mapped[Optional[str]] = mapped_column(String(160), nullable=True, index=True)
     execution_lease_until: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True, index=True)
     execution_heartbeat_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
     execution_epoch: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
@@ -160,6 +161,7 @@ class AppDfaWorkerSlot(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     worker_id: Mapped[str] = mapped_column(String(128), nullable=False, unique=True, index=True)
+    instance_id: Mapped[Optional[str]] = mapped_column(String(160), nullable=True, index=True)
     pod_name: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
     pod_ip: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
     http_port: Mapped[int] = mapped_column(Integer, nullable=False, default=8080)

@@ -6,6 +6,7 @@ from datetime import timedelta
 from sqlalchemy.orm import Session
 
 from app.db.models import AppDfaTask
+from app.runtime_context import INSTANCE_ID
 from app.runtime_context import LEASE_REQUEUE_DELAY_SECONDS, LEASE_TTL_SECONDS
 from app.time_utils import now_local
 
@@ -23,6 +24,7 @@ class ExecutionSnapshot:
     task_id: str
     status: str
     execution_owner_id: str | None
+    execution_owner_instance_id: str | None
     execution_epoch: int
     control_version: int
     dispatch_status: str | None
@@ -85,6 +87,7 @@ def claim_one_runnable_task(db: Session, owner_id: str) -> ClaimedTask | None:
     expected_status = str(candidate.status or "pending")
     update_fields = {
         AppDfaTask.execution_owner_id: owner_id,
+        AppDfaTask.execution_owner_instance_id: INSTANCE_ID,
         AppDfaTask.execution_lease_until: _lease_deadline(),
         AppDfaTask.execution_heartbeat_at: now,
         AppDfaTask.execution_epoch: int(candidate.execution_epoch or 0) + 1,
@@ -134,7 +137,7 @@ def renew_lease(db: Session, task_id: str, owner_id: str, epoch: int) -> bool:
         .filter(
             AppDfaTask.task_id == task_id,
             AppDfaTask.execution_owner_id == owner_id,
-            AppDfaTask.execution_epoch == epoch,
+            AppDfaTask.execution_owner_instance_id == INSTANCE_ID,
             AppDfaTask.is_deleted.is_(False),
             AppDfaTask.status == "running",
         )
@@ -161,6 +164,7 @@ def release_lease(db: Session, task_id: str, owner_id: str, epoch: int) -> bool:
         .update(
             {
                 AppDfaTask.execution_owner_id: None,
+                AppDfaTask.execution_owner_instance_id: None,
                 AppDfaTask.execution_lease_until: None,
                 AppDfaTask.dispatch_status: None,
             },
@@ -195,6 +199,7 @@ def recover_running_task_if_owner(
             {
                 AppDfaTask.status: "pending",
                 AppDfaTask.execution_owner_id: None,
+                AppDfaTask.execution_owner_instance_id: None,
                 AppDfaTask.execution_lease_until: None,
                 AppDfaTask.execution_heartbeat_at: None,
                 AppDfaTask.dispatch_status: "pending",
@@ -328,6 +333,7 @@ def still_owner(db: Session, task_id: str, owner_id: str, epoch: int, control_ve
         return False
     return (
         row.execution_owner_id == owner_id
+        and str(row.execution_owner_instance_id or "") == INSTANCE_ID
         and int(row.execution_epoch or 0) == int(epoch)
         and int(row.control_version or 0) == int(control_version)
         and row.status in {"pending", "running"}
@@ -349,6 +355,7 @@ def load_execution_snapshot(db: Session, task_id: str) -> ExecutionSnapshot | No
         task_id=row.task_id,
         status=str(row.status or ""),
         execution_owner_id=row.execution_owner_id,
+        execution_owner_instance_id=row.execution_owner_instance_id,
         execution_epoch=int(row.execution_epoch or 0),
         control_version=int(row.control_version or 0),
         dispatch_status=row.dispatch_status,

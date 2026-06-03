@@ -287,7 +287,7 @@ class RuntimeBootstrap:
 
         def _worker_slot_loop() -> None:
             from app.db import get_db
-            from app.runtime_context import MAX_LOCAL_RUNNING_TASKS, POD_IP, POD_NAME, WORKER_ID, WORKER_SLOT_HEARTBEAT_SECONDS
+            from app.runtime_context import INSTANCE_ID, MAX_LOCAL_RUNNING_TASKS, POD_IP, POD_NAME, WORKER_ID, WORKER_SLOT_HEARTBEAT_SECONDS
             from app.service.worker_slot_service import get_worker_slot_service
             orphan_sweep_seconds = max(10, int(os.environ.get("DFA_ORPHAN_PI_SWEEP_SECONDS", "30")))
             running_reconcile_seconds = max(10, int(os.environ.get("DFA_ORPHAN_RUNNING_RECONCILE_SECONDS", str(max(10, WORKER_SLOT_HEARTBEAT_SECONDS)))))
@@ -319,6 +319,7 @@ class RuntimeBootstrap:
                     get_worker_slot_service().upsert_heartbeat(
                         db,
                         worker_id=WORKER_ID,
+                        instance_id=INSTANCE_ID,
                         pod_name=POD_NAME,
                         pod_ip=POD_IP or None,
                         http_port=int(os.environ.get("PORT") or 8080),

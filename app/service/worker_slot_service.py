@@ -86,6 +86,7 @@ class WorkerSlotService:
         db: Session,
         *,
         worker_id: str,
+        instance_id: str | None,
         pod_name: str,
         pod_ip: str | None,
         http_port: int = 8080,
@@ -98,6 +99,7 @@ class WorkerSlotService:
         if row is None:
             row = AppDfaWorkerSlot(
                 worker_id=worker_id,
+                instance_id=instance_id,
                 pod_name=pod_name,
                 pod_ip=pod_ip,
                 http_port=max(1, int(http_port or 8080)),
@@ -107,6 +109,7 @@ class WorkerSlotService:
             )
             db.add(row)
         else:
+            row.instance_id = instance_id
             row.pod_name = pod_name
             row.pod_ip = pod_ip
             row.http_port = max(1, int(http_port or 8080))
