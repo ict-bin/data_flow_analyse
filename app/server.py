@@ -266,10 +266,15 @@ def _probe_payload() -> dict[str, object]:
     supervisor = get_task_service().supervisor_status()
     now_ts = time.time()
     heartbeat_recent = bool(worker_slot["last_heartbeat_at"] and now_ts - float(worker_slot["last_heartbeat_at"]) <= 90)
+    worker_role_enabled = ROLE in {"worker", "all", "standalone"} or bool(DISPATCHER_ENABLED or EXECUTOR_ENABLED)
+    worker_ready = (not worker_role_enabled) or (
+        bool(worker_slot["thread_alive"])
+        and heartbeat_recent
+        and bool(supervisor["thread_alive"])
+    )
     ready_ok = bool(
         bootstrap["ready"]
-        and worker_slot["thread_alive"]
-        and heartbeat_recent
+        and worker_ready
         and _loop_lag_seconds <= 5.0
         and not _probe_shutdown
     )
@@ -314,7 +319,15 @@ def _probe_payload() -> dict[str, object]:
             "shutting_down"
             if _probe_shutdown
             else bootstrap["error"]
-            or ("worker_slot_heartbeat_stale" if not heartbeat_recent else "control_plane_lagged")
+            or (
+                "worker_slot_heartbeat_stale"
+                if worker_role_enabled and not heartbeat_recent
+                else (
+                    "execution_supervisor_unavailable"
+                    if worker_role_enabled and not bool(supervisor["thread_alive"])
+                    else "control_plane_lagged"
+                )
+            )
         ),
         "checks": {
             "bootstrap": {
@@ -329,17 +342,19 @@ def _probe_payload() -> dict[str, object]:
                 "last_tick_at": _control_plane_last_tick_at or None,
             },
             "heartbeat": {
-                "ok": heartbeat_recent and bool(worker_slot["thread_alive"]),
+                "ok": (not worker_role_enabled) or (heartbeat_recent and bool(worker_slot["thread_alive"])),
                 "thread_alive": bool(worker_slot["thread_alive"]),
                 "last_heartbeat_at": worker_slot["last_heartbeat_at"] or None,
                 "last_heartbeat_ok": bool(worker_slot["last_heartbeat_ok"]),
                 "last_error": worker_slot["last_error"],
+                "required": worker_role_enabled,
             },
             "supervisor": {
-                "ok": bool(supervisor["thread_alive"]),
+                "ok": (not worker_role_enabled) or bool(supervisor["thread_alive"]),
                 "thread_alive": bool(supervisor["thread_alive"]),
                 "last_run_at": supervisor["last_run_at"] or None,
                 "last_error": supervisor["last_error"],
+                "required": worker_role_enabled,
             },
         },
     }
