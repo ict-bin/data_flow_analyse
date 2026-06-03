@@ -47,6 +47,7 @@ class OrphanedRunningCandidate:
     control_version: int
     dispatch_status: str | None
     execution_lease_until: object | None
+    execution_heartbeat_at: object | None
     reason: str
 
 
@@ -56,6 +57,10 @@ def _lease_requeue_deadline(base_time=None):
 
 def _lease_deadline():
     return now_local() + timedelta(seconds=LEASE_TTL_SECONDS)
+
+
+def _running_reclaim_cutoff(base_time=None):
+    return (base_time or now_local()) - timedelta(seconds=max(LEASE_TTL_SECONDS, LEASE_REQUEUE_DELAY_SECONDS) * 2)
 
 
 def claim_one_runnable_task(db: Session, owner_id: str) -> ClaimedTask | None:
@@ -212,6 +217,7 @@ def recover_running_task_if_owner(
 
 def list_recoverable_orphaned_running_tasks(db: Session, *, limit: int = 100) -> list[OrphanedRunningCandidate]:
     now = now_local()
+    reclaim_cutoff = _running_reclaim_cutoff(now)
     rows = (
         db.query(AppDfaTask)
         .filter(
@@ -219,8 +225,13 @@ def list_recoverable_orphaned_running_tasks(db: Session, *, limit: int = 100) ->
             AppDfaTask.status == "running",
             (
                 (AppDfaTask.execution_owner_id.is_(None))
-                | (AppDfaTask.execution_lease_until.is_(None))
-                | (AppDfaTask.execution_lease_until < now)
+                | (
+                    (AppDfaTask.execution_lease_until.is_(None) | (AppDfaTask.execution_lease_until < reclaim_cutoff))
+                    & (
+                        AppDfaTask.execution_heartbeat_at.is_(None)
+                        | (AppDfaTask.execution_heartbeat_at < reclaim_cutoff)
+                    )
+                )
             ),
         )
         .order_by(AppDfaTask.updated_at.asc(), AppDfaTask.id.asc())
@@ -231,10 +242,14 @@ def list_recoverable_orphaned_running_tasks(db: Session, *, limit: int = 100) ->
     for row in rows:
         if row.execution_owner_id is None:
             reason = "missing_owner"
+        elif row.execution_lease_until is None and row.execution_heartbeat_at is None:
+            reason = "missing_lease_and_heartbeat"
         elif row.execution_lease_until is None:
-            reason = "missing_lease"
+            reason = "missing_lease_stale_heartbeat"
+        elif row.execution_heartbeat_at is None:
+            reason = "expired_lease_missing_heartbeat"
         else:
-            reason = "expired_lease"
+            reason = "expired_lease_stale_heartbeat"
         candidates.append(
             OrphanedRunningCandidate(
                 task_id=row.task_id,
@@ -243,6 +258,7 @@ def list_recoverable_orphaned_running_tasks(db: Session, *, limit: int = 100) ->
                 control_version=int(row.control_version or 0),
                 dispatch_status=row.dispatch_status,
                 execution_lease_until=row.execution_lease_until,
+                execution_heartbeat_at=row.execution_heartbeat_at,
                 reason=reason,
             )
         )
