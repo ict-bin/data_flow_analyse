@@ -3770,6 +3770,22 @@ class TaskService:
     def _row_to_dict(row: AppDfaTask, *, include_heavy: bool = True, db: Session | None = None) -> dict:
         def fmt(dt: datetime | None) -> str | None:
             return isoformat_local(dt)
+        def duration_ms() -> float | None:
+            if isinstance(result_json, dict) and result_json.get("total_duration_ms") is not None:
+                try:
+                    return float(result_json.get("total_duration_ms"))
+                except (TypeError, ValueError):
+                    return None
+            if row.started_at is None:
+                return None
+            finished_at = row.finished_at or datetime.now(timezone.utc)
+            started_at = row.started_at
+            if started_at.tzinfo is None:
+                started_at = started_at.replace(tzinfo=timezone.utc)
+            if finished_at.tzinfo is None:
+                finished_at = finished_at.replace(tzinfo=timezone.utc)
+            duration = (finished_at - started_at).total_seconds() * 1000.0
+            return max(duration, 0.0)
         abnormal_reason = _task_abnormal_reason(row)
         auto_requeue_pending = _auto_requeue_pending(row)
         task_root = str(Path(row.output_path) / row.task_id) if row.output_path else None
@@ -3777,7 +3793,9 @@ class TaskService:
         workspace_root = str(Path(run_root) / "epochs") if run_root else None
         ctx = _get_running_task_context(row.task_id)
         result_json = _lightweight_result_json(row, row.result_json) if include_heavy else None
-        latest_started_at = _latest_execution_started_at(db, row.task_id) if db is not None else fmt(row.started_at)
+        latest_started_at = _latest_execution_started_at(db, row.task_id) if db is not None else None
+        if not latest_started_at:
+            latest_started_at = fmt(row.started_at)
         return {
             **_origin_payload(row),
             "task_id": row.task_id, "project_id": row.project_id,
@@ -3809,11 +3827,7 @@ class TaskService:
             "created_at": fmt(row.created_at), "updated_at": fmt(row.updated_at),
             "started_at": fmt(row.started_at), "finished_at": fmt(row.finished_at),
             "latest_started_at": latest_started_at,
-            "execution_duration_ms": (
-                float(result_json.get("total_duration_ms"))
-                if isinstance(result_json, dict) and result_json.get("total_duration_ms") is not None
-                else None
-            ),
+            "execution_duration_ms": duration_ms(),
             "execution_owner_id": row.execution_owner_id,
             "execution_lease_until": fmt(row.execution_lease_until),
             "execution_heartbeat_at": fmt(row.execution_heartbeat_at),
