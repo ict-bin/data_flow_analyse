@@ -64,6 +64,11 @@ TASK_EVENT_RENEW_INTERVAL_SECONDS = max(60, HEARTBEAT_INTERVAL_SECONDS * 6)
 EXECUTION_SUPERVISOR_INTERVAL_SECONDS = float(os.environ.get("DFA_EXECUTION_SUPERVISOR_INTERVAL_SECONDS", "5"))
 EXECUTION_NO_PROGRESS_SECONDS = float(os.environ.get("DFA_EXECUTION_NO_PROGRESS_SECONDS", "120"))
 AUTO_REQUEUE_REASON_LEASE_LOST = "lease_lost"
+LEASE_REQUEUE_RETRY_DELAYS_SECONDS = (1.0, 2.0, 5.0)
+LEASE_RECOVERY_STATE_IDLE = "idle"
+LEASE_RECOVERY_STATE_REQUESTED = "requested"
+LEASE_RECOVERY_STATE_REQUEUE_COMMITTED = "requeue_committed"
+LEASE_RECOVERY_STATE_FAILED = "failed"
 
 _RUNNING_TASK_LOCK = threading.RLock()
 _running_tasks: dict[str, "_RunningTaskContext"] = {}
@@ -86,6 +91,9 @@ class _RunningTaskContext:
     lease_renew_failure_count: int = 0
     last_lease_renew_attempt_at: float = 0.0
     last_lease_renew_success_at: float = 0.0
+    lease_recovery_state: str = LEASE_RECOVERY_STATE_IDLE
+    lease_recovery_error: str | None = None
+    lease_recovery_updated_at: float = 0.0
     termination_reason: str | None = None
     cancel_requested: threading.Event = field(default_factory=threading.Event)
     lease_stop_requested: threading.Event = field(default_factory=threading.Event)
@@ -146,6 +154,19 @@ def _compact_event_payload(payload: dict[str, object] | None) -> dict[str, objec
         else:
             compact[key] = _fit_event_message(value)
     return compact
+
+
+def _is_db_connection_error(exc: Exception) -> bool:
+    message = str(exc or "").lower()
+    return any(token in message for token in [
+        "lost connection to mysql server",
+        "server has gone away",
+        "connection reset",
+        "connection refused",
+        "connection aborted",
+        "broken pipe",
+        "operationalerror",
+    ])
 
 
 def _task_event_dedupe_key(
@@ -1471,11 +1492,117 @@ class TaskService:
         if ctx is not None:
             ctx.termination_reason = recovery_reason
             ctx.cancel_requested.set()
+            ctx.lease_recovery_state = LEASE_RECOVERY_STATE_REQUESTED
+            ctx.lease_recovery_error = None
+            ctx.lease_recovery_updated_at = _time.time()
             if ctx.orch is not None:
                 ctx.orch.abort()
+        return self._request_lease_requeue_with_retry(
+            task_id,
+            owner_id=owner_id,
+            epoch=epoch,
+            control_version=control_version,
+            recovery_reason=recovery_reason,
+        )
+
+    def _request_lease_requeue_with_retry(
+        self,
+        task_id: str,
+        *,
+        owner_id: str,
+        epoch: int,
+        control_version: int,
+        recovery_reason: str,
+    ) -> bool:
+        from app.db import get_db
+
+        last_error: Exception | None = None
+        for attempt, delay in enumerate((0.0, *LEASE_REQUEUE_RETRY_DELAYS_SECONDS), start=1):
+            if delay > 0:
+                _time.sleep(delay)
+            db_gen = get_db()
+            lease_db: Session = next(db_gen)
+            try:
+                recovered = self._commit_lease_requeue(
+                    lease_db,
+                    task_id,
+                    owner_id=owner_id,
+                    epoch=epoch,
+                    control_version=control_version,
+                    recovery_reason=recovery_reason,
+                    attempt=attempt,
+                )
+                if recovered:
+                    ctx = _get_running_task_context(task_id)
+                    if ctx is not None:
+                        ctx.lease_recovery_state = LEASE_RECOVERY_STATE_REQUEUE_COMMITTED
+                        ctx.lease_recovery_error = None
+                        ctx.lease_recovery_updated_at = _time.time()
+                    return True
+                return False
+            except Exception as exc:
+                last_error = exc
+                ctx = _get_running_task_context(task_id)
+                if ctx is not None:
+                    ctx.lease_recovery_error = str(exc)
+                    ctx.lease_recovery_updated_at = _time.time()
+                try:
+                    lease_db.rollback()
+                except Exception:
+                    pass
+                recover_row = lease_db.query(AppDfaTask).filter_by(task_id=task_id).first()
+                if recover_row is not None:
+                    recover_row.lease_recovery_state = LEASE_RECOVERY_STATE_FAILED
+                    recover_row.lease_recovery_error = str(exc)
+                    recover_row.lease_recovery_updated_at = now_local()
+                    _record_task_event(
+                        lease_db,
+                        row=recover_row,
+                        event_type="task_lease_requeue_retry" if attempt < len(LEASE_REQUEUE_RETRY_DELAYS_SECONDS) + 1 else "task_lease_requeue_failed",
+                        message="任务 lease_lost 自动回队失败，正在重试" if attempt < len(LEASE_REQUEUE_RETRY_DELAYS_SECONDS) + 1 else "任务 lease_lost 自动回队失败，已进入后台修复",
+                        level="warning",
+                        status=recover_row.status,
+                        dispatch_status=recover_row.dispatch_status,
+                        payload={
+                            "attempt": attempt,
+                            "error": str(exc),
+                            "owner_id": owner_id,
+                            "epoch": epoch,
+                            "control_version": control_version,
+                        },
+                    )
+                    lease_db.commit()
+                if not _is_db_connection_error(exc):
+                    break
+            finally:
+                try:
+                    next(db_gen)
+                except StopIteration:
+                    pass
+        ctx = _get_running_task_context(task_id)
+        if ctx is not None:
+            ctx.lease_recovery_state = LEASE_RECOVERY_STATE_FAILED
+            ctx.lease_recovery_error = str(last_error) if last_error is not None else "lease_requeue_failed"
+            ctx.lease_recovery_updated_at = _time.time()
+        return False
+
+    def _commit_lease_requeue(
+        self,
+        db: Session,
+        task_id: str,
+        *,
+        owner_id: str,
+        epoch: int,
+        control_version: int,
+        recovery_reason: str,
+        attempt: int,
+    ) -> bool:
         row = db.query(AppDfaTask).filter_by(task_id=task_id).first()
         if row is None:
             return False
+        row.lease_recovery_state = LEASE_RECOVERY_STATE_REQUESTED
+        row.lease_recovery_error = None
+        row.lease_recovery_updated_at = now_local()
         recovered = recover_running_task_if_owner(
             db,
             task_id,
@@ -1485,10 +1612,14 @@ class TaskService:
             reason=recovery_reason,
         )
         if not recovered:
-            return False
+            refreshed = db.query(AppDfaTask).filter_by(task_id=task_id).first()
+            return bool(refreshed and str(refreshed.status or "") == "pending")
         refreshed = db.query(AppDfaTask).filter_by(task_id=task_id).first()
         if refreshed is None:
             return False
+        refreshed.lease_recovery_state = LEASE_RECOVERY_STATE_REQUEUE_COMMITTED
+        refreshed.lease_recovery_error = None
+        refreshed.lease_recovery_updated_at = now_local()
         payload = {
             "owner_id": owner_id,
             "epoch": epoch,
@@ -1496,6 +1627,7 @@ class TaskService:
             "lease_lost_count": int(refreshed.lease_lost_count or 0),
             "lease_requeue_not_before": isoformat_local(refreshed.lease_requeue_not_before),
             "recovery_reason": recovery_reason,
+            "attempt": attempt,
         }
         _record_task_event(
             db,
@@ -1592,6 +1724,23 @@ class TaskService:
                             except StopIteration:
                                 pass
                         _unregister_running_task_context(task_id)
+                    db_gen = get_db()
+                    db: Session = next(db_gen)
+                    try:
+                        repaired = self.reconcile_failed_lease_recoveries(db, limit=20)
+                        if repaired:
+                            log_event(
+                                logger,
+                                logging.WARNING,
+                                "lease recovery repair worker repaired failed samples",
+                                event="task_lease_recovery_repaired",
+                                repaired_count=repaired,
+                            )
+                    finally:
+                        try:
+                            next(db_gen)
+                        except StopIteration:
+                            pass
                     self._last_supervisor_error = None
                 except Exception as exc:
                     self._last_supervisor_error = str(exc)
@@ -1650,6 +1799,55 @@ class TaskService:
         if recovered:
             db.commit()
         return len(recovered)
+
+    def reconcile_failed_lease_recoveries(self, db: Session, *, limit: int = 50) -> int:
+        rows = (
+            db.query(AppDfaTask)
+            .filter(
+                AppDfaTask.is_deleted.is_(False),
+                AppDfaTask.status == "error",
+                AppDfaTask.execution_owner_id.is_(None),
+                AppDfaTask.lease_lost_count == 0,
+                (
+                    (AppDfaTask.lease_recovery_state == LEASE_RECOVERY_STATE_FAILED)
+                    | (
+                        AppDfaTask.latest_abnormal_reason_json.is_not(None)
+                        & (AppDfaTask.error.like("%Lost connection to MySQL server during query%"))
+                    )
+                ),
+            )
+            .order_by(AppDfaTask.updated_at.desc(), AppDfaTask.id.desc())
+            .limit(max(1, int(limit or 50)))
+            .all()
+        )
+        repaired = 0
+        for row in rows:
+            row.status = "pending"
+            row.finished_at = None
+            row.error = None
+            row.latest_abnormal_reason_json = None
+            row.dispatch_status = "pending"
+            row.lease_lost_count = max(1, int(row.lease_lost_count or 0) + 1)
+            row.last_lease_lost_at = row.last_lease_lost_at or now_local()
+            row.lease_requeue_not_before = now_local()
+            row.lease_recovery_state = LEASE_RECOVERY_STATE_REQUEUE_COMMITTED
+            row.lease_recovery_error = None
+            row.lease_recovery_updated_at = now_local()
+            flag_modified(row, "latest_abnormal_reason_json")
+            _record_task_event(
+                db,
+                row=row,
+                event_type="task_lease_recovery_repaired",
+                message="后台修复 worker 已补救 lease_lost 回队失败样本",
+                level="warning",
+                status=row.status,
+                dispatch_status=row.dispatch_status,
+                payload={"repair_reason": "lease_recovery_failed_sample"},
+            )
+            repaired += 1
+        if repaired:
+            db.commit()
+        return repaired
 
     async def dispatch_once(self) -> str | None:
         if self.local_running_task_count() >= MAX_LOCAL_RUNNING_TASKS:
@@ -2851,6 +3049,29 @@ class TaskService:
             try:
                 db.rollback()
                 r = db.query(AppDfaTask).filter_by(task_id=task_id).first()
+                lease_recovery_in_progress = bool(
+                    ctx is not None
+                    and ctx.termination_reason == AUTO_REQUEUE_REASON_LEASE_LOST
+                )
+                if r and str(r.lease_recovery_state or "") in {
+                    LEASE_RECOVERY_STATE_REQUESTED,
+                    LEASE_RECOVERY_STATE_REQUEUE_COMMITTED,
+                    LEASE_RECOVERY_STATE_FAILED,
+                }:
+                    lease_recovery_in_progress = True
+                if lease_recovery_in_progress and _is_db_connection_error(exc):
+                    log_event(
+                        logger,
+                        logging.WARNING,
+                        "task exception suppressed because lease recovery has priority",
+                        event="task_lease_recovery_exception_suppressed",
+                        task_id=task_id,
+                        owner_id=WORKER_ID,
+                        epoch=epoch,
+                        control_version=control_version,
+                        error=str(exc),
+                    )
+                    return
                 if r and r.status == "running" and still_owner(db, task_id, WORKER_ID, epoch, control_version):
                     _persist_terminal_failure(r, str(exc), status="error")
                     commit_terminal_state_if_owner(
@@ -3049,6 +3270,9 @@ class TaskService:
                 AppDfaTask.lease_requeue_not_before,
                 AppDfaTask.last_lease_lost_epoch,
                 AppDfaTask.last_lease_lost_control_version,
+                AppDfaTask.lease_recovery_state,
+                AppDfaTask.lease_recovery_error,
+                AppDfaTask.lease_recovery_updated_at,
             ),
         )
 
@@ -3103,6 +3327,13 @@ class TaskService:
             "lease_requeue_not_before": fmt(row.lease_requeue_not_before),
             "last_lease_lost_epoch": row.last_lease_lost_epoch,
             "last_lease_lost_control_version": row.last_lease_lost_control_version,
+            "lease_recovery_state": row.lease_recovery_state,
+            "lease_recovery_error": row.lease_recovery_error,
+            "lease_recovery_failed": str(row.lease_recovery_state or "") == LEASE_RECOVERY_STATE_FAILED,
+            "lease_recovery_expected_requeue": bool(
+                str(row.status or "") in {"error", "cancelled"}
+                and ((row.error or "").find("Lost connection to MySQL server during query") >= 0)
+            ),
             "lease_renew_failure_count": int(ctx.lease_renew_failure_count if ctx is not None else 0),
             "last_lease_renew_success_at": (
                 isoformat_local(datetime.fromtimestamp(ctx.last_lease_renew_success_at, tz=UTC_PLUS_8).replace(tzinfo=None))
@@ -3112,11 +3343,11 @@ class TaskService:
             "last_lease_renew_error": ctx.last_lease_error if ctx is not None else None,
             "auto_requeue_pending": auto_requeue_pending,
             "auto_requeue_reason": AUTO_REQUEUE_REASON_LEASE_LOST if auto_requeue_pending else None,
-            "abnormal_reason": None if auto_requeue_pending else abnormal_reason,
+            "abnormal_reason": None if (auto_requeue_pending or str(row.status or "") in {"running", "pending"}) else abnormal_reason,
             "abnormal_reason_history": _abnormal_reason_history(row) if include_heavy else [],
-            "abnormal_reason_title": None if auto_requeue_pending else (abnormal_reason or {}).get("title"),
-            "abnormal_reason_code": None if auto_requeue_pending else (abnormal_reason or {}).get("code"),
-            "abnormal_reason_category": None if auto_requeue_pending else (abnormal_reason or {}).get("category"),
+            "abnormal_reason_title": None if (auto_requeue_pending or str(row.status or "") in {"running", "pending"}) else (abnormal_reason or {}).get("title"),
+            "abnormal_reason_code": None if (auto_requeue_pending or str(row.status or "") in {"running", "pending"}) else (abnormal_reason or {}).get("code"),
+            "abnormal_reason_category": None if (auto_requeue_pending or str(row.status or "") in {"running", "pending"}) else (abnormal_reason or {}).get("category"),
         }
 
 

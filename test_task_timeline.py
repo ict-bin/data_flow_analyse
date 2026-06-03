@@ -311,13 +311,14 @@ class TaskTimelineTests(unittest.TestCase):
             }
             db.commit()
 
-            requeued = self.service.request_lease_requeue(
-                db,
-                task_id,
-                owner_id="worker-a",
-                epoch=2,
-                control_version=3,
-            )
+            with patch("app.db.get_db", side_effect=lambda: self._db_generator()):
+                requeued = self.service.request_lease_requeue(
+                    db,
+                    task_id,
+                    owner_id="worker-a",
+                    epoch=2,
+                    control_version=3,
+                )
 
             self.assertTrue(requeued)
             payload = self.service.get_task(db, task_id)
@@ -384,6 +385,56 @@ class TaskTimelineTests(unittest.TestCase):
         finally:
             task_service_module._running_tasks.pop(task_id, None)
             task_service_module._running_task_contexts.pop(task_id, None)
+            db.close()
+
+    def test_request_lease_requeue_marks_recovery_state(self):
+        task_id = self._create_task()
+        db = self._session()
+        try:
+            row = db.query(AppDfaTask).filter_by(task_id=task_id).first()
+            row.status = "running"
+            row.execution_owner_id = "worker-a"
+            row.execution_epoch = 2
+            row.control_version = 3
+            row.dispatch_status = "running"
+            row.execution_lease_until = now_local() + timedelta(minutes=5)
+            db.commit()
+
+            with patch("app.db.get_db", side_effect=lambda: self._db_generator()):
+                requeued = self.service.request_lease_requeue(
+                    db,
+                    task_id,
+                    owner_id="worker-a",
+                    epoch=2,
+                    control_version=3,
+                )
+
+            self.assertTrue(requeued)
+            payload = self.service.get_task(db, task_id)
+            self.assertEqual("pending", payload["status"])
+            self.assertEqual("requeue_committed", payload["lease_recovery_state"])
+            self.assertFalse(bool(payload["lease_recovery_failed"]))
+        finally:
+            db.close()
+
+    def test_reconcile_failed_lease_recoveries_requeues_error_sample(self):
+        task_id = self._create_task()
+        db = self._session()
+        try:
+            row = db.query(AppDfaTask).filter_by(task_id=task_id).first()
+            row.status = "error"
+            row.error = "Lost connection to MySQL server during query"
+            row.lease_recovery_state = "failed"
+            db.commit()
+
+            repaired = self.service.reconcile_failed_lease_recoveries(db, limit=10)
+
+            self.assertEqual(1, repaired)
+            payload = self.service.get_task(db, task_id)
+            self.assertEqual("pending", payload["status"])
+            self.assertEqual(1, payload["lease_lost_count"])
+            self.assertEqual("requeue_committed", payload["lease_recovery_state"])
+        finally:
             db.close()
 
     def test_lease_heartbeat_failure_before_ttl_does_not_requeue(self):

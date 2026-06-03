@@ -221,6 +221,30 @@ _MIGRATIONS = [
         statement="ALTER TABLE secflow_app_dfa_tasks ADD COLUMN last_lease_lost_control_version INT NULL",
     ),
     Migration(
+        kind="column",
+        table_name="secflow_app_dfa_tasks",
+        name="lease_recovery_state",
+        statement="ALTER TABLE secflow_app_dfa_tasks ADD COLUMN lease_recovery_state VARCHAR(32) NULL",
+    ),
+    Migration(
+        kind="column",
+        table_name="secflow_app_dfa_tasks",
+        name="lease_recovery_error",
+        statement="ALTER TABLE secflow_app_dfa_tasks ADD COLUMN lease_recovery_error TEXT NULL",
+    ),
+    Migration(
+        kind="column",
+        table_name="secflow_app_dfa_tasks",
+        name="lease_recovery_updated_at",
+        statement="ALTER TABLE secflow_app_dfa_tasks ADD COLUMN lease_recovery_updated_at DATETIME NULL",
+    ),
+    Migration(
+        kind="index",
+        table_name="secflow_app_dfa_tasks",
+        name="ix_dfa_tasks_lease_recovery_state",
+        statement="CREATE INDEX ix_dfa_tasks_lease_recovery_state ON secflow_app_dfa_tasks (lease_recovery_state)",
+    ),
+    Migration(
         kind="index",
         table_name="secflow_app_dfa_tasks",
         name="ix_dfa_tasks_project_deleted_created_id",

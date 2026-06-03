@@ -69,6 +69,9 @@ class AppDfaTask(Base):
     lease_requeue_not_before: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True, index=True)
     last_lease_lost_epoch: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     last_lease_lost_control_version: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    lease_recovery_state: Mapped[Optional[str]] = mapped_column(String(32), nullable=True, index=True)
+    lease_recovery_error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    lease_recovery_updated_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
 
     is_deleted: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
 
