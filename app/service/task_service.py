@@ -95,6 +95,9 @@ class _RunningTaskContext:
     lease_recovery_error: str | None = None
     lease_recovery_updated_at: float = 0.0
     termination_reason: str | None = None
+    root_task_id: str | None = None
+    parent_task_id: str | None = None
+    session_kind: str | None = None
     cancel_requested: threading.Event = field(default_factory=threading.Event)
     lease_stop_requested: threading.Event = field(default_factory=threading.Event)
 
@@ -106,6 +109,7 @@ class _RunningTaskContext:
 
 
 _running_task_contexts: dict[str, _RunningTaskContext] = {}
+_child_execution_contexts: dict[str, _RunningTaskContext] = {}
 
 _TASK_LIST_SORT_COLUMNS = {
     "created_at": AppDfaTask.created_at,
@@ -316,6 +320,9 @@ def _register_running_task_context(
     run_root: str | None = None,
     epoch: int | None = None,
     control_version: int | None = None,
+    root_task_id: str | None = None,
+    parent_task_id: str | None = None,
+    session_kind: str | None = None,
 ) -> _RunningTaskContext:
     with _RUNNING_TASK_LOCK:
         ctx = _running_task_contexts.get(task_id) or _RunningTaskContext()
@@ -333,6 +340,12 @@ def _register_running_task_context(
         ctx.epoch = epoch
     if control_version is not None:
         ctx.control_version = control_version
+    if root_task_id is not None:
+        ctx.root_task_id = root_task_id
+    if parent_task_id is not None:
+        ctx.parent_task_id = parent_task_id
+    if session_kind is not None:
+        ctx.session_kind = session_kind
     ctx.last_state_sync_at = _time.time()
     with _RUNNING_TASK_LOCK:
         _running_task_contexts[task_id] = ctx
@@ -349,6 +362,46 @@ def _unregister_running_task_context(task_id: str) -> None:
     with _RUNNING_TASK_LOCK:
         _running_task_contexts.pop(task_id, None)
         _running_tasks.pop(task_id, None)
+        _child_execution_contexts.pop(task_id, None)
+
+
+def _register_child_execution_context(
+    task_id: str,
+    *,
+    root_task_id: str,
+    parent_task_id: str | None,
+    task_root: str | None,
+    run_root: str | None,
+    epoch: int | None,
+    session_kind: str,
+) -> _RunningTaskContext:
+    with _RUNNING_TASK_LOCK:
+        ctx = _child_execution_contexts.get(task_id) or _RunningTaskContext()
+        ctx.root_task_id = root_task_id
+        ctx.parent_task_id = parent_task_id
+        ctx.task_root = task_root
+        ctx.run_root = run_root
+        ctx.epoch = epoch
+        ctx.session_kind = session_kind
+        now = _time.time()
+        ctx.last_progress_at = now
+        ctx.last_state_sync_at = now
+        _child_execution_contexts[task_id] = ctx
+        return ctx
+
+
+def _unregister_child_execution_context(task_id: str) -> None:
+    with _RUNNING_TASK_LOCK:
+        _child_execution_contexts.pop(task_id, None)
+
+
+def _mark_child_execution_progress(task_id: str) -> None:
+    with _RUNNING_TASK_LOCK:
+        ctx = _child_execution_contexts.get(task_id)
+        if ctx is not None:
+            now = _time.time()
+            ctx.last_progress_at = now
+            ctx.last_state_sync_at = now
 
 
 def _mark_task_progress(task_id: str) -> None:
@@ -1477,6 +1530,33 @@ class TaskService:
                         "task_root": ctx.task_root,
                         "run_root": ctx.run_root or _epoch_run_root_from_task_root(ctx.task_root, ctx.epoch),
                         "active_context": ctx.execution_alive() or ctx.lease_alive(),
+                        "root_task_id": ctx.root_task_id or task_id,
+                        "parent_task_id": ctx.parent_task_id,
+                        "session_kind": ctx.session_kind or "root",
+                    }
+                )
+            for task_id, ctx in _child_execution_contexts.items():
+                rows.append(
+                    {
+                        "task_id": task_id,
+                        "execution_alive": ctx.execution_alive(),
+                        "lease_alive": ctx.lease_alive(),
+                        "last_progress_at": ctx.last_progress_at,
+                        "last_lease_heartbeat_at": ctx.last_lease_heartbeat_at,
+                        "last_state_sync_at": ctx.last_state_sync_at,
+                        "termination_reason": ctx.termination_reason,
+                        "cancel_requested": ctx.cancel_requested.is_set(),
+                        "epoch": ctx.epoch,
+                        "execution_epoch": ctx.epoch,
+                        "control_version": ctx.control_version,
+                        "owner_id": WORKER_ID,
+                        "status": "running",
+                        "task_root": ctx.task_root,
+                        "run_root": ctx.run_root or _epoch_run_root_from_task_root(ctx.task_root, ctx.epoch),
+                        "active_context": True,
+                        "root_task_id": ctx.root_task_id or task_id,
+                        "parent_task_id": ctx.parent_task_id,
+                        "session_kind": ctx.session_kind or "subtask",
                     }
                 )
             return rows

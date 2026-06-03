@@ -100,7 +100,7 @@ class RuntimeBootstrapTests(unittest.IsolatedAsyncioTestCase):
         def fake_heartbeat(**kwargs):
             heartbeat_calls.append(kwargs["worker_id"])
 
-        with patch("app.service.runtime_bootstrap.get_task_service", return_value=SimpleNamespace(reconcile_orphaned_running_tasks=fake_reconcile, running_task_snapshot=lambda: [{"task_id": "dfa_1", "owner_id": "pod-a", "execution_epoch": 1, "status": "running", "active_context": True}])), patch(
+        with patch("app.service.runtime_bootstrap.get_task_service", return_value=SimpleNamespace(reconcile_orphaned_running_tasks=fake_reconcile, running_task_snapshot=lambda: [{"task_id": "dfa_1", "root_task_id": "dfa_1", "parent_task_id": None, "owner_id": "pod-a", "execution_epoch": 1, "status": "running", "active_context": True}])), patch(
             "app.service.worker_slot_service.get_worker_slot_service",
             return_value=SimpleNamespace(upsert_heartbeat=lambda db, **kwargs: fake_heartbeat(**kwargs)),
         ), patch("app.service.runtime_bootstrap.cleanup_orphan_pi_processes", side_effect=lambda *args, **kwargs: orphan_sweep_calls.append(kwargs) or 0), patch(

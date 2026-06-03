@@ -502,6 +502,9 @@ class PerTaintWorkflow:
         max_depth: int = 5,
         on_event: Callable | None = None,
         cancel_event: asyncio.Event | None = None,
+        root_task_id: str = "",
+        parent_task_id: str = "",
+        session_kind: str = "worker",
     ):
         self.cfg = cfg
         self.func_name = func_name
@@ -515,6 +518,9 @@ class PerTaintWorkflow:
         self.max_depth = max_depth
         self.on_event = on_event
         self.cancel_event = cancel_event
+        self.root_task_id = root_task_id or task_id
+        self.parent_task_id = parent_task_id
+        self.session_kind = session_kind or "worker"
 
         # Session 文件路径
         self.sess_dir = out_dir / "sessions"
@@ -597,7 +603,9 @@ class PerTaintWorkflow:
                 "task_id": self.task_id,
                 "task_root": str(self.out_dir.parent) if self.out_dir else "",
                 "task_run_root": str(self.out_dir) if self.out_dir else str(self.ws),
-                "session_kind": "worker" if not is_judge else "judge",
+                "session_kind": self.session_kind if not is_judge else ("subtask_judge" if self.session_kind.startswith("subtask") else "judge"),
+                "root_task_id": self.root_task_id,
+                "parent_task_id": self.parent_task_id,
             },
         )
 

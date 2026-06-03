@@ -562,22 +562,42 @@ class Orchestrator(JudgeMixin):
                 if _root_out_dir is not None
                 else Path(os.path.abspath(cfg.output_dir)) / logical_task_id / "run"
             )
-            result = await self.execute(
-                logical_task_id,
-                archive=False,
-                depth=depth,
-                max_depth=cfg.max_trace_depth,
-                run_dir=out_dir,
+            root_task_id = task_id.split("-d", 1)[0] if task_id else logical_task_id
+            parent_task_id = task_id.rsplit("-d", 1)[0] if task_id and "-d" in task_id else root_task_id
+            from .service.task_service import (
+                _mark_child_execution_progress,
+                _register_child_execution_context,
+                _unregister_child_execution_context,
             )
-            df_path = _find_dataflow_file(out_dir, cfg.function_name)
-            if df_path:
-                try:
-                    df_text = Path(df_path).read_text(encoding="utf-8")
-                    if len(df_text.strip()) > len((result.final_output or "").strip()):
-                        result.final_output = df_text
-                except OSError:
-                    pass
-            return result
+            _register_child_execution_context(
+                logical_task_id,
+                root_task_id=root_task_id,
+                parent_task_id=parent_task_id,
+                task_root=str(out_dir.parent),
+                run_root=str(out_dir),
+                epoch=depth,
+                session_kind="subtask_worker",
+            )
+            try:
+                _mark_child_execution_progress(logical_task_id)
+                result = await self.execute(
+                    logical_task_id,
+                    archive=False,
+                    depth=depth,
+                    max_depth=cfg.max_trace_depth,
+                    run_dir=out_dir,
+                )
+                df_path = _find_dataflow_file(out_dir, cfg.function_name)
+                if df_path:
+                    try:
+                        df_text = Path(df_path).read_text(encoding="utf-8")
+                        if len(df_text.strip()) > len((result.final_output or "").strip()):
+                            result.final_output = df_text
+                    except OSError:
+                        pass
+                return result
+            finally:
+                _unregister_child_execution_context(logical_task_id)
 
         # ── 根任务:BFS 队列 + 工作池 ────────────────────────────────────────
         max_depth = cfg.max_trace_depth
@@ -697,6 +717,9 @@ class Orchestrator(JudgeMixin):
                     max_depth=max_depth,
                     on_event=self.on_event,
                     cancel_event=self._cancel_event,
+                    root_task_id=root_task_id,
+                    parent_task_id=tid.rsplit("-d", 1)[0] if dep > 0 and "-d" in tid else root_task_id,
+                    session_kind="subtask_worker" if dep > 0 else "worker",
                 )
                 result = await workflow.run()
                 self._raise_if_cancelled()

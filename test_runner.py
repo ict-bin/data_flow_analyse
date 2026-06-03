@@ -115,6 +115,55 @@ class RunAgentPromptFileTests(unittest.TestCase):
         self.assertEqual(killed, 0)
         kill_group.assert_not_called()
 
+    def test_cleanup_orphan_pi_processes_preserves_subtask_under_active_root(self):
+        orphan = agent_process.AgentProcessInfo(
+            pid=101,
+            ppid=1,
+            pgid=201,
+            comm="pi",
+            exe="node",
+            cwd="/tmp/root/run/epochs/0001/subtasks/depth_01/child/workspace-worker-0",
+            cmdline="pi --mode rpc",
+            environ={
+                "DFA_TASK_ID": "child",
+                "DFA_ROOT_TASK_ID": "root",
+                "DFA_PARENT_TASK_ID": "root",
+                "DFA_TASK_ROOT": "/tmp/root/run/epochs",
+                "DFA_TASK_RUN_ROOT": "/tmp/root/run/epochs/0001/subtasks/depth_01/child",
+                "DFA_EXECUTION_EPOCH": "1",
+                "DFA_SESSION_KIND": "subtask_worker",
+            },
+        )
+        with patch.object(agent_process, "_iter_agent_processes", return_value=[orphan]), patch.object(
+            agent_process,
+            "_task_process_started_at",
+            return_value=0.0,
+        ), patch.object(
+            agent_process,
+            "_session_activity_mtime",
+            return_value=None,
+        ):
+            with patch.object(agent_process, "_kill_process_group", return_value=True) as kill_group:
+                killed = agent_process.cleanup_orphan_pi_processes(
+                    lambda _: None,
+                    label="test",
+                    owner_id="pod-a",
+                    runtime_snapshots=[
+                        {
+                            "task_id": "root",
+                            "root_task_id": "root",
+                            "parent_task_id": None,
+                            "owner_id": "pod-a",
+                            "execution_epoch": 1,
+                            "status": "running",
+                            "run_root": "/tmp/root/run/epochs/0001",
+                            "active_context": True,
+                        }
+                    ],
+                )
+        self.assertEqual(killed, 0)
+        kill_group.assert_not_called()
+
     def test_cleanup_task_agent_processes_only_hits_matching_task(self):
         match = agent_process.AgentProcessInfo(
             pid=101,

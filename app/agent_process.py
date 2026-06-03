@@ -144,6 +144,8 @@ class AgentCleanupTarget:
 @dataclass(frozen=True)
 class AgentRuntimeSnapshot:
     task_id: str
+    root_task_id: str | None = None
+    parent_task_id: str | None = None
     owner_id: str | None = None
     execution_epoch: int | None = None
     status: str | None = None
@@ -261,6 +263,14 @@ def _env_session_kind(info: AgentProcessInfo) -> str | None:
     return raw or None
 
 
+def _env_root_task_id(info: AgentProcessInfo) -> str:
+    return str(info.environ.get("DFA_ROOT_TASK_ID") or "").strip()
+
+
+def _env_parent_task_id(info: AgentProcessInfo) -> str:
+    return str(info.environ.get("DFA_PARENT_TASK_ID") or "").strip()
+
+
 def _session_activity_mtime(run_root: str | None) -> float | None:
     normalized = _normalize_path(run_root)
     if not normalized:
@@ -299,6 +309,8 @@ def _normalize_runtime_snapshots(
             execution_epoch = None
         normalized[task_id] = AgentRuntimeSnapshot(
             task_id=task_id,
+            root_task_id=str(item.get("root_task_id") or "").strip() or None,
+            parent_task_id=str(item.get("parent_task_id") or "").strip() or None,
             owner_id=str(item.get("owner_id") or item.get("execution_owner_id") or "").strip() or None,
             execution_epoch=execution_epoch,
             status=str(item.get("status") or "").strip() or None,
@@ -345,6 +357,8 @@ def _build_orphan_sweep_decision(
     recent_activity_seconds: float,
 ) -> OrphanSweepDecision:
     task_id = _env_task_id(info)
+    root_task_id = _env_root_task_id(info)
+    parent_task_id = _env_parent_task_id(info)
     run_root = _env_run_root(info)
     env_epoch = _env_execution_epoch(info)
     session_kind = _env_session_kind(info)
@@ -370,6 +384,31 @@ def _build_orphan_sweep_decision(
                 db_status=snapshot.status,
                 session_kind=session_kind,
             )
+    if root_task_id:
+        root_snapshot = runtime_snapshots.get(root_task_id)
+        if root_snapshot is not None:
+            owner_match = not owner_id or not root_snapshot.owner_id or root_snapshot.owner_id == owner_id
+            epoch_match = env_epoch is None or root_snapshot.execution_epoch is None or root_snapshot.execution_epoch == env_epoch
+            active_root = root_snapshot.active_context or str(root_snapshot.status or "").lower() == "running"
+            run_root_match = bool(run_root) and (
+                _path_within(run_root, root_snapshot.run_root)
+                or _path_within(run_root, pathlib.Path(str(root_snapshot.run_root or "")) / "subtasks")
+            )
+            parent_match = not parent_task_id or any(
+                snapshot_item.parent_task_id == parent_task_id or snapshot_item.task_id == parent_task_id
+                for snapshot_item in runtime_snapshots.values()
+            )
+            if owner_match and epoch_match and active_root and run_root_match and parent_match:
+                return OrphanSweepDecision(
+                    False,
+                    "active_root_execution_tree",
+                    active_context_matched=bool(root_snapshot.active_context),
+                    recent_activity_seconds=activity_age,
+                    db_owner_id=root_snapshot.owner_id,
+                    db_execution_epoch=root_snapshot.execution_epoch,
+                    db_status=root_snapshot.status,
+                    session_kind=session_kind,
+                )
     if activity_age is not None and activity_age <= recent_activity_seconds:
         return OrphanSweepDecision(
             False,

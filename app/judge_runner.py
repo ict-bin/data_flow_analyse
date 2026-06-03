@@ -100,6 +100,8 @@ class JudgeMixin:
             pi_retry_delay=cfg.pi_retry_delay,
             task_context={
                 "task_id": result.task_id,
+                "root_task_id": result.task_id,
+                "parent_task_id": "",
                 "task_root": str(Path(cwd).resolve().parent),
                 "task_run_root": str(Path(cwd).resolve()),
                 "session_kind": "merge",

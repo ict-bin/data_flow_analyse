@@ -363,6 +363,10 @@ def _build_agent_env(
     payload["DFA_TASK_RUN_ROOT"] = str(task_context.get("task_run_root") or cwd)
     if task_context.get("task_id"):
         payload["DFA_TASK_ID"] = str(task_context["task_id"])
+    if task_context.get("root_task_id"):
+        payload["DFA_ROOT_TASK_ID"] = str(task_context["root_task_id"])
+    if task_context.get("parent_task_id"):
+        payload["DFA_PARENT_TASK_ID"] = str(task_context["parent_task_id"])
     if task_context.get("task_root"):
         payload["DFA_TASK_ROOT"] = str(task_context["task_root"])
     if task_context.get("worker_id"):
