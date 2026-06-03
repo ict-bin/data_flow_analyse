@@ -276,7 +276,7 @@ def _latest_execution_started_at(db: Session, task_id: str) -> str | None:
         db.query(AppDfaTaskEvent.created_at)
         .filter(
             AppDfaTaskEvent.task_id == task_id,
-            AppDfaTaskEvent.event_type == "task_execution_started",
+            AppDfaTaskEvent.event_type.in_(("task_started", "task_execution_started")),
         )
         .order_by(AppDfaTaskEvent.created_at.desc())
         .first()
@@ -3770,12 +3770,22 @@ class TaskService:
     def _row_to_dict(row: AppDfaTask, *, include_heavy: bool = True, db: Session | None = None) -> dict:
         def fmt(dt: datetime | None) -> str | None:
             return isoformat_local(dt)
+        def latest_started_at_value() -> str | None:
+            latest = _latest_execution_started_at(db, row.task_id) if db is not None else None
+            if latest:
+                return latest
+            if str(row.status or "").strip().lower() in {"running", "passed", "failed", "error", "cancelled"}:
+                return fmt(row.started_at)
+            return None
         def duration_ms() -> float | None:
             if isinstance(result_json, dict) and result_json.get("total_duration_ms") is not None:
                 try:
                     return float(result_json.get("total_duration_ms"))
                 except (TypeError, ValueError):
                     return None
+            normalized_status = str(row.status or "").strip().lower()
+            if normalized_status not in {"running", "passed", "failed", "error", "cancelled"}:
+                return None
             if row.started_at is None:
                 return None
             finished_at = row.finished_at or datetime.now(timezone.utc)
@@ -3793,9 +3803,7 @@ class TaskService:
         workspace_root = str(Path(run_root) / "epochs") if run_root else None
         ctx = _get_running_task_context(row.task_id)
         result_json = _lightweight_result_json(row, row.result_json) if include_heavy else None
-        latest_started_at = _latest_execution_started_at(db, row.task_id) if db is not None else None
-        if not latest_started_at:
-            latest_started_at = fmt(row.started_at)
+        latest_started_at = latest_started_at_value()
         return {
             **_origin_payload(row),
             "task_id": row.task_id, "project_id": row.project_id,
