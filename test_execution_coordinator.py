@@ -14,6 +14,7 @@ from app.service.execution_coordinator import (
     claim_one_runnable_task,
     commit_terminal_state_if_owner,
     list_recoverable_orphaned_running_tasks,
+    release_lease,
     recover_running_task_if_owner,
     reclaim_orphaned_running_tasks,
     renew_lease,
@@ -44,6 +45,7 @@ class ExecutionCoordinatorTests(unittest.TestCase):
                 prompt_content=kwargs.get("prompt_content", "analyse"),
                 status=kwargs.get("status", "pending"),
                 execution_owner_id=kwargs.get("execution_owner_id"),
+                execution_owner_instance_id=kwargs.get("execution_owner_instance_id"),
                 execution_lease_until=kwargs.get("execution_lease_until"),
                 execution_epoch=kwargs.get("execution_epoch", 0),
                 control_version=kwargs.get("control_version", 0),
@@ -248,6 +250,7 @@ class ExecutionCoordinatorTests(unittest.TestCase):
             task_id="dfa_missing_owner",
             status="running",
             execution_owner_id=None,
+            execution_owner_instance_id="pod-old:deadbeef",
             execution_lease_until=future,
             execution_epoch=1,
             control_version=0,
@@ -272,13 +275,34 @@ class ExecutionCoordinatorTests(unittest.TestCase):
             self.assertEqual(rows["dfa_missing_owner"].status, "pending")
             self.assertEqual(rows["dfa_missing_owner"].dispatch_status, "pending")
             self.assertIsNone(rows["dfa_missing_owner"].execution_owner_id)
+            self.assertIsNone(rows["dfa_missing_owner"].execution_owner_instance_id)
             self.assertEqual(1, int(rows["dfa_missing_owner"].lease_lost_count or 0))
             self.assertIsNotNone(rows["dfa_missing_owner"].lease_requeue_not_before)
             self.assertEqual(rows["dfa_expired_lease"].status, "pending")
             self.assertEqual(rows["dfa_expired_lease"].dispatch_status, "pending")
             self.assertIsNone(rows["dfa_expired_lease"].execution_owner_id)
+            self.assertIsNone(rows["dfa_expired_lease"].execution_owner_instance_id)
             self.assertEqual(1, int(rows["dfa_expired_lease"].lease_lost_count or 0))
             self.assertIsNotNone(rows["dfa_expired_lease"].lease_requeue_not_before)
+        finally:
+            db.close()
+
+    def test_release_lease_does_not_clear_running_task_owner(self):
+        self._insert_task(
+            status="running",
+            execution_owner_id="pod-a",
+            execution_owner_instance_id="pod-a:inst1",
+            execution_epoch=2,
+            dispatch_status="running",
+        )
+        db = self._session()
+        try:
+            self.assertFalse(release_lease(db, "dfa_test_1", "pod-a", 2))
+            row = db.query(AppDfaTask).filter_by(task_id="dfa_test_1").first()
+            self.assertEqual("running", row.status)
+            self.assertEqual("pod-a", row.execution_owner_id)
+            self.assertEqual("pod-a:inst1", row.execution_owner_instance_id)
+            self.assertEqual("running", row.dispatch_status)
         finally:
             db.close()
 

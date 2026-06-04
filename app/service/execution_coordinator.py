@@ -45,6 +45,7 @@ class RecoveredRunningTask:
 class OrphanedRunningCandidate:
     task_id: str
     execution_owner_id: str | None
+    execution_owner_instance_id: str | None
     execution_epoch: int
     control_version: int
     dispatch_status: str | None
@@ -160,6 +161,7 @@ def release_lease(db: Session, task_id: str, owner_id: str, epoch: int) -> bool:
             AppDfaTask.task_id == task_id,
             AppDfaTask.execution_owner_id == owner_id,
             AppDfaTask.execution_epoch == epoch,
+            AppDfaTask.status != "running",
         )
         .update(
             {
@@ -259,6 +261,7 @@ def list_recoverable_orphaned_running_tasks(db: Session, *, limit: int = 100) ->
             OrphanedRunningCandidate(
                 task_id=row.task_id,
                 execution_owner_id=row.execution_owner_id,
+                execution_owner_instance_id=row.execution_owner_instance_id,
                 execution_epoch=int(row.execution_epoch or 0),
                 control_version=int(row.control_version or 0),
                 dispatch_status=row.dispatch_status,
@@ -288,6 +291,7 @@ def reclaim_orphaned_running_tasks(db: Session, *, limit: int = 100) -> list[Rec
                 {
                     AppDfaTask.status: "pending",
                     AppDfaTask.execution_owner_id: None,
+                    AppDfaTask.execution_owner_instance_id: None,
                     AppDfaTask.execution_lease_until: None,
                     AppDfaTask.execution_heartbeat_at: None,
                     AppDfaTask.dispatch_status: "pending",

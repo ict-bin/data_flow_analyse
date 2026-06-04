@@ -2323,6 +2323,7 @@ class TaskService:
                         {
                             AppDfaTask.status: "pending",
                             AppDfaTask.execution_owner_id: None,
+                            AppDfaTask.execution_owner_instance_id: None,
                             AppDfaTask.execution_lease_until: None,
                             AppDfaTask.execution_heartbeat_at: None,
                             AppDfaTask.dispatch_status: "pending",
