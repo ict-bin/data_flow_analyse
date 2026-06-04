@@ -182,6 +182,44 @@ class OrphanSweepDecision:
     session_kind: str | None = None
 
 
+@dataclass(frozen=True)
+class AgentCleanupProcessRecord:
+    pid: int
+    pgid: int | None
+    ppid: int | None
+    cmdline: str
+    cwd: str
+    exe: str
+    task_id: str | None
+    root_task_id: str | None
+    worker_id: str | None
+    execution_epoch: int | None
+    match_reason: str
+    kill_attempted: bool
+    kill_result: str
+
+
+@dataclass(frozen=True)
+class AgentCleanupScanResult:
+    scan_phase: str
+    matched_count: int
+    killed_count: int
+    failed_count: int
+    surviving_count: int
+    matched_processes: list[AgentCleanupProcessRecord]
+    killed_processes: list[AgentCleanupProcessRecord]
+    failed_processes: list[AgentCleanupProcessRecord]
+    surviving_processes: list[AgentCleanupProcessRecord]
+
+    @property
+    def cleanup_result(self) -> str:
+        if self.matched_count <= 0:
+            return "clean"
+        if self.failed_count > 0 or self.surviving_count > 0:
+            return "residual_present" if self.surviving_count > 0 else "partially_cleaned"
+        return "cleaned"
+
+
 def _iter_agent_processes() -> list[AgentProcessInfo]:
     candidates: list[AgentProcessInfo] = []
     proc_root = pathlib.Path("/proc")
@@ -497,6 +535,67 @@ def cleanup_task_agent_processes(
         if _kill_process_group(logger, label=label, info=info, reason="task_targeted_cleanup"):
             killed += 1
     return killed
+
+
+def scan_and_cleanup_worker_agent_processes(
+    logger: Callable[[str], None],
+    *,
+    label: str,
+    scan_phase: str,
+    worker_id: str | None = None,
+) -> AgentCleanupScanResult:
+    matched_processes: list[AgentCleanupProcessRecord] = []
+    killed_processes: list[AgentCleanupProcessRecord] = []
+    failed_processes: list[AgentCleanupProcessRecord] = []
+    surviving_processes: list[AgentCleanupProcessRecord] = []
+    seen_pgids: set[tuple[str, int]] = set()
+    target_worker_id = str(worker_id or "").strip() or None
+    for info in _iter_agent_processes():
+        env_worker_id = str(info.environ.get("DFA_WORKER_ID") or "").strip() or None
+        if target_worker_id and env_worker_id and env_worker_id != target_worker_id:
+            continue
+        if not _matches_target(info, None):
+            continue
+        key = ("pg", info.pgid) if info.pgid is not None else ("pid", info.pid)
+        if key in seen_pgids:
+            continue
+        seen_pgids.add(key)
+        record = AgentCleanupProcessRecord(
+            pid=info.pid,
+            pgid=info.pgid,
+            ppid=info.ppid,
+            cmdline=info.cmdline,
+            cwd=info.cwd,
+            exe=info.exe,
+            task_id=_env_task_id(info) or None,
+            root_task_id=_env_root_task_id(info) or None,
+            worker_id=env_worker_id,
+            execution_epoch=_env_execution_epoch(info),
+            match_reason="worker_pod_agent_process",
+            kill_attempted=True,
+            kill_result="failed",
+        )
+        matched_processes.append(record)
+        if _kill_process_group(logger, label=label, info=info, reason=f"worker_pod_cleanup:{scan_phase}"):
+            killed_record = AgentCleanupProcessRecord(**{**record.__dict__, "kill_result": "killed"})
+            killed_processes.append(killed_record)
+            if info.pgid is not None and process_group_exists(info.pgid):
+                surviving_processes.append(AgentCleanupProcessRecord(**{**record.__dict__, "kill_result": "surviving"}))
+        else:
+            failed_record = AgentCleanupProcessRecord(**{**record.__dict__, "kill_result": "failed"})
+            failed_processes.append(failed_record)
+            surviving_processes.append(AgentCleanupProcessRecord(**{**record.__dict__, "kill_result": "surviving"}))
+    return AgentCleanupScanResult(
+        scan_phase=scan_phase,
+        matched_count=len(matched_processes),
+        killed_count=len(killed_processes),
+        failed_count=len(failed_processes),
+        surviving_count=len(surviving_processes),
+        matched_processes=matched_processes,
+        killed_processes=killed_processes,
+        failed_processes=failed_processes,
+        surviving_processes=surviving_processes,
+    )
 
 
 def cleanup_orphan_pi_processes(

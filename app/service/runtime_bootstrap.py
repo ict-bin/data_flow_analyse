@@ -12,7 +12,6 @@ from typing import Optional
 
 from fastapi import FastAPI
 
-from app.agent_process import cleanup_orphan_pi_processes
 from app.config import get_service_yaml
 from app.runtime_context import (
     DISPATCHER_ENABLED,
@@ -56,7 +55,6 @@ class RuntimeBootstrap:
         self._worker_slot_last_heartbeat_ok = False
         self._worker_slot_last_reconcile_at = 0.0
         self._worker_slot_last_error: str | None = None
-        self._worker_slot_orphan_tracker: dict[str, int] = {}
 
     async def start(self, app: FastAPI) -> None:
         if self._task and not self._task.done():
@@ -289,10 +287,8 @@ class RuntimeBootstrap:
             from app.db import get_db
             from app.runtime_context import INSTANCE_ID, MAX_LOCAL_RUNNING_TASKS, POD_IP, POD_NAME, WORKER_ID, WORKER_SLOT_HEARTBEAT_SECONDS
             from app.service.worker_slot_service import get_worker_slot_service
-            orphan_sweep_seconds = max(10, int(os.environ.get("DFA_ORPHAN_PI_SWEEP_SECONDS", "30")))
             running_reconcile_seconds = max(10, int(os.environ.get("DFA_ORPHAN_RUNNING_RECONCILE_SECONDS", str(max(10, WORKER_SLOT_HEARTBEAT_SECONDS)))))
             heartbeat_interval_seconds = max(5, int(WORKER_SLOT_HEARTBEAT_SECONDS))
-            last_orphan_sweep = [0.0]
             last_running_reconcile = [0.0]
 
             def _run_once() -> None:
@@ -306,16 +302,6 @@ class RuntimeBootstrap:
                     return
                 try:
                     now_ts = time.time()
-                    if now_ts - last_orphan_sweep[0] >= orphan_sweep_seconds:
-                        runtime_snapshot = get_task_service().running_task_snapshot()
-                        cleanup_orphan_pi_processes(
-                            logger.warning,
-                            label="dfa_worker_registry",
-                            owner_id=WORKER_ID,
-                            runtime_snapshots=runtime_snapshot,
-                            state_tracker=self._worker_slot_orphan_tracker,
-                        )
-                        last_orphan_sweep[0] = now_ts
                     get_worker_slot_service().upsert_heartbeat(
                         db,
                         worker_id=WORKER_ID,

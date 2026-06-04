@@ -10,7 +10,7 @@ import re
 
 from sqlalchemy.orm import Session
 
-from .db.models import AppDfaTask
+from .db.models import AppDfaAgentCleanupAudit, AppDfaTask
 from .runtime_context import (
     CLUSTER_EXPECTED_WORKER_CAPACITY,
     CLUSTER_EXPECTED_WORKERS,
@@ -115,6 +115,7 @@ def render_aggregate_metrics() -> str:
         from .api.tasks import _LAST_AGENT_AGGREGATE_META
         lines.append("secflow_dfa_metrics_aggregate_up 1")
         lines.extend(_render_cluster_task_metrics())
+        lines.extend(_render_agent_observability_metrics())
         lines.extend([
             "# HELP secflow_dfa_metrics_aggregate_partial Aggregate metrics returned a partial response.",
             "# TYPE secflow_dfa_metrics_aggregate_partial gauge",
@@ -685,13 +686,17 @@ def _fmt(value: float) -> str:
 
 def _render_agent_observability_metrics() -> list[str]:
     from .db import get_db
-    from .service.agent_observability import get_agent_observability_service
 
     try:
         db_gen = get_db()
         db: Session = next(db_gen)
         try:
-            snapshot = get_agent_observability_service().build_snapshot(db)
+            rows = (
+                db.query(AppDfaAgentCleanupAudit)
+                .order_by(AppDfaAgentCleanupAudit.created_at.desc(), AppDfaAgentCleanupAudit.id.desc())
+                .limit(200)
+                .all()
+            )
         finally:
             try:
                 next(db_gen)
@@ -700,70 +705,43 @@ def _render_agent_observability_metrics() -> list[str]:
     except Exception:
         return []
 
-    processes = list(snapshot.get("processes") or [])
-    sessions = list(snapshot.get("sessions") or [])
-    tasks = list(snapshot.get("tasks") or [])
     lines = [
-        "# HELP secflow_dfa_agent_process_total Agent process total grouped by owner state, pod and role.",
-        "# TYPE secflow_dfa_agent_process_total gauge",
-        "# HELP secflow_dfa_agent_orphan_process_total Confirmed orphan agent process total by pod.",
-        "# TYPE secflow_dfa_agent_orphan_process_total gauge",
-        "# HELP secflow_dfa_agent_suspected_orphan_process_total Suspected orphan agent process total by pod.",
-        "# TYPE secflow_dfa_agent_suspected_orphan_process_total gauge",
-        "# HELP secflow_dfa_agent_killable_orphan_process_total Killable orphan agent process total by pod.",
-        "# TYPE secflow_dfa_agent_killable_orphan_process_total gauge",
-        "# HELP secflow_dfa_agent_killable_suspected_orphan_process_total Killable suspected orphan agent process total by pod.",
-        "# TYPE secflow_dfa_agent_killable_suspected_orphan_process_total gauge",
-        "# HELP secflow_dfa_agent_session_total Agent session total grouped by state, pod and role.",
-        "# TYPE secflow_dfa_agent_session_total gauge",
-        "# HELP secflow_dfa_agent_orphan_session_total Orphan agent session total by pod.",
-        "# TYPE secflow_dfa_agent_orphan_session_total gauge",
-        "# HELP secflow_dfa_agent_task_ownership_total Agent task ownership total by status.",
-        "# TYPE secflow_dfa_agent_task_ownership_total gauge",
+        "# HELP secflow_dfa_worker_agent_cleanup_runs_total Worker pod agent cleanup audit total by phase and result.",
+        "# TYPE secflow_dfa_worker_agent_cleanup_runs_total gauge",
+        "# HELP secflow_dfa_worker_agent_cleanup_matched_total Matched agent process total from cleanup audits.",
+        "# TYPE secflow_dfa_worker_agent_cleanup_matched_total gauge",
+        "# HELP secflow_dfa_worker_agent_cleanup_killed_total Killed agent process total from cleanup audits.",
+        "# TYPE secflow_dfa_worker_agent_cleanup_killed_total gauge",
+        "# HELP secflow_dfa_worker_agent_cleanup_failed_total Failed cleanup process total from cleanup audits.",
+        "# TYPE secflow_dfa_worker_agent_cleanup_failed_total gauge",
+        "# HELP secflow_dfa_worker_agent_cleanup_surviving_total Surviving agent process total from cleanup audits.",
+        "# TYPE secflow_dfa_worker_agent_cleanup_surviving_total gauge",
+        "# HELP secflow_dfa_worker_agent_forced_cleanup_event_total Cleanup audits that matched agent processes.",
+        "# TYPE secflow_dfa_worker_agent_forced_cleanup_event_total gauge",
+        "# HELP secflow_dfa_worker_agent_cleanup_residual_event_total Cleanup audits that left surviving processes.",
+        "# TYPE secflow_dfa_worker_agent_cleanup_residual_event_total gauge",
     ]
-    process_counts: dict[tuple[str, str, str], int] = defaultdict(int)
-    session_counts: dict[tuple[str, str, str], int] = defaultdict(int)
-    orphan_by_pod: dict[str, int] = defaultdict(int)
-    suspected_by_pod: dict[str, int] = defaultdict(int)
-    killable_by_pod: dict[str, int] = defaultdict(int)
-    killable_suspected_by_pod: dict[str, int] = defaultdict(int)
-    orphan_sessions_by_pod: dict[str, int] = defaultdict(int)
-    ownership_counts: dict[str, int] = defaultdict(int)
-    for item in processes:
-        key = (str(item.get("owner_kind") or "unknown"), str(item.get("pod_name") or "unknown"), str(item.get("role_kind") or "unknown"))
-        process_counts[key] += 1
-        if str(item.get("owner_kind") or "") == "orphan":
-            orphan_by_pod[str(item.get("pod_name") or "unknown")] += 1
-            if bool(item.get("kill_allowed")):
-                killable_by_pod[str(item.get("pod_name") or "unknown")] += 1
-        if str(item.get("owner_kind") or "") == "unknown":
-            suspected_by_pod[str(item.get("pod_name") or "unknown")] += 1
-            if bool(item.get("kill_allowed")):
-                killable_suspected_by_pod[str(item.get("pod_name") or "unknown")] += 1
-    for item in sessions:
-        session_state = "orphan" if bool(item.get("orphan_session")) else ("live" if bool(item.get("live")) else "history")
-        key = (session_state, str(item.get("pod_name") or "unknown"), str(item.get("role_kind") or "unknown"))
-        session_counts[key] += 1
-        if bool(item.get("orphan_session")):
-            orphan_sessions_by_pod[str(item.get("pod_name") or "unknown")] += 1
-    for item in tasks:
-        ownership_counts[str(item.get("ownership_status") or "unknown")] += 1
-    for (state, pod, role_kind), value in sorted(process_counts.items()):
-        lines.append(f"secflow_dfa_agent_process_total{_labels(state=state, pod=pod, role_kind=role_kind)} {value}")
-    for pod, value in sorted(orphan_by_pod.items()):
-        lines.append(f"secflow_dfa_agent_orphan_process_total{_labels(pod=pod)} {value}")
-    for pod, value in sorted(suspected_by_pod.items()):
-        lines.append(f"secflow_dfa_agent_suspected_orphan_process_total{_labels(pod=pod)} {value}")
-    for pod, value in sorted(killable_by_pod.items()):
-        lines.append(f"secflow_dfa_agent_killable_orphan_process_total{_labels(pod=pod)} {value}")
-    for pod, value in sorted(killable_suspected_by_pod.items()):
-        lines.append(f"secflow_dfa_agent_killable_suspected_orphan_process_total{_labels(pod=pod)} {value}")
-    for (state, pod, role_kind), value in sorted(session_counts.items()):
-        lines.append(f"secflow_dfa_agent_session_total{_labels(state=state, pod=pod, role_kind=role_kind)} {value}")
-    for pod, value in sorted(orphan_sessions_by_pod.items()):
-        lines.append(f"secflow_dfa_agent_orphan_session_total{_labels(pod=pod)} {value}")
-    for ownership_status, value in sorted(ownership_counts.items()):
-        lines.append(f"secflow_dfa_agent_task_ownership_total{_labels(ownership_status=ownership_status)} {value}")
+    cleanup_runs: dict[tuple[str, str], int] = defaultdict(int)
+    matched_total = killed_total = failed_total = surviving_total = 0
+    forced_events = residual_events = 0
+    for row in rows:
+        cleanup_runs[(str(row.scan_phase or "unknown"), str(row.result_status or "unknown"))] += 1
+        matched_total += int(row.matched_count or 0)
+        killed_total += int(row.killed_count or 0)
+        failed_total += int(row.failed_count or 0)
+        surviving_total += int(row.surviving_count or 0)
+        if int(row.matched_count or 0) > 0:
+            forced_events += 1
+        if int(row.surviving_count or 0) > 0:
+            residual_events += 1
+    for (scan_phase, result_status), value in sorted(cleanup_runs.items()):
+        lines.append(f"secflow_dfa_worker_agent_cleanup_runs_total{_labels(scan_phase=scan_phase, result_status=result_status)} {value}")
+    lines.append(f"secflow_dfa_worker_agent_cleanup_matched_total {matched_total}")
+    lines.append(f"secflow_dfa_worker_agent_cleanup_killed_total {killed_total}")
+    lines.append(f"secflow_dfa_worker_agent_cleanup_failed_total {failed_total}")
+    lines.append(f"secflow_dfa_worker_agent_cleanup_surviving_total {surviving_total}")
+    lines.append(f"secflow_dfa_worker_agent_forced_cleanup_event_total {forced_events}")
+    lines.append(f"secflow_dfa_worker_agent_cleanup_residual_event_total {residual_events}")
     return lines
 
 

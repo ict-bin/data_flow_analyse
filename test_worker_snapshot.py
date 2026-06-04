@@ -55,7 +55,7 @@ class WorkerSnapshotTests(unittest.TestCase):
                 worker_id=kwargs.get("worker_id", "pod-a"),
                 pod_name=kwargs.get("pod_name", "pod-a"),
                 pod_ip=kwargs.get("pod_ip"),
-                max_concurrent_tasks=kwargs.get("max_concurrent_tasks", 2),
+                max_concurrent_tasks=kwargs.get("max_concurrent_tasks", 1),
                 last_seen_status=kwargs.get("last_seen_status", "running"),
                 last_heartbeat_at=kwargs.get("last_heartbeat_at", now_local()),
             )
@@ -66,7 +66,7 @@ class WorkerSnapshotTests(unittest.TestCase):
 
     def test_single_worker_running_task(self):
         now = now_local()
-        self._insert_worker(worker_id="pod-a", pod_name="pod-a", max_concurrent_tasks=2, last_heartbeat_at=now)
+        self._insert_worker(worker_id="pod-a", pod_name="pod-a", max_concurrent_tasks=1, last_heartbeat_at=now)
         self._insert_task(
             status="running",
             execution_owner_id="pod-a",
@@ -77,9 +77,9 @@ class WorkerSnapshotTests(unittest.TestCase):
         try:
             snapshot = build_worker_cluster_snapshot(db, project_id="p1")
             self.assertEqual(1, snapshot.worker_count)
-            self.assertEqual(2, snapshot.total_capacity)
+            self.assertEqual(1, snapshot.total_capacity)
             self.assertEqual(1, snapshot.running_jobs)
-            self.assertEqual(1, snapshot.available_slots)
+            self.assertEqual(0, snapshot.available_slots)
             worker = snapshot.workers[0]
             self.assertEqual("pod-a", worker.worker_id)
             self.assertEqual("pod-a", worker.host_name)
@@ -91,7 +91,7 @@ class WorkerSnapshotTests(unittest.TestCase):
 
     def test_multiple_running_tasks_aggregate_to_same_worker(self):
         now = now_local()
-        self._insert_worker(worker_id="pod-a", pod_name="pod-a", max_concurrent_tasks=3, last_heartbeat_at=now)
+        self._insert_worker(worker_id="pod-a", pod_name="pod-a", max_concurrent_tasks=1, last_heartbeat_at=now)
         self._insert_task(task_id="dfa_a", status="running", execution_owner_id="pod-a", execution_lease_until=now, execution_heartbeat_at=now)
         self._insert_task(task_id="dfa_b", status="running", execution_owner_id="pod-a", execution_lease_until=now, execution_heartbeat_at=now)
         db = self._session()
@@ -100,7 +100,7 @@ class WorkerSnapshotTests(unittest.TestCase):
             self.assertEqual(1, snapshot.worker_count)
             self.assertEqual(2, snapshot.running_jobs)
             self.assertEqual(2, len(snapshot.workers[0].active_jobs))
-            self.assertEqual(1, snapshot.available_slots)
+            self.assertEqual(0, snapshot.available_slots)
         finally:
             db.close()
 

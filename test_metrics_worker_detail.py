@@ -8,7 +8,7 @@ from sqlalchemy.orm import sessionmaker
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from app.db.models import AppDfaTask, AppDfaWorkerSlot, Base
+from app.db.models import AppDfaAgentCleanupAudit, AppDfaTask, AppDfaWorkerSlot, Base
 from app.metrics import render_aggregate_metrics
 from app.time_utils import now_local
 
@@ -47,7 +47,7 @@ class MetricsWorkerDetailTests(unittest.TestCase):
                 worker_id=kwargs.get("worker_id", "pod-a"),
                 pod_name=kwargs.get("pod_name", "pod-a"),
                 pod_ip=kwargs.get("pod_ip"),
-                max_concurrent_tasks=kwargs.get("max_concurrent_tasks", 2),
+                max_concurrent_tasks=kwargs.get("max_concurrent_tasks", 1),
                 last_seen_status="running",
                 last_heartbeat_at=kwargs.get("last_heartbeat_at", now_local()),
             )
@@ -56,9 +56,34 @@ class MetricsWorkerDetailTests(unittest.TestCase):
         finally:
             db.close()
 
+    def _insert_cleanup_audit(self, **kwargs):
+        db = self.Session()
+        try:
+            row = AppDfaAgentCleanupAudit(
+                audit_id=kwargs.get("audit_id", "ac_1"),
+                task_id=kwargs.get("task_id", "dfa_running"),
+                project_id=kwargs.get("project_id", "p1"),
+                worker_id=kwargs.get("worker_id", "pod-a"),
+                pod_name=kwargs.get("pod_name", "pod-a"),
+                scan_phase=kwargs.get("scan_phase", "before_task_start"),
+                trigger_source=kwargs.get("trigger_source", "task_start"),
+                result_status=kwargs.get("result_status", "cleaned"),
+                matched_count=kwargs.get("matched_count", 1),
+                killed_count=kwargs.get("killed_count", 1),
+                failed_count=kwargs.get("failed_count", 0),
+                surviving_count=kwargs.get("surviving_count", 0),
+                started_at=kwargs.get("started_at", now_local()),
+                finished_at=kwargs.get("finished_at", now_local()),
+            )
+            row.details = kwargs.get("details", {"sample_processes": []})
+            db.add(row)
+            db.commit()
+        finally:
+            db.close()
+
     def test_aggregate_metrics_export_worker_detail_samples(self):
         now = now_local()
-        self._insert_worker(worker_id="pod-a", pod_name="pod-a", max_concurrent_tasks=2, last_heartbeat_at=now)
+        self._insert_worker(worker_id="pod-a", pod_name="pod-a", max_concurrent_tasks=1, last_heartbeat_at=now)
         self._insert_task(
             task_id="dfa_running",
             status="running",
@@ -75,6 +100,7 @@ class MetricsWorkerDetailTests(unittest.TestCase):
             execution_heartbeat_at=now,
             dispatch_status="leased",
         )
+        self._insert_cleanup_audit()
 
         session_factory = self.Session
 
@@ -88,13 +114,16 @@ class MetricsWorkerDetailTests(unittest.TestCase):
         with patch("app.db.get_db", fake_get_db):
             rendered = render_aggregate_metrics()
 
-        self.assertIn('secflow_dfa_cluster_worker_runtime{worker_id="pod-a",host_name="pod-a",healthy="true",source="worker_registry",kind="capacity"} 2', rendered)
+        self.assertIn('secflow_dfa_cluster_worker_runtime{worker_id="pod-a",host_name="pod-a",healthy="true",source="worker_registry",kind="capacity"} 1', rendered)
         self.assertIn('secflow_dfa_cluster_worker_runtime{worker_id="pod-a",host_name="pod-a",healthy="true",source="worker_registry",kind="running_jobs"} 1', rendered)
-        self.assertIn('secflow_dfa_cluster_worker_slots{kind="capacity"} 2', rendered)
+        self.assertIn('secflow_dfa_cluster_worker_slots{kind="capacity"} 1', rendered)
         self.assertIn('secflow_dfa_cluster_worker_slots{kind="busy"} 1', rendered)
-        self.assertIn('secflow_dfa_cluster_worker_slots{kind="free"} 1', rendered)
+        self.assertIn('secflow_dfa_cluster_worker_slots{kind="free"} 0', rendered)
         self.assertIn('secflow_dfa_cluster_worker_active_jobs{worker_id="pod-a",host_name="pod-a",status="pending"} 1', rendered)
         self.assertIn('secflow_dfa_cluster_worker_active_jobs{worker_id="pod-a",host_name="pod-a",status="running"} 1', rendered)
+        self.assertIn('secflow_dfa_worker_agent_cleanup_runs_total{scan_phase="before_task_start",result_status="cleaned"} 1', rendered)
+        self.assertIn("secflow_dfa_worker_agent_cleanup_matched_total 1", rendered)
+        self.assertIn("secflow_dfa_worker_agent_forced_cleanup_event_total 1", rendered)
 
     def test_aggregate_metrics_export_orphan_running_samples(self):
         now = now_local()

@@ -287,6 +287,44 @@ _MIGRATIONS = [
         statement="CREATE INDEX ix_dfa_task_events_category ON secflow_app_dfa_task_events (event_category)",
     ),
     Migration(
+        kind="table",
+        table_name="secflow_app_dfa_agent_cleanup_audits",
+        name="secflow_app_dfa_agent_cleanup_audits",
+        statement="""
+CREATE TABLE secflow_app_dfa_agent_cleanup_audits (
+    id INT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+    audit_id VARCHAR(64) NOT NULL UNIQUE,
+    task_id VARCHAR(64) NOT NULL,
+    project_id VARCHAR(100) NOT NULL,
+    worker_id VARCHAR(128) NULL,
+    pod_name VARCHAR(128) NULL,
+    scan_phase VARCHAR(32) NOT NULL,
+    trigger_source VARCHAR(32) NOT NULL,
+    result_status VARCHAR(32) NOT NULL,
+    matched_count INT NOT NULL DEFAULT 0,
+    killed_count INT NOT NULL DEFAULT 0,
+    failed_count INT NOT NULL DEFAULT 0,
+    surviving_count INT NOT NULL DEFAULT 0,
+    started_at DATETIME NOT NULL,
+    finished_at DATETIME NOT NULL,
+    details_json TEXT NULL,
+    created_at DATETIME NOT NULL
+)
+        """.strip(),
+    ),
+    Migration(
+        kind="index",
+        table_name="secflow_app_dfa_agent_cleanup_audits",
+        name="ix_dfa_agent_cleanup_task_created",
+        statement="CREATE INDEX ix_dfa_agent_cleanup_task_created ON secflow_app_dfa_agent_cleanup_audits (task_id, created_at)",
+    ),
+    Migration(
+        kind="index",
+        table_name="secflow_app_dfa_agent_cleanup_audits",
+        name="ix_dfa_agent_cleanup_project_created",
+        statement="CREATE INDEX ix_dfa_agent_cleanup_project_created ON secflow_app_dfa_agent_cleanup_audits (project_id, created_at)",
+    ),
+    Migration(
         kind="index",
         table_name="secflow_app_dfa_tasks",
         name="ix_dfa_tasks_lease_recovery_state",

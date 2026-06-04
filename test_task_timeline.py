@@ -22,7 +22,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from app.api import router as api_router
 from app.api import tasks as tasks_api
-from app.db.models import AppDfaTask, AppDfaTaskEvent, AppDfaWorkerSlot, Base
+from app.db.models import AppDfaAgentCleanupAudit, AppDfaTask, AppDfaTaskEvent, AppDfaWorkerSlot, Base
 from app.service.execution_coordinator import renew_lease
 from app.service import task_service as task_service_module
 from app.service.task_service import TaskService
@@ -1156,7 +1156,6 @@ class TaskTimelineTests(unittest.TestCase):
         previous_get_db = sys.modules["app.db"].get_db
         previous_still_owner = task_service_module.still_owner
         previous_begin = task_service_module.begin_execution_if_owner
-        previous_cleanup = task_service_module.cleanup_orphan_pi_processes
         previous_release = task_service_module.release_lease
         try:
             def _fake_get_db():
@@ -1167,7 +1166,6 @@ class TaskTimelineTests(unittest.TestCase):
                     db.close()
 
             sys.modules["app.db"].get_db = _fake_get_db
-            task_service_module.cleanup_orphan_pi_processes = lambda *args, **kwargs: 0
             task_service_module.release_lease = lambda db, task_id, owner_id, epoch: False
 
             task_service_module.still_owner = lambda db, task_id, owner_id, epoch, control_version: False
@@ -1205,8 +1203,109 @@ class TaskTimelineTests(unittest.TestCase):
             sys.modules["app.db"].get_db = previous_get_db
             task_service_module.still_owner = previous_still_owner
             task_service_module.begin_execution_if_owner = previous_begin
-            task_service_module.cleanup_orphan_pi_processes = previous_cleanup
             task_service_module.release_lease = previous_release
+
+    def test_get_task_agent_cleanup_audits_returns_task_audits(self):
+        task_id = self._create_task()
+        db = self._session()
+        try:
+            audit = AppDfaAgentCleanupAudit(
+                audit_id="ac_test_1",
+                task_id=task_id,
+                project_id=self.project_id,
+                worker_id="pod-a",
+                pod_name="pod-a",
+                scan_phase="before_task_start",
+                trigger_source="task_start",
+                result_status="cleaned",
+                matched_count=1,
+                killed_count=1,
+                failed_count=0,
+                surviving_count=0,
+                started_at=now_local(),
+                finished_at=now_local(),
+            )
+            audit.details = {"sample_processes": [{"pid": 123}]}
+            db.add(audit)
+            db.commit()
+
+            payload = self.service.get_task_agent_cleanup_audits(db, task_id)
+            self.assertEqual(1, len(payload))
+            self.assertEqual("ac_test_1", payload[0]["audit_id"])
+            self.assertEqual("before_task_start", payload[0]["scan_phase"])
+            self.assertEqual(1, payload[0]["matched_count"])
+        finally:
+            db.close()
+
+    def test_task_detail_and_api_expose_cleanup_audit_summary(self):
+        task_id = self._create_task()
+        db = self._session()
+        try:
+            audit = AppDfaAgentCleanupAudit(
+                audit_id="ac_test_2",
+                task_id=task_id,
+                project_id=self.project_id,
+                worker_id="pod-a",
+                pod_name="pod-a",
+                scan_phase="after_task_finish",
+                trigger_source="task_finish",
+                result_status="residual_present",
+                matched_count=2,
+                killed_count=1,
+                failed_count=1,
+                surviving_count=1,
+                started_at=now_local(),
+                finished_at=now_local(),
+            )
+            audit.details = {"sample_processes": [{"pid": 456}]}
+            db.add(audit)
+            db.commit()
+
+            detail = self.service.get_task(db, task_id)
+            self.assertTrue(bool(detail["agent_cleanup_residual_present"]))
+            self.assertTrue(bool(detail["agent_forced_cleanup_detected"]))
+            self.assertEqual("after_task_finish", detail["latest_agent_postcleanup"]["scan_phase"])
+        finally:
+            db.close()
+
+        with self._build_client() as client:
+            response = client.get(f"/api/app/dataflow-analyse/tasks/{task_id}/agent-cleanup-audits")
+        self.assertEqual(200, response.status_code)
+        payload = response.json()
+        self.assertEqual(1, len(payload))
+        self.assertEqual("ac_test_2", payload[0]["audit_id"])
+
+    def test_record_agent_cleanup_timeline_marks_forced_cleanup_as_error_event(self):
+        task_id = self._create_task()
+        db = self._session()
+        try:
+            row = db.query(AppDfaTask).filter_by(task_id=task_id).first()
+            result = task_service_module.AgentCleanupScanResult(
+                scan_phase="before_task_start",
+                matched_count=2,
+                killed_count=2,
+                failed_count=0,
+                surviving_count=0,
+                matched_processes=[],
+                killed_processes=[],
+                failed_processes=[],
+                surviving_processes=[],
+            )
+            task_service_module._record_agent_cleanup_timeline(
+                db,
+                row=row,
+                result=result,
+                epoch=1,
+                control_version=0,
+                trigger_source="task_start",
+            )
+            db.commit()
+            event = db.query(AppDfaTaskEvent).filter_by(task_id=task_id, event_type="task_worker_agent_forced_cleanup_detected").first()
+            self.assertIsNotNone(event)
+            self.assertEqual("error", event.level)
+            self.assertEqual("timeline", event.event_visibility)
+        finally:
+            db.close()
 
     def test_execute_task_closes_db_session_before_long_running_orchestrator(self):
         task_id = self._create_task()

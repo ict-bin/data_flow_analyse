@@ -27,7 +27,7 @@ from sqlalchemy.orm import Session, load_only
 from sqlalchemy.orm.attributes import flag_modified
 
 from app.config import build_task_config, load_service_config
-from app.db.models import AppDfaTask, AppDfaTaskEvent, AppDfaWorkerSlot
+from app.db.models import AppDfaAgentCleanupAudit, AppDfaTask, AppDfaTaskEvent, AppDfaWorkerSlot
 from app.logging_utils import log_event
 from app.models import SwarmEvent, TaskStatus
 from app.orchestrator import Orchestrator
@@ -53,7 +53,7 @@ from app.service.execution_coordinator import (
 )
 from app.service.session_index import build_session_catalog
 from app.time_utils import UTC_PLUS_8, isoformat_local, now_local
-from app.agent_process import cleanup_orphan_pi_processes, cleanup_task_agent_processes
+from app.agent_process import AgentCleanupScanResult, cleanup_task_agent_processes, scan_and_cleanup_worker_agent_processes
 
 logger = logging.getLogger("dfa.task_service")
 
@@ -167,6 +167,12 @@ _TASK_EVENT_POLICIES: dict[str, dict[str, str]] = {
     "task_delete_rejected": {"category": "audit", "visibility": TASK_EVENT_VISIBILITY_DEBUG, "summary_title": "任务删除被拒绝"},
     "agent_process_manual_kill": {"category": "audit", "visibility": TASK_EVENT_VISIBILITY_TIMELINE, "summary_title": "智能体进程已被手工终止"},
     "agent_process_bulk_manual_kill": {"category": "audit", "visibility": TASK_EVENT_VISIBILITY_TIMELINE, "summary_title": "批量智能体进程已被手工终止"},
+    "task_worker_agent_precleanup_started": {"category": "audit", "visibility": TASK_EVENT_VISIBILITY_DEBUG, "summary_title": "任务启动前智能体清理开始"},
+    "task_worker_agent_precleanup_finished": {"category": "audit", "visibility": TASK_EVENT_VISIBILITY_TIMELINE, "summary_title": "任务启动前智能体清理完成"},
+    "task_worker_agent_postcleanup_started": {"category": "audit", "visibility": TASK_EVENT_VISIBILITY_DEBUG, "summary_title": "任务结束后智能体清理开始"},
+    "task_worker_agent_postcleanup_finished": {"category": "audit", "visibility": TASK_EVENT_VISIBILITY_TIMELINE, "summary_title": "任务结束后智能体清理完成"},
+    "task_worker_agent_cleanup_residual_detected": {"category": "audit", "visibility": TASK_EVENT_VISIBILITY_TIMELINE, "summary_title": "任务清理后仍发现残留智能体"},
+    "task_worker_agent_forced_cleanup_detected": {"category": "audit", "visibility": TASK_EVENT_VISIBILITY_TIMELINE, "summary_title": "任务运行前后发现残留智能体并已强制清理"},
     "task_retried": {"category": "operation", "visibility": TASK_EVENT_VISIBILITY_TIMELINE, "summary_title": "任务重跑已请求"},
     "task_resumed": {"category": "operation", "visibility": TASK_EVENT_VISIBILITY_TIMELINE, "summary_title": "任务续跑已请求"},
     "task_leased": {"category": "dispatch", "visibility": TASK_EVENT_VISIBILITY_TIMELINE, "summary_title": "任务已被领取"},
@@ -425,6 +431,232 @@ def _task_event_summary_title(event_type: str) -> str | None:
 
 def _event_visibility_for_row(event: AppDfaTaskEvent) -> str:
     return str(event.event_visibility or _task_event_visibility(event.event_type) or TASK_EVENT_VISIBILITY_INTERNAL).strip()
+
+
+def _agent_cleanup_sample(result: AgentCleanupScanResult, *, limit: int = 5) -> list[dict[str, object]]:
+    sample = []
+    for item in result.matched_processes[:limit]:
+        sample.append(
+            {
+                "pid": item.pid,
+                "pgid": item.pgid,
+                "ppid": item.ppid,
+                "task_id": item.task_id,
+                "root_task_id": item.root_task_id,
+                "worker_id": item.worker_id,
+                "execution_epoch": item.execution_epoch,
+                "cmdline": item.cmdline,
+                "cwd": item.cwd,
+                "exe": item.exe,
+                "match_reason": item.match_reason,
+                "kill_result": item.kill_result,
+            }
+        )
+    return sample
+
+
+def _record_agent_cleanup_audit(
+    db: Session,
+    *,
+    row: AppDfaTask,
+    result: AgentCleanupScanResult,
+    trigger_source: str,
+) -> AppDfaAgentCleanupAudit:
+    audit = AppDfaAgentCleanupAudit(
+        audit_id=f"ac_{uuid.uuid4().hex[:20]}",
+        task_id=row.task_id,
+        project_id=row.project_id,
+        worker_id=WORKER_ID,
+        pod_name=WORKER_ID,
+        scan_phase=result.scan_phase,
+        trigger_source=trigger_source,
+        result_status=result.cleanup_result,
+        matched_count=int(result.matched_count or 0),
+        killed_count=int(result.killed_count or 0),
+        failed_count=int(result.failed_count or 0),
+        surviving_count=int(result.surviving_count or 0),
+        started_at=now_local(),
+        finished_at=now_local(),
+    )
+    audit.details = {
+        "scan_phase": result.scan_phase,
+        "cleanup_result": result.cleanup_result,
+        "matched_count": int(result.matched_count or 0),
+        "killed_count": int(result.killed_count or 0),
+        "failed_count": int(result.failed_count or 0),
+        "surviving_count": int(result.surviving_count or 0),
+        "sample_processes": _agent_cleanup_sample(result),
+    }
+    db.add(audit)
+    db.flush()
+    return audit
+
+
+def _record_agent_cleanup_timeline(
+    db: Session,
+    *,
+    row: AppDfaTask,
+    result: AgentCleanupScanResult,
+    epoch: int,
+    control_version: int,
+    trigger_source: str,
+) -> None:
+    payload = {
+        "scan_phase": result.scan_phase,
+        "trigger_source": trigger_source,
+        "matched_count": int(result.matched_count or 0),
+        "killed_count": int(result.killed_count or 0),
+        "failed_count": int(result.failed_count or 0),
+        "surviving_count": int(result.surviving_count or 0),
+        "sample_processes": _agent_cleanup_sample(result),
+        "cleanup_result": result.cleanup_result,
+    }
+    finished_event = (
+        "task_worker_agent_precleanup_finished"
+        if result.scan_phase == "before_task_start"
+        else "task_worker_agent_postcleanup_finished"
+    )
+    _record_task_event(
+        db,
+        row=row,
+        event_type=finished_event,
+        message="任务智能体清场已完成",
+        level="warning" if result.failed_count > 0 or result.surviving_count > 0 else "info",
+        status=row.status,
+        worker_id=WORKER_ID,
+        execution_owner_id=WORKER_ID,
+        execution_epoch=epoch,
+        control_version=control_version,
+        dispatch_status=row.dispatch_status,
+        payload=payload,
+    )
+    if result.matched_count > 0:
+        _record_task_event(
+            db,
+            row=row,
+            event_type="task_worker_agent_forced_cleanup_detected",
+            message="扫描到残留智能体并执行强制清理",
+            level="error",
+            status=row.status,
+            worker_id=WORKER_ID,
+            execution_owner_id=WORKER_ID,
+            execution_epoch=epoch,
+            control_version=control_version,
+            dispatch_status=row.dispatch_status,
+            payload=payload,
+        )
+    if result.failed_count > 0 or result.surviving_count > 0:
+        _record_task_event(
+            db,
+            row=row,
+            event_type="task_worker_agent_cleanup_residual_detected",
+            message="任务清场后仍发现残留智能体",
+            level="error",
+            status=row.status,
+            worker_id=WORKER_ID,
+            execution_owner_id=WORKER_ID,
+            execution_epoch=epoch,
+            control_version=control_version,
+            dispatch_status=row.dispatch_status,
+            payload=payload,
+        )
+
+
+def _run_worker_agent_cleanup(
+    db: Session,
+    *,
+    row: AppDfaTask,
+    scan_phase: str,
+    epoch: int,
+    control_version: int,
+    trigger_source: str,
+    log_label: str,
+) -> AgentCleanupScanResult:
+    started_event = (
+        "task_worker_agent_precleanup_started"
+        if scan_phase == "before_task_start"
+        else "task_worker_agent_postcleanup_started"
+    )
+    _record_task_event(
+        db,
+        row=row,
+        event_type=started_event,
+        message="任务智能体清场开始",
+        status=row.status,
+        worker_id=WORKER_ID,
+        execution_owner_id=WORKER_ID,
+        execution_epoch=epoch,
+        control_version=control_version,
+        dispatch_status=row.dispatch_status,
+        payload={"scan_phase": scan_phase, "trigger_source": trigger_source},
+    )
+    result = scan_and_cleanup_worker_agent_processes(
+        logger.warning,
+        label=log_label,
+        scan_phase=scan_phase,
+        worker_id=WORKER_ID,
+    )
+    _record_agent_cleanup_audit(db, row=row, result=result, trigger_source=trigger_source)
+    _record_agent_cleanup_timeline(
+        db,
+        row=row,
+        result=result,
+        epoch=epoch,
+        control_version=control_version,
+        trigger_source=trigger_source,
+    )
+    db.commit()
+    return result
+
+
+def _latest_agent_cleanup_summary(db: Session | None, task_id: str, scan_phase: str) -> dict[str, object] | None:
+    if db is None:
+        return None
+    row = (
+        db.query(AppDfaAgentCleanupAudit)
+        .filter(
+            AppDfaAgentCleanupAudit.task_id == task_id,
+            AppDfaAgentCleanupAudit.scan_phase == scan_phase,
+        )
+        .order_by(AppDfaAgentCleanupAudit.created_at.desc(), AppDfaAgentCleanupAudit.id.desc())
+        .first()
+    )
+    if row is None:
+        return None
+    return {
+        "audit_id": row.audit_id,
+        "scan_phase": row.scan_phase,
+        "trigger_source": row.trigger_source,
+        "result_status": row.result_status,
+        "matched_count": int(row.matched_count or 0),
+        "killed_count": int(row.killed_count or 0),
+        "failed_count": int(row.failed_count or 0),
+        "surviving_count": int(row.surviving_count or 0),
+        "started_at": isoformat_local(row.started_at),
+        "finished_at": isoformat_local(row.finished_at),
+        "details": row.details,
+    }
+
+
+def _agent_cleanup_audit_to_dict(row: AppDfaAgentCleanupAudit) -> dict[str, object]:
+    return {
+        "audit_id": row.audit_id,
+        "task_id": row.task_id,
+        "project_id": row.project_id,
+        "worker_id": row.worker_id,
+        "pod_name": row.pod_name,
+        "scan_phase": row.scan_phase,
+        "trigger_source": row.trigger_source,
+        "result_status": row.result_status,
+        "matched_count": int(row.matched_count or 0),
+        "killed_count": int(row.killed_count or 0),
+        "failed_count": int(row.failed_count or 0),
+        "surviving_count": int(row.surviving_count or 0),
+        "started_at": isoformat_local(row.started_at),
+        "finished_at": isoformat_local(row.finished_at),
+        "created_at": isoformat_local(row.created_at),
+        "details": row.details,
+    }
 
 
 def _timeline_dedupe_key(
@@ -2988,7 +3220,7 @@ class TaskService:
         }
 
     def get_task(self, db: Session, task_id: str) -> dict:
-        return self._row_to_dict(self._get_or_404(db, task_id))
+        return self._row_to_dict(self._get_or_404(db, task_id), db=db)
 
     def get_task_execution(self, db: Session, task_id: str) -> dict:
         row = self._get_or_404(db, task_id)
@@ -3020,6 +3252,16 @@ class TaskService:
             "task_id": row.task_id,
             "events": [_build_task_event_response(event) for event in events],
         }
+
+    def get_task_agent_cleanup_audits(self, db: Session, task_id: str) -> list[dict[str, object]]:
+        row = self._get_or_404(db, task_id)
+        audit_rows = (
+            db.query(AppDfaAgentCleanupAudit)
+            .filter(AppDfaAgentCleanupAudit.task_id == row.task_id)
+            .order_by(AppDfaAgentCleanupAudit.created_at.asc(), AppDfaAgentCleanupAudit.id.asc())
+            .all()
+        )
+        return [_agent_cleanup_audit_to_dict(audit) for audit in audit_rows]
 
     def clear_task_timeline(self, db: Session, task_id: str) -> int:
         row = self._get_or_404(db, task_id)
@@ -3798,6 +4040,18 @@ class TaskService:
             elif epoch_run_root is not None:
                 epoch_run_root.mkdir(parents=True, exist_ok=True)
 
+            precleanup_row = db.query(AppDfaTask).filter_by(task_id=task_id).first()
+            if precleanup_row is not None:
+                _run_worker_agent_cleanup(
+                    db,
+                    row=precleanup_row,
+                    scan_phase="before_task_start",
+                    epoch=epoch,
+                    control_version=control_version,
+                    trigger_source="task_start",
+                    log_label=f"task_prestart:{task_id}",
+                )
+
             cfg = build_task_config(svc, row.prompt_content, cwd=row.source_root_path or row.input_path)
             if tcfg.get("source_file"):
                 cfg.source_file = str(tcfg["source_file"])
@@ -4150,6 +4404,20 @@ class TaskService:
             except Exception:
                 logger.warning("failed to cleanup orphan pi processes for %s", task_id, exc_info=True)
             try:
+                cleanup_row = db.query(AppDfaTask).filter_by(task_id=task_id).first()
+                if cleanup_row is not None:
+                    _run_worker_agent_cleanup(
+                        db,
+                        row=cleanup_row,
+                        scan_phase="after_task_finish",
+                        epoch=epoch,
+                        control_version=control_version,
+                        trigger_source="task_finish",
+                        log_label=f"task_postfinish:{task_id}",
+                    )
+            except Exception:
+                logger.warning("failed to run worker pod cleanup audit for %s", task_id, exc_info=True)
+            try:
                 snapshot = load_execution_snapshot(db, task_id)
                 if (
                     snapshot is not None
@@ -4308,6 +4576,8 @@ class TaskService:
         ctx = _get_running_task_context(row.task_id)
         result_json = _lightweight_result_json(row, row.result_json) if include_heavy else None
         latest_started_at = latest_started_at_value()
+        latest_precleanup = _latest_agent_cleanup_summary(db, row.task_id, "before_task_start")
+        latest_postcleanup = _latest_agent_cleanup_summary(db, row.task_id, "after_task_finish")
         return {
             **_origin_payload(row),
             "task_id": row.task_id, "project_id": row.project_id,
@@ -4367,6 +4637,16 @@ class TaskService:
                 else None
             ),
             "last_lease_renew_error": ctx.last_lease_error if ctx is not None else None,
+            "latest_agent_precleanup": latest_precleanup,
+            "latest_agent_postcleanup": latest_postcleanup,
+            "agent_cleanup_residual_present": bool(
+                (latest_precleanup and int(latest_precleanup.get("surviving_count") or 0) > 0)
+                or (latest_postcleanup and int(latest_postcleanup.get("surviving_count") or 0) > 0)
+            ),
+            "agent_forced_cleanup_detected": bool(
+                (latest_precleanup and int(latest_precleanup.get("matched_count") or 0) > 0)
+                or (latest_postcleanup and int(latest_postcleanup.get("matched_count") or 0) > 0)
+            ),
             "auto_requeue_pending": auto_requeue_pending,
             "auto_requeue_reason": AUTO_REQUEUE_REASON_LEASE_LOST if auto_requeue_pending else None,
             "abnormal_reason": None if (auto_requeue_pending or str(row.status or "") in {"running", "pending"}) else abnormal_reason,

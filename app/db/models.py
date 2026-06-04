@@ -126,6 +126,44 @@ class AppDfaTaskEvent(Base):
         self.payload_json = json.dumps(value or {}, ensure_ascii=False)
 
 
+class AppDfaAgentCleanupAudit(Base):
+    """Structured task-level agent cleanup audit."""
+
+    __tablename__ = "secflow_app_dfa_agent_cleanup_audits"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    audit_id: Mapped[str] = mapped_column(String(64), nullable=False, unique=True, index=True)
+    task_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    project_id: Mapped[str] = mapped_column(String(100), nullable=False, index=True)
+    worker_id: Mapped[Optional[str]] = mapped_column(String(128), nullable=True, index=True)
+    pod_name: Mapped[Optional[str]] = mapped_column(String(128), nullable=True, index=True)
+    scan_phase: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    trigger_source: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    result_status: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    matched_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    killed_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    failed_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    surviving_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    started_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=now_local, index=True)
+    finished_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=now_local)
+    details_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=now_local, index=True)
+
+    @property
+    def details(self) -> dict[str, Any]:
+        if not self.details_json:
+            return {}
+        try:
+            loaded = json.loads(self.details_json)
+            return loaded if isinstance(loaded, dict) else {}
+        except Exception:
+            return {}
+
+    @details.setter
+    def details(self, value: dict[str, Any] | None) -> None:
+        self.details_json = json.dumps(value or {}, ensure_ascii=False)
+
+
 class AppDfaPromptTemplate(Base):
     """Reusable prompt templates for secflow-app-dataflow-analyse."""
     __tablename__ = "secflow_app_dfa_prompt_templates"

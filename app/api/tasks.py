@@ -812,6 +812,25 @@ class TaskTimelineResponse(BaseModel):
     events: list[TaskTimelineEventResponse] = Field(default_factory=list)
 
 
+class TaskAgentCleanupAuditResponse(BaseModel):
+    audit_id: str
+    task_id: str
+    project_id: str
+    worker_id: str | None = None
+    pod_name: str | None = None
+    scan_phase: str
+    trigger_source: str
+    result_status: str
+    matched_count: int = 0
+    killed_count: int = 0
+    failed_count: int = 0
+    surviving_count: int = 0
+    started_at: str | None = None
+    finished_at: str | None = None
+    created_at: str | None = None
+    details: Dict[str, Any] = Field(default_factory=dict)
+
+
 class ActionResponse(BaseModel):
     status: str = "ok"
     task_id: str
@@ -1867,6 +1886,11 @@ def delete_task(
 @router.get("/tasks/{task_id}/timeline", response_model=TaskTimelineResponse)
 def get_task_timeline(task_id: str, db: Session = Depends(get_db)):
     return get_task_service().get_task_timeline(db, task_id)
+
+
+@router.get("/tasks/{task_id}/agent-cleanup-audits", response_model=list[TaskAgentCleanupAuditResponse])
+def get_task_agent_cleanup_audits(task_id: str, db: Session = Depends(get_db)):
+    return get_task_service().get_task_agent_cleanup_audits(db, task_id)
 
 
 @router.delete("/tasks/{task_id}/timeline", response_model=ActionResponse)

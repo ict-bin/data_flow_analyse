@@ -81,7 +81,6 @@ class RuntimeBootstrapTests(unittest.IsolatedAsyncioTestCase):
         bootstrap = RuntimeBootstrap()
         reconcile_calls = []
         heartbeat_calls = []
-        orphan_sweep_calls = []
 
         def fake_get_db():
             class _DummyDb:
@@ -103,10 +102,7 @@ class RuntimeBootstrapTests(unittest.IsolatedAsyncioTestCase):
         with patch("app.service.runtime_bootstrap.get_task_service", return_value=SimpleNamespace(reconcile_orphaned_running_tasks=fake_reconcile, running_task_snapshot=lambda: [{"task_id": "dfa_1", "root_task_id": "dfa_1", "parent_task_id": None, "owner_id": "pod-a", "execution_epoch": 1, "status": "running", "active_context": True}])), patch(
             "app.service.worker_slot_service.get_worker_slot_service",
             return_value=SimpleNamespace(upsert_heartbeat=lambda db, **kwargs: fake_heartbeat(**kwargs)),
-        ), patch("app.service.runtime_bootstrap.cleanup_orphan_pi_processes", side_effect=lambda *args, **kwargs: orphan_sweep_calls.append(kwargs) or 0), patch(
-            "app.db.get_db",
-            fake_get_db,
-        ), patch("app.runtime_context.WORKER_SLOT_HEARTBEAT_SECONDS", 1), patch(
+        ), patch("app.db.get_db", fake_get_db), patch("app.runtime_context.WORKER_SLOT_HEARTBEAT_SECONDS", 1), patch(
             "app.runtime_context.WORKER_ID",
             "pod-a",
         ), patch("app.runtime_context.POD_NAME", "pod-a"), patch(
@@ -126,9 +122,7 @@ class RuntimeBootstrapTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertGreaterEqual(len(heartbeat_calls), 1)
         self.assertGreaterEqual(len(reconcile_calls), 1)
-        self.assertGreaterEqual(len(orphan_sweep_calls), 1)
-        self.assertEqual(orphan_sweep_calls[0]["owner_id"], "pod-a")
-        self.assertEqual(orphan_sweep_calls[0]["runtime_snapshots"][0]["task_id"], "dfa_1")
+        self.assertFalse(bootstrap.worker_slot_status()["last_error"])
 
     def test_install_internal_observability_router_is_idempotent(self):
         bootstrap = RuntimeBootstrap()
