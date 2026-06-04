@@ -789,6 +789,14 @@ class TaskTimelineEventResponse(BaseModel):
     execution_epoch: int | None = None
     control_version: int | None = None
     dispatch_status: str | None = None
+    event_category: str | None = None
+    event_visibility: str | None = None
+    attempt_no: int | None = None
+    attempt_label: str | None = None
+    superseded: bool = False
+    supersedes_event_id: str | None = None
+    summary_title: str | None = None
+    summary_detail: str | None = None
     function_name: str | None = None
     source_file: str | None = None
     line_hint: str | None = None

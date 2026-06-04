@@ -251,6 +251,42 @@ _MIGRATIONS = [
         statement="ALTER TABLE secflow_app_dfa_tasks ADD COLUMN lease_recovery_updated_at DATETIME NULL",
     ),
     Migration(
+        kind="column",
+        table_name="secflow_app_dfa_task_events",
+        name="event_category",
+        statement="ALTER TABLE secflow_app_dfa_task_events ADD COLUMN event_category VARCHAR(32) NULL",
+    ),
+    Migration(
+        kind="column",
+        table_name="secflow_app_dfa_task_events",
+        name="event_visibility",
+        statement="ALTER TABLE secflow_app_dfa_task_events ADD COLUMN event_visibility VARCHAR(16) NULL",
+    ),
+    Migration(
+        kind="column",
+        table_name="secflow_app_dfa_task_events",
+        name="attempt_no",
+        statement="ALTER TABLE secflow_app_dfa_task_events ADD COLUMN attempt_no INT NULL",
+    ),
+    Migration(
+        kind="column",
+        table_name="secflow_app_dfa_task_events",
+        name="supersedes_event_id",
+        statement="ALTER TABLE secflow_app_dfa_task_events ADD COLUMN supersedes_event_id VARCHAR(32) NULL",
+    ),
+    Migration(
+        kind="index",
+        table_name="secflow_app_dfa_task_events",
+        name="ix_dfa_task_events_visibility_created",
+        statement="CREATE INDEX ix_dfa_task_events_visibility_created ON secflow_app_dfa_task_events (task_id, event_visibility, created_at)",
+    ),
+    Migration(
+        kind="index",
+        table_name="secflow_app_dfa_task_events",
+        name="ix_dfa_task_events_category",
+        statement="CREATE INDEX ix_dfa_task_events_category ON secflow_app_dfa_task_events (event_category)",
+    ),
+    Migration(
         kind="index",
         table_name="secflow_app_dfa_tasks",
         name="ix_dfa_tasks_lease_recovery_state",

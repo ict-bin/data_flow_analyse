@@ -103,13 +103,14 @@ class TaskTimelineTests(unittest.TestCase):
         db = self._session()
         try:
             events = db.query(AppDfaTaskEvent).filter_by(task_id=task_id).all()
-            self.assertEqual(1, len(events))
+            self.assertEqual(2, len(events))
             self.assertEqual("task_created", events[0].event_type)
+            self.assertEqual("task_enqueued", events[1].event_type)
             self.assertEqual("pending", events[0].status)
         finally:
             db.close()
 
-    def test_get_timeline_returns_events_in_descending_order(self):
+    def test_get_timeline_returns_timeline_events_in_ascending_order(self):
         task_id = self._create_task()
         db = self._session()
         try:
@@ -124,15 +125,43 @@ class TaskTimelineTests(unittest.TestCase):
                 status="running",
                 message="任务已开始执行",
                 dedupe_key="dedupe-task-started",
+                event_visibility="timeline",
+                event_category="lifecycle",
+                attempt_no=1,
             )
             db.add(extra)
             db.commit()
 
             timeline = self.service.get_task_timeline(db, task_id)
             self.assertEqual(task_id, timeline["task_id"])
-            self.assertEqual("task_started", timeline["events"][0]["event_type"])
-            self.assertEqual("task_created", timeline["events"][-1]["event_type"])
+            self.assertEqual("task_created", timeline["events"][0]["event_type"])
+            self.assertEqual("task_started", timeline["events"][-1]["event_type"])
             self.assertEqual(row.project_id, timeline["events"][0]["project_id"])
+        finally:
+            db.close()
+
+    def test_get_timeline_filters_internal_events(self):
+        task_id = self._create_task()
+        db = self._session()
+        try:
+            row = db.query(AppDfaTask).filter_by(task_id=task_id).first()
+            internal = AppDfaTaskEvent(
+                id="evt-internal",
+                task_id=task_id,
+                project_id=self.project_id,
+                source="dfa",
+                level="warning",
+                event_type="task_not_owner_pre_execute",
+                status="running",
+                message="内部执行权检查失败",
+                dedupe_key="dedupe-internal",
+            )
+            db.add(internal)
+            db.commit()
+
+            timeline_types = [event["event_type"] for event in self.service.get_task_timeline(db, task_id)["events"]]
+            self.assertNotIn("task_not_owner_pre_execute", timeline_types)
+            self.assertEqual(["task_created", "task_enqueued"], timeline_types)
         finally:
             db.close()
 
@@ -159,10 +188,10 @@ class TaskTimelineTests(unittest.TestCase):
             self.assertEqual(1, deleted_one)
             db.commit()
             remaining = db.query(AppDfaTaskEvent).filter_by(task_id=task_id).all()
-            self.assertEqual(1, len(remaining))
+            self.assertEqual(2, len(remaining))
 
             deleted_all = self.service.clear_task_timeline(db, task_id)
-            self.assertEqual(1, deleted_all)
+            self.assertEqual(2, deleted_all)
             db.commit()
             self.assertEqual(0, db.query(AppDfaTaskEvent).filter_by(task_id=task_id).count())
         finally:
@@ -185,9 +214,10 @@ class TaskTimelineTests(unittest.TestCase):
             self.assertEqual("pending", payload["status"])
             self.assertEqual(3, payload["control_version"])
             events = self.service.get_task_timeline(db, task_id)["events"]
-            self.assertEqual("task_retried", events[0]["event_type"])
-            self.assertEqual(3, events[0]["control_version"])
-            self.assertEqual("pending", events[0]["dispatch_status"])
+            self.assertEqual("task_restart_requested", events[-2]["event_type"])
+            self.assertEqual("task_retried", events[-1]["event_type"])
+            self.assertEqual(3, events[-1]["control_version"])
+            self.assertEqual("pending", events[-1]["dispatch_status"])
         finally:
             db.close()
 
@@ -210,9 +240,10 @@ class TaskTimelineTests(unittest.TestCase):
             self.assertEqual("pending", payload["status"])
             self.assertEqual(6, payload["control_version"])
             timeline = self.service.get_task_timeline(db, task_id)
-            self.assertEqual("task_resumed", timeline["events"][0]["event_type"])
-            self.assertEqual(3, timeline["events"][0]["payload"]["start_stage"])
-            self.assertIn(f"{task_id}/run/epochs/0002/workspace-worker-0", timeline["events"][0]["payload"]["resume_workspace"])
+            self.assertEqual("task_resume_requested", timeline["events"][-2]["event_type"])
+            self.assertEqual("task_resumed", timeline["events"][-1]["event_type"])
+            self.assertEqual(3, timeline["events"][-1]["payload"]["start_stage"])
+            self.assertIn(f"{task_id}/run/epochs/0002/workspace-worker-0", timeline["events"][-1]["payload"]["resume_workspace"])
         finally:
             task_service_module._load_svc_config_from_db = previous_loader
             db.close()
@@ -233,9 +264,10 @@ class TaskTimelineTests(unittest.TestCase):
 
             self.assertEqual("cancelled", payload["status"])
             timeline = self.service.get_task_timeline(db, task_id)
-            self.assertEqual("task_cancelled", timeline["events"][0]["event_type"])
-            self.assertEqual("cancelled", timeline["events"][0]["status"])
-            self.assertEqual(2, timeline["events"][0]["control_version"])
+            self.assertEqual("task_cancel_requested", timeline["events"][-2]["event_type"])
+            self.assertEqual("task_cancelled", timeline["events"][-1]["event_type"])
+            self.assertEqual("cancelled", timeline["events"][-1]["status"])
+            self.assertEqual(2, timeline["events"][-1]["control_version"])
         finally:
             db.close()
 
@@ -288,8 +320,8 @@ class TaskTimelineTests(unittest.TestCase):
             self.assertTrue(fake_ctx.cancel_requested.is_set())
             cleanup.assert_called_once()
             timeline = self.service.get_task_timeline(db, task_id)
-            self.assertTrue(bool(timeline["events"][0]["payload"]["orchestrator_abort_sent"]))
-            self.assertEqual("/tmp/dfa-task", timeline["events"][0]["payload"]["cleanup_task_root"])
+            self.assertTrue(bool(timeline["events"][-1]["payload"]["orchestrator_abort_sent"]))
+            self.assertEqual("/tmp/dfa-task", timeline["events"][-1]["payload"]["cleanup_task_root"])
         finally:
             task_service_module._running_tasks.pop(task_id, None)
             task_service_module._running_task_contexts.pop(task_id, None)
@@ -662,6 +694,7 @@ class TaskTimelineTests(unittest.TestCase):
             row = db.query(AppDfaTask).filter_by(task_id=task_id).first()
             row.status = "running"
             row.execution_owner_id = task_service_module.WORKER_ID
+            row.execution_owner_instance_id = task_service_module.INSTANCE_ID
             row.execution_epoch = 9
             row.control_version = 1
             row.dispatch_status = "running"
@@ -687,6 +720,7 @@ class TaskTimelineTests(unittest.TestCase):
             row = db.query(AppDfaTask).filter_by(task_id=task_id).first()
             row.status = "running"
             row.execution_owner_id = task_service_module.WORKER_ID
+            row.execution_owner_instance_id = task_service_module.INSTANCE_ID
             row.execution_epoch = 5
             row.control_version = 2
             row.dispatch_status = "running"
@@ -988,8 +1022,8 @@ class TaskTimelineTests(unittest.TestCase):
         self.assertEqual(200, response.status_code)
         payload = response.json()
         self.assertEqual(task_id, payload["task_id"])
-        self.assertEqual("task_started", payload["events"][0]["event_type"])
-        self.assertEqual("task_created", payload["events"][-1]["event_type"])
+        self.assertEqual("task_created", payload["events"][0]["event_type"])
+        self.assertEqual("task_started", payload["events"][-1]["event_type"])
 
     def test_timeline_api_delete_single_event(self):
         task_id = self._create_task()
@@ -1019,7 +1053,7 @@ class TaskTimelineTests(unittest.TestCase):
         self.assertEqual(1, response.json()["deleted_event_count"])
         db = self._session()
         try:
-            self.assertEqual(1, db.query(AppDfaTaskEvent).filter_by(task_id=task_id).count())
+            self.assertEqual(2, db.query(AppDfaTaskEvent).filter_by(task_id=task_id).count())
             self.assertEqual(0, db.query(AppDfaTaskEvent).filter_by(task_id=task_id, event_type="timeline_event_deleted").count())
         finally:
             db.close()
@@ -1050,7 +1084,7 @@ class TaskTimelineTests(unittest.TestCase):
             response = client.delete(f"/api/app/dataflow-analyse/tasks/{task_id}/timeline")
 
         self.assertEqual(200, response.status_code)
-        self.assertEqual(2, response.json()["deleted_event_count"])
+        self.assertEqual(3, response.json()["deleted_event_count"])
         db = self._session()
         try:
             self.assertEqual(0, db.query(AppDfaTaskEvent).filter_by(task_id=task_id).count())
@@ -1105,7 +1139,7 @@ class TaskTimelineTests(unittest.TestCase):
         finally:
             db.close()
 
-    def test_execute_task_pre_execution_rejections_record_timeline_events(self):
+    def test_execute_task_pre_execution_rejections_do_not_record_main_timeline_events(self):
         task_id = self._create_task()
         db = self._session()
         try:
@@ -1142,7 +1176,7 @@ class TaskTimelineTests(unittest.TestCase):
             db = self._session()
             try:
                 event = db.query(AppDfaTaskEvent).filter_by(task_id=task_id, event_type="task_not_owner_pre_execute").first()
-                self.assertIsNotNone(event)
+                self.assertIsNone(event)
             finally:
                 db.close()
 
@@ -1164,7 +1198,7 @@ class TaskTimelineTests(unittest.TestCase):
             db = self._session()
             try:
                 event = db.query(AppDfaTaskEvent).filter_by(task_id=task_id, event_type="task_begin_execution_rejected").first()
-                self.assertIsNotNone(event)
+                self.assertIsNone(event)
             finally:
                 db.close()
         finally:

@@ -62,6 +62,9 @@ ENTRY_CONTEXT_MAX_CHARS = 32000
 ENTRY_CONTEXT_MAX_TAINTS = 64
 ENTRY_CONTEXT_MAX_DESC_CHARS = 2240
 TASK_EVENT_SOURCE_DFA = "dfa"
+TASK_EVENT_VISIBILITY_TIMELINE = "timeline"
+TASK_EVENT_VISIBILITY_DEBUG = "debug"
+TASK_EVENT_VISIBILITY_INTERNAL = "internal"
 TASK_EVENT_RENEW_INTERVAL_SECONDS = max(60, HEARTBEAT_INTERVAL_SECONDS * 6)
 EXECUTION_SUPERVISOR_INTERVAL_SECONDS = float(os.environ.get("DFA_EXECUTION_SUPERVISOR_INTERVAL_SECONDS", "5"))
 EXECUTION_NO_PROGRESS_SECONDS = float(os.environ.get("DFA_EXECUTION_NO_PROGRESS_SECONDS", "120"))
@@ -130,6 +133,63 @@ _TASK_LIST_SORT_COLUMNS = {
     "finished_at": AppDfaTask.finished_at,
     "status": AppDfaTask.status,
     "task_name": AppDfaTask.task_name,
+}
+
+_TASK_EVENT_POLICIES: dict[str, dict[str, str]] = {
+    "task_created": {"category": "lifecycle", "visibility": TASK_EVENT_VISIBILITY_TIMELINE, "summary_title": "任务已创建"},
+    "task_enqueued": {"category": "dispatch", "visibility": TASK_EVENT_VISIBILITY_TIMELINE, "summary_title": "任务已进入队列"},
+    "task_claimed": {"category": "dispatch", "visibility": TASK_EVENT_VISIBILITY_TIMELINE, "summary_title": "任务已被领取"},
+    "task_slot_assigned": {"category": "dispatch", "visibility": TASK_EVENT_VISIBILITY_TIMELINE, "summary_title": "任务已分配槽位"},
+    "task_dispatch_requested": {"category": "dispatch", "visibility": TASK_EVENT_VISIBILITY_TIMELINE, "summary_title": "任务已请求调度"},
+    "task_dispatch_rejected": {"category": "dispatch", "visibility": TASK_EVENT_VISIBILITY_TIMELINE, "summary_title": "任务调度被拒绝"},
+    "task_started": {"category": "lifecycle", "visibility": TASK_EVENT_VISIBILITY_TIMELINE, "summary_title": "任务已开始"},
+    "task_execution_started": {"category": "lifecycle", "visibility": TASK_EVENT_VISIBILITY_TIMELINE, "summary_title": "任务进入执行"},
+    "task_cancel_requested": {"category": "operation", "visibility": TASK_EVENT_VISIBILITY_TIMELINE, "summary_title": "任务取消已请求"},
+    "task_resume_requested": {"category": "operation", "visibility": TASK_EVENT_VISIBILITY_TIMELINE, "summary_title": "任务续跑已请求"},
+    "task_restart_requested": {"category": "operation", "visibility": TASK_EVENT_VISIBILITY_TIMELINE, "summary_title": "任务重跑已请求"},
+    "task_retry_requested": {"category": "operation", "visibility": TASK_EVENT_VISIBILITY_TIMELINE, "summary_title": "任务重试已请求"},
+    "task_manual_operation_requested": {"category": "operation", "visibility": TASK_EVENT_VISIBILITY_TIMELINE, "summary_title": "任务人工操作已请求"},
+    "task_lease_renew_degraded": {"category": "lease", "visibility": TASK_EVENT_VISIBILITY_TIMELINE, "summary_title": "任务租约续租抖动"},
+    "task_lease_lost": {"category": "lease", "visibility": TASK_EVENT_VISIBILITY_TIMELINE, "summary_title": "任务租约已丢失"},
+    "task_auto_requeued_after_lease_lost": {"category": "recovery", "visibility": TASK_EVENT_VISIBILITY_TIMELINE, "summary_title": "任务已自动回队"},
+    "task_lease_requeue_waiting": {"category": "recovery", "visibility": TASK_EVENT_VISIBILITY_TIMELINE, "summary_title": "任务等待自动重排队"},
+    "task_running_recovered": {"category": "recovery", "visibility": TASK_EVENT_VISIBILITY_TIMELINE, "summary_title": "运行中任务已回收"},
+    "task_reclaimed": {"category": "recovery", "visibility": TASK_EVENT_VISIBILITY_TIMELINE, "summary_title": "任务已回收"},
+    "task_lease_recovery_repaired": {"category": "recovery", "visibility": TASK_EVENT_VISIBILITY_TIMELINE, "summary_title": "任务回队失败样本已修复"},
+    "task_checkpoint_reached": {"category": "lifecycle", "visibility": TASK_EVENT_VISIBILITY_TIMELINE, "summary_title": "任务已到达关键检查点"},
+    "task_result_persisted": {"category": "terminal", "visibility": TASK_EVENT_VISIBILITY_TIMELINE, "summary_title": "任务结果已落库"},
+    "task_finished": {"category": "terminal", "visibility": TASK_EVENT_VISIBILITY_TIMELINE, "summary_title": "任务已结束"},
+    "task_failed": {"category": "terminal", "visibility": TASK_EVENT_VISIBILITY_TIMELINE, "summary_title": "任务失败"},
+    "task_error": {"category": "terminal", "visibility": TASK_EVENT_VISIBILITY_TIMELINE, "summary_title": "任务异常"},
+    "task_cancelled": {"category": "terminal", "visibility": TASK_EVENT_VISIBILITY_TIMELINE, "summary_title": "任务已取消"},
+    "task_terminal_committed": {"category": "terminal", "visibility": TASK_EVENT_VISIBILITY_TIMELINE, "summary_title": "任务终态已提交"},
+    "task_deleted": {"category": "audit", "visibility": TASK_EVENT_VISIBILITY_TIMELINE, "summary_title": "任务已删除"},
+    "task_delete_rejected": {"category": "audit", "visibility": TASK_EVENT_VISIBILITY_DEBUG, "summary_title": "任务删除被拒绝"},
+    "agent_process_manual_kill": {"category": "audit", "visibility": TASK_EVENT_VISIBILITY_TIMELINE, "summary_title": "智能体进程已被手工终止"},
+    "agent_process_bulk_manual_kill": {"category": "audit", "visibility": TASK_EVENT_VISIBILITY_TIMELINE, "summary_title": "批量智能体进程已被手工终止"},
+    "task_retried": {"category": "operation", "visibility": TASK_EVENT_VISIBILITY_TIMELINE, "summary_title": "任务重跑已请求"},
+    "task_resumed": {"category": "operation", "visibility": TASK_EVENT_VISIBILITY_TIMELINE, "summary_title": "任务续跑已请求"},
+    "task_leased": {"category": "dispatch", "visibility": TASK_EVENT_VISIBILITY_TIMELINE, "summary_title": "任务已被领取"},
+    "task_lease_renew_failed": {"category": "lease", "visibility": TASK_EVENT_VISIBILITY_DEBUG, "summary_title": "任务租约续租失败"},
+    "task_running_reconcile_recovered": {"category": "recovery", "visibility": TASK_EVENT_VISIBILITY_DEBUG, "summary_title": "运行中任务已被巡检回收"},
+    "task_lease_requeue_retry": {"category": "recovery", "visibility": TASK_EVENT_VISIBILITY_DEBUG, "summary_title": "任务自动回队重试中"},
+    "task_lease_requeue_failed": {"category": "recovery", "visibility": TASK_EVENT_VISIBILITY_DEBUG, "summary_title": "任务自动回队失败"},
+    "task_running_reconcile_candidate": {"category": "recovery", "visibility": TASK_EVENT_VISIBILITY_DEBUG, "summary_title": "任务满足回收候选条件"},
+    "task_running_reconcile_skipped_local_active": {"category": "recovery", "visibility": TASK_EVENT_VISIBILITY_DEBUG, "summary_title": "任务回收已跳过"},
+    "task_running_reconcile_skipped_recent_activity": {"category": "recovery", "visibility": TASK_EVENT_VISIBILITY_DEBUG, "summary_title": "任务回收因最近活跃而跳过"},
+    "task_running_reconcile_skipped_owner_alive": {"category": "recovery", "visibility": TASK_EVENT_VISIBILITY_DEBUG, "summary_title": "任务回收因 owner 存活而跳过"},
+    "task_lease_renewed": {"category": "lease", "visibility": TASK_EVENT_VISIBILITY_INTERNAL, "summary_title": "任务租约已续期"},
+    "task_not_owner_pre_execute": {"category": "dispatch", "visibility": TASK_EVENT_VISIBILITY_INTERNAL, "summary_title": "任务执行权检查失败"},
+    "task_not_owner_pre_llm_sync": {"category": "dispatch", "visibility": TASK_EVENT_VISIBILITY_INTERNAL, "summary_title": "任务执行权检查失败"},
+    "task_not_owner_pre_commit": {"category": "dispatch", "visibility": TASK_EVENT_VISIBILITY_INTERNAL, "summary_title": "任务执行权检查失败"},
+    "task_control_guard_abort": {"category": "dispatch", "visibility": TASK_EVENT_VISIBILITY_INTERNAL, "summary_title": "任务控制保护触发"},
+    "task_skip_pre_execute": {"category": "dispatch", "visibility": TASK_EVENT_VISIBILITY_INTERNAL, "summary_title": "任务执行前被跳过"},
+    "task_begin_execution_rejected": {"category": "dispatch", "visibility": TASK_EVENT_VISIBILITY_INTERNAL, "summary_title": "任务进入执行态失败"},
+    "task_lease_released": {"category": "lease", "visibility": TASK_EVENT_VISIBILITY_INTERNAL, "summary_title": "任务租约已释放"},
+    "task_agent_cleanup_started": {"category": "audit", "visibility": TASK_EVENT_VISIBILITY_INTERNAL, "summary_title": "智能体清理开始"},
+    "task_agent_cleanup_finished": {"category": "audit", "visibility": TASK_EVENT_VISIBILITY_INTERNAL, "summary_title": "智能体清理完成"},
+    "task_execution_cancelled": {"category": "terminal", "visibility": TASK_EVENT_VISIBILITY_INTERNAL, "summary_title": "任务执行已取消"},
+    "task_terminal_commit_rejected": {"category": "terminal", "visibility": TASK_EVENT_VISIBILITY_INTERNAL, "summary_title": "任务终态提交被拒绝"},
 }
 
 
@@ -290,6 +350,20 @@ def _latest_execution_started_at(db: Session, task_id: str) -> str | None:
 
 
 def _build_task_event_response(event: AppDfaTaskEvent) -> dict[str, object]:
+    payload = event.payload
+    summary_title = None
+    summary_detail = None
+    if isinstance(payload, dict):
+        summary_title = str(payload.get("summary_title") or "").strip() or None
+        summary_detail = str(payload.get("summary_detail") or "").strip() or None
+    event_visibility = event.event_visibility or _task_event_visibility(event.event_type)
+    event_category = event.event_category or _task_event_category(event.event_type)
+    attempt_no = event.attempt_no
+    if attempt_no is None:
+        try:
+            attempt_no = max(1, int(event.execution_epoch or 0) + 1)
+        except (TypeError, ValueError):
+            attempt_no = 1
     return {
         "id": event.id,
         "task_id": event.task_id,
@@ -303,15 +377,76 @@ def _build_task_event_response(event: AppDfaTaskEvent) -> dict[str, object]:
         "execution_epoch": event.execution_epoch,
         "control_version": event.control_version,
         "dispatch_status": event.dispatch_status,
+        "event_category": event_category,
+        "event_visibility": event_visibility,
+        "attempt_no": attempt_no,
+        "attempt_label": f"第 {int(attempt_no)} 次执行" if attempt_no else None,
+        "superseded": bool(event.supersedes_event_id),
+        "supersedes_event_id": event.supersedes_event_id,
+        "summary_title": summary_title,
+        "summary_detail": summary_detail,
         "function_name": event.function_name,
         "source_file": event.source_file,
         "line_hint": event.line_hint,
         "parent_task_id": event.parent_task_id,
         "parent_stage_item_id": event.parent_stage_item_id,
         "message": event.message,
-        "payload": event.payload,
+        "payload": payload,
         "created_at": isoformat_local(event.created_at),
     }
+
+
+def _task_event_policy(event_type: str) -> dict[str, str]:
+    return _TASK_EVENT_POLICIES.get(str(event_type or "").strip(), {})
+
+
+def _should_record_task_event(event_type: str) -> bool:
+    policy = _task_event_policy(event_type)
+    visibility = str(policy.get("visibility") or TASK_EVENT_VISIBILITY_INTERNAL).strip()
+    return visibility in {TASK_EVENT_VISIBILITY_TIMELINE, TASK_EVENT_VISIBILITY_DEBUG}
+
+
+def _task_event_visibility(event_type: str) -> str:
+    policy = _task_event_policy(event_type)
+    return str(policy.get("visibility") or TASK_EVENT_VISIBILITY_INTERNAL).strip()
+
+
+def _task_event_category(event_type: str) -> str | None:
+    policy = _task_event_policy(event_type)
+    category = str(policy.get("category") or "").strip()
+    return category or None
+
+
+def _task_event_summary_title(event_type: str) -> str | None:
+    policy = _task_event_policy(event_type)
+    title = str(policy.get("summary_title") or "").strip()
+    return title or None
+
+
+def _event_visibility_for_row(event: AppDfaTaskEvent) -> str:
+    return str(event.event_visibility or _task_event_visibility(event.event_type) or TASK_EVENT_VISIBILITY_INTERNAL).strip()
+
+
+def _timeline_dedupe_key(
+    task_id: str,
+    event_type: str,
+    *,
+    control_version: int | None = None,
+    dispatch_status: str | None = None,
+    execution_epoch: int | None = None,
+    action_id: str | None = None,
+    attempt_no: int | None = None,
+) -> str:
+    parts = [
+        task_id,
+        event_type,
+        str(control_version or ""),
+        str(dispatch_status or ""),
+        str(execution_epoch or ""),
+        str(attempt_no or ""),
+        str(action_id or ""),
+    ]
+    return "::".join(parts)[:255]
 
 
 def _record_task_event(
@@ -332,8 +467,14 @@ def _record_task_event(
     function_name: str | None = None,
     source_file: str | None = None,
     line_hint: str | None = None,
+    attempt_no: int | None = None,
+    event_visibility: str | None = None,
+    event_category: str | None = None,
+    supersedes_event_id: str | None = None,
     dedupe_key: str | None = None,
 ) -> AppDfaTaskEvent | None:
+    if not _should_record_task_event(event_type):
+        return None
     normalized_message = _fit_event_message(message, limit=1000)
     normalized_status = str(status or row.status or "").strip() or None
     normalized_worker_id = str(worker_id or row.execution_owner_id or "").strip() or None
@@ -342,15 +483,42 @@ def _record_task_event(
     normalized_function_name = str(function_name or (row.task_config_json or {}).get("function_name") or "").strip() or None
     normalized_source_file = str(source_file or (row.task_config_json or {}).get("source_file") or "").strip() or None
     normalized_line_hint = str(line_hint or (row.task_config_json or {}).get("line_hint") or "").strip() or None
-    event_dedupe_key = dedupe_key or _task_event_dedupe_key(
-        row.task_id,
-        event_type,
-        normalized_status,
-        normalized_message,
-        epoch=execution_epoch or int(row.execution_epoch or 0),
-        function_name=normalized_function_name,
-        dispatch_status=normalized_dispatch_status,
-        line_hint=normalized_line_hint,
+    effective_execution_epoch = int(execution_epoch) if execution_epoch is not None else int(row.execution_epoch or 0)
+    effective_attempt_no = int(attempt_no) if attempt_no is not None else max(1, effective_execution_epoch + 1)
+    effective_visibility = str(event_visibility or _task_event_visibility(event_type) or TASK_EVENT_VISIBILITY_INTERNAL).strip()
+    effective_category = str(event_category or _task_event_category(event_type) or "").strip() or None
+    payload_dict = _compact_event_payload(payload or {})
+    if _task_event_summary_title(event_type) and "summary_title" not in payload_dict:
+        payload_dict["summary_title"] = _task_event_summary_title(event_type)
+    if "summary_detail" not in payload_dict:
+        payload_dict["summary_detail"] = normalized_message
+    action_id = None
+    for key in ("operation_id", "request_id", "decision_nonce", "requested_at", "last_lease_lost_at"):
+        value = payload_dict.get(key)
+        if value is not None and str(value).strip():
+            action_id = str(value).strip()
+            break
+    event_dedupe_key = dedupe_key or (
+        _timeline_dedupe_key(
+            row.task_id,
+            event_type,
+            control_version=int(control_version) if control_version is not None else int(row.control_version or 0),
+            dispatch_status=normalized_dispatch_status,
+            execution_epoch=effective_execution_epoch,
+            action_id=action_id,
+            attempt_no=effective_attempt_no,
+        )
+        if effective_visibility == TASK_EVENT_VISIBILITY_TIMELINE
+        else _task_event_dedupe_key(
+            row.task_id,
+            event_type,
+            normalized_status,
+            normalized_message,
+            epoch=effective_execution_epoch,
+            function_name=normalized_function_name,
+            dispatch_status=normalized_dispatch_status,
+            line_hint=normalized_line_hint,
+        )
     )
     existing = db.query(AppDfaTaskEvent).filter(AppDfaTaskEvent.dedupe_key == event_dedupe_key).first()
     if existing is not None:
@@ -365,9 +533,13 @@ def _record_task_event(
         status=normalized_status,
         worker_id=normalized_worker_id,
         execution_owner_id=normalized_owner_id,
-        execution_epoch=int(execution_epoch) if execution_epoch is not None else int(row.execution_epoch or 0),
+        execution_epoch=effective_execution_epoch,
         control_version=int(control_version) if control_version is not None else int(row.control_version or 0),
         dispatch_status=normalized_dispatch_status,
+        event_category=effective_category,
+        event_visibility=effective_visibility,
+        attempt_no=effective_attempt_no,
+        supersedes_event_id=str(supersedes_event_id or "").strip() or None,
         function_name=normalized_function_name,
         source_file=normalized_source_file,
         line_hint=normalized_line_hint,
@@ -376,7 +548,7 @@ def _record_task_event(
         message=normalized_message,
         dedupe_key=event_dedupe_key,
     )
-    event.payload = _compact_event_payload(payload or {})
+    event.payload = payload_dict
     db.add(event)
     try:
         db.flush()
@@ -806,6 +978,19 @@ def _start_task_lease_heartbeat(
                             lambda: _hb_db.query(AppDfaTask).filter_by(task_id=task_id).first(),
                         )
                         if renew_failed_row is not None:
+                            _record_task_event(
+                                _hb_db,
+                                row=renew_failed_row,
+                                event_type="task_lease_renew_degraded",
+                                message="任务租约续租异常，但租约尚未过期，将继续重试",
+                                level="warning",
+                                status=renew_failed_row.status,
+                                worker_id=WORKER_ID,
+                                execution_owner_id=WORKER_ID,
+                                execution_epoch=epoch,
+                                control_version=control_version,
+                                payload=failure_payload,
+                            )
                             _record_task_event(
                                 _hb_db,
                                 row=renew_failed_row,
@@ -2378,6 +2563,16 @@ class TaskService:
             _record_task_event(
                 db,
                 row=row,
+                event_type="task_running_recovered",
+                message="后台巡检确认任务已失去有效执行权，已自动回收并重新排队",
+                level="warning",
+                status=row.status,
+                dispatch_status=row.dispatch_status,
+                payload=payload,
+            )
+            _record_task_event(
+                db,
+                row=row,
                 event_type="task_running_reconcile_recovered",
                 message="后台巡检确认任务已失去有效执行权，已自动回收并重新排队",
                 level="warning",
@@ -2546,6 +2741,25 @@ class TaskService:
             )
             claimed_row = db.query(AppDfaTask).filter_by(task_id=claimed.task_id).first()
             if claimed_row is not None:
+                _record_task_event(
+                    db,
+                    row=claimed_row,
+                    event_type="task_claimed",
+                    message="任务已被 worker 领取",
+                    status=claimed_row.status,
+                    execution_epoch=claimed.epoch,
+                    control_version=claimed.control_version,
+                    dispatch_status=claimed.dispatch_status,
+                    worker_id=WORKER_ID,
+                    execution_owner_id=WORKER_ID,
+                    payload={
+                        "owner_id": WORKER_ID,
+                        "owner_instance_id": INSTANCE_ID,
+                        "epoch": claimed.epoch,
+                        "control_version": claimed.control_version,
+                        "dispatch_status": claimed.dispatch_status,
+                    },
+                )
                 _record_task_event(
                     db,
                     row=claimed_row,
@@ -2795,12 +3009,13 @@ class TaskService:
 
     def get_task_timeline(self, db: Session, task_id: str) -> dict:
         row = self._get_or_404(db, task_id)
-        events = (
+        raw_events = (
             db.query(AppDfaTaskEvent)
             .filter(AppDfaTaskEvent.task_id == row.task_id)
-            .order_by(AppDfaTaskEvent.created_at.desc())
+            .order_by(AppDfaTaskEvent.created_at.asc(), AppDfaTaskEvent.id.asc())
             .all()
         )
+        events = [event for event in raw_events if _event_visibility_for_row(event) == TASK_EVENT_VISIBILITY_TIMELINE]
         return {
             "task_id": row.task_id,
             "events": [_build_task_event_response(event) for event in events],
@@ -2925,6 +3140,18 @@ class TaskService:
                 "parent_stage_item_id": row.parent_stage_item_id,
             },
         )
+        _record_task_event(
+            db,
+            row=row,
+            event_type="task_enqueued",
+            message="任务已进入待调度队列",
+            status=row.status,
+            dispatch_status=row.dispatch_status,
+            payload={
+                "task_origin_type": row.task_origin_type,
+                "queue_status": row.dispatch_status,
+            },
+        )
         db.commit(); db.refresh(row)
         log_event(logger, logging.INFO, "task created",
                   event="task_created", task_id=task_id, project_id=project_id)
@@ -2958,6 +3185,16 @@ class TaskService:
         flag_modified(row, "task_config_json")
         flag_modified(row, "latest_abnormal_reason_json")
         db.commit(); db.refresh(row)
+        _record_task_event(
+            db,
+            row=row,
+            event_type="task_restart_requested",
+            message="任务已请求原地重跑",
+            status=row.status,
+            control_version=int(row.control_version or 0),
+            dispatch_status=row.dispatch_status,
+            payload={"control_version": int(row.control_version or 0)},
+        )
         _record_task_event(
             db,
             row=row,
@@ -3009,6 +3246,20 @@ class TaskService:
         flag_modified(row, "task_config_json")
         flag_modified(row, "latest_abnormal_reason_json")
         db.commit(); db.refresh(row)
+        _record_task_event(
+            db,
+            row=row,
+            event_type="task_resume_requested",
+            message="任务已请求断点续跑",
+            status=row.status,
+            control_version=int(row.control_version or 0),
+            dispatch_status=row.dispatch_status,
+            payload={
+                "control_version": int(row.control_version or 0),
+                "resume_workspace": resume_workspace,
+                "start_stage": 3,
+            },
+        )
         _record_task_event(
             db,
             row=row,
@@ -3079,6 +3330,20 @@ class TaskService:
         reason, changed = _sync_task_abnormal_reason(row)
         _record_abnormal_reason(row, reason, changed=changed)
         _record_abnormal_reason_timeline(db, row, reason, changed=changed)
+        _record_task_event(
+            db,
+            row=row,
+            event_type="task_cancel_requested",
+            message="任务已请求取消",
+            level="warning",
+            status="running" if local_task is not None or ctx is not None else row.status,
+            control_version=int(row.control_version or 0),
+            payload={
+                "requested_by": "control_plane",
+                "orchestrator_abort_sent": bool(ctx and ctx.orch is not None),
+                "local_task_active": local_task is not None,
+            },
+        )
         _record_task_event(
             db,
             row=row,
